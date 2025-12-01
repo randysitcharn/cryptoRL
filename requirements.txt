@@ -1,0 +1,8 @@
+gymnasium
+stable-baselines3[extra]
+torch
+pandas
+numpy
+matplotlib
+yfinance
+# ta-lib  # Note: Requires C binary installed manually. Use pandas-ta as a simpler alternative if needed.
