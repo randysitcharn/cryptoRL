@@ -6,7 +6,10 @@ Implements CryptoTradingEnv compatible with Stable-Baselines3:
 - Continuous action [-1, 1] representing target position (% of portfolio)
 - Proper financial execution with slippage and commission
 - NAV-based portfolio tracking
+- Risk-adjusted reward (Sortino-proxy) with downside deviation
 """
+
+from collections import deque
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -24,7 +27,8 @@ class CryptoTradingEnv(gym.Env):
         df: pd.DataFrame,
         initial_balance: float = 10000.0,
         commission: float = 0.001,
-        slippage: float = 0.0001
+        slippage: float = 0.0001,
+        reward_scaling: float = 10.0
     ):
         """
         Initialize the trading environment.
@@ -34,6 +38,7 @@ class CryptoTradingEnv(gym.Env):
             initial_balance (float): Initial capital in USD.
             commission (float): Transaction fee (0.001 = 0.1%).
             slippage (float): Slippage cost (0.0001 = 0.01%).
+            reward_scaling (float): Multiplier for risk-adjusted reward.
         """
         super().__init__()
 
@@ -51,6 +56,7 @@ class CryptoTradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.commission = commission
         self.slippage = slippage
+        self.reward_scaling = reward_scaling
 
         # Action and observation spaces
         # Action: target position [-1, 1] as % of portfolio
@@ -78,6 +84,11 @@ class CryptoTradingEnv(gym.Env):
         self.cash = self.initial_balance
         self.asset_holdings = 0.0  # Quantity of crypto held
 
+        # Risk-adjusted reward tracking
+        self.returns_window: deque = deque(maxlen=50)  # Rolling window for Sortino
+        self.max_drawdown = 0.0
+        self.peak_nav = self.initial_balance
+
     def _get_current_price(self) -> float:
         """Return the current close price."""
         return float(self.prices[self.current_step])
@@ -86,6 +97,51 @@ class CryptoTradingEnv(gym.Env):
         """Calculate current Net Asset Value (NAV)."""
         current_price = self._get_current_price()
         return self.cash + (self.asset_holdings * current_price)
+
+    def _calculate_reward(self, current_nav: float, old_nav: float) -> tuple:
+        """
+        Calculate risk-adjusted reward using Sortino-proxy.
+
+        Uses log returns and downside deviation to penalize volatility,
+        especially negative volatility (Sortino ratio approach).
+
+        Args:
+            current_nav (float): Current portfolio value.
+            old_nav (float): Previous portfolio value.
+
+        Returns:
+            tuple: (reward, log_return) where reward is scaled risk-adjusted return.
+        """
+        # 1. Log return (more stable than simple return for small changes)
+        if old_nav > 0 and current_nav > 0:
+            step_log_return = float(np.log(current_nav / old_nav))
+        else:
+            step_log_return = 0.0
+
+        # 2. Store in rolling window
+        self.returns_window.append(step_log_return)
+
+        # 3. Update peak and max drawdown
+        if current_nav > self.peak_nav:
+            self.peak_nav = current_nav
+        current_drawdown = (self.peak_nav - current_nav) / self.peak_nav
+        self.max_drawdown = max(self.max_drawdown, current_drawdown)
+
+        # 4. Downside deviation (Sortino denominator)
+        negative_returns = [r for r in self.returns_window if r < 0]
+        if len(negative_returns) >= 2:
+            downside_std = float(np.std(negative_returns))
+        else:
+            downside_std = 0.0
+
+        # 5. Risk-adjusted return
+        if downside_std > 1e-8:
+            risk_adjusted = step_log_return / downside_std
+        else:
+            # No downside deviation yet, use raw log return
+            risk_adjusted = step_log_return
+
+        return risk_adjusted * self.reward_scaling, step_log_return
 
     def reset(self, seed=None, options=None):
         """
@@ -147,33 +203,34 @@ class CryptoTradingEnv(gym.Env):
             self.asset_holdings += trade_qty
             self.cash -= trade_amount_usd
 
-        # 5. Calculate new portfolio value
-        new_portfolio_value = self._get_portfolio_value()
-
-        # 6. Check for bankruptcy
+        # 5. Check for immediate bankruptcy (after trade, before price change)
         terminated = False
         truncated = False
+        log_return = 0.0
 
-        if new_portfolio_value <= 0:
+        immediate_nav = self._get_portfolio_value()
+        if immediate_nav <= 0:
             terminated = True
             reward = -100.0  # Death penalty
         else:
-            # 7. Advance to next step
+            # 6. Advance to next step (price changes)
             self.current_step += 1
 
             # Check if episode ended (reached end of data)
             if self.current_step >= self.n_steps - 1:
                 terminated = True
 
-            # 8. Calculate reward (simple return)
-            if current_portfolio_value > 0:
-                reward = (new_portfolio_value - current_portfolio_value) / current_portfolio_value
-            else:
-                reward = 0.0
+            # 7. Calculate new portfolio value at NEW price
+            new_portfolio_value = self._get_portfolio_value()
+
+            # 8. Calculate risk-adjusted reward (Sortino-proxy)
+            reward, log_return = self._calculate_reward(
+                new_portfolio_value, current_portfolio_value
+            )
 
         # 9. Get observation and info
         observation = self._get_observation()
-        info = self._get_info(action[0])
+        info = self._get_info(action[0], log_return)
 
         return observation, float(reward), terminated, truncated, info
 
@@ -181,15 +238,18 @@ class CryptoTradingEnv(gym.Env):
         """Return current observation."""
         return self.data[self.current_step].copy()
 
-    def _get_info(self, action=0.0):
-        """Return additional information."""
+    def _get_info(self, action=0.0, log_return=0.0):
+        """Return additional information including monitoring metrics."""
         return {
             'step': self.current_step,
             'portfolio_value': self._get_portfolio_value(),
             'cash': self.cash,
             'asset_holdings': self.asset_holdings,
             'price': self._get_current_price(),
-            'action': float(action)
+            'action': float(action),
+            'log_return': log_return,
+            'max_drawdown': self.max_drawdown,
+            'peak_nav': self.peak_nav,
         }
 
     def render(self):
