@@ -1,3 +1,10 @@
+"""
+downloader.py - Téléchargement des données de marché.
+
+Classe YFinanceDownloader pour récupérer les données OHLCV horaires
+depuis Yahoo Finance (limite 730 jours). Sauvegarde dans data/raw/.
+"""
+
 import os
 import yfinance as yf
 import pandas as pd

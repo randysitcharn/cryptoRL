@@ -1,3 +1,10 @@
+"""
+test_reproducibility.py - Tests de reproductibilité.
+
+Vérifie que seed_everything() produit des résultats identiques
+lors d'exécutions successives avec la même graine.
+"""
+
 import torch
 import sys
 import os

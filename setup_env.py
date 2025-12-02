@@ -1,3 +1,10 @@
+"""
+setup_env.py - Script de vérification de l'environnement.
+
+Vérifie la disponibilité de CUDA et affiche les versions des dépendances
+principales (Gymnasium, Stable-Baselines3).
+"""
+
 import sys
 import torch
 import gymnasium

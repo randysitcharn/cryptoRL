@@ -24,5 +24,9 @@ data/*
 !data/raw/.gitkeep
 !data/processed/
 !data/processed/.gitkeep
+data/processed/*.csv
 logs/*
 !logs/.gitkeep
+
+# Claude Code
+.claude/

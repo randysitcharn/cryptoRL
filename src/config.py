@@ -1,3 +1,10 @@
+"""
+config.py - Configuration globale du projet.
+
+Définit les constantes globales (SEED) et détecte automatiquement
+le device optimal (CUDA, MPS, ou CPU).
+"""
+
 import torch
 
 # Global Configuration

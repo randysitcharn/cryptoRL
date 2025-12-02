@@ -1,3 +1,10 @@
+"""
+reproducibility.py - Utilitaires pour la reproductibilité.
+
+Fournit seed_everything() pour initialiser tous les générateurs
+de nombres aléatoires (Python, NumPy, PyTorch) avec une graine fixe.
+"""
+
 import random
 import os
 import numpy as np
