@@ -135,7 +135,8 @@ class CryptoTradingEnv(gym.Env):
             downside_std = 0.0
 
         # 5. Risk-adjusted return with floor
-        # Use minimum std of 0.001 to avoid tiny rewards early in training
+        # Reward is an instantaneous Sortino Ratio scaled by 10.
+        # Floor volatility at 0.1% to prevent explosion.
         effective_std = max(downside_std, 0.001)
         risk_adjusted = step_log_return / effective_std
 
