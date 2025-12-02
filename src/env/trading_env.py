@@ -134,12 +134,10 @@ class CryptoTradingEnv(gym.Env):
         else:
             downside_std = 0.0
 
-        # 5. Risk-adjusted return
-        if downside_std > 1e-8:
-            risk_adjusted = step_log_return / downside_std
-        else:
-            # No downside deviation yet, use raw log return
-            risk_adjusted = step_log_return
+        # 5. Risk-adjusted return with floor
+        # Use minimum std of 0.001 to avoid tiny rewards early in training
+        effective_std = max(downside_std, 0.001)
+        risk_adjusted = step_log_return / effective_std
 
         return risk_adjusted * self.reward_scaling, step_log_return
 
