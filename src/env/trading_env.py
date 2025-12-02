@@ -166,9 +166,9 @@ class CryptoTradingEnv(gym.Env):
         Execute action and advance one step.
 
         Args:
-            action (np.ndarray): Target position [-1, 1] as % of portfolio.
-                -1 = 100% short (not implemented, treated as 0)
-                 0 = 100% cash
+            action (np.ndarray): Target position [-1, 1] remapped to [0, 1].
+                -1 = 0% in asset (100% cash)
+                 0 = 50% in asset
                 +1 = 100% in asset
 
         Returns:
@@ -178,11 +178,9 @@ class CryptoTradingEnv(gym.Env):
         current_price = self._get_current_price()
         current_portfolio_value = self._get_portfolio_value()
 
-        # 2. Parse action (clip to valid range)
-        target_position = float(np.clip(action[0], -1.0, 1.0))
-
-        # For now, treat negative positions as 0 (no shorting)
-        target_position = max(0.0, target_position)
+        # 2. Parse action: remap [-1, 1] to [0, 1] for position sizing
+        # -1 = 0% in asset (100% cash), +1 = 100% in asset
+        target_position = (float(np.clip(action[0], -1.0, 1.0)) + 1.0) / 2.0
 
         # 3. Calculate target vs current asset value
         target_asset_value = current_portfolio_value * target_position
