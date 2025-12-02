@@ -77,7 +77,7 @@ def test_reset():
     assert obs.shape == (16,), f"Expected shape (16,), got {obs.shape}"
     assert obs.dtype == np.float32, f"Expected float32, got {obs.dtype}"
     assert 'step' in info, "Info should contain 'step'"
-    assert 'balance' in info, "Info should contain 'balance'"
+    assert 'portfolio_value' in info, "Info should contain 'portfolio_value'"
 
     print("SUCCESS: reset() works correctly!")
 
