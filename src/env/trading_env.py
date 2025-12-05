@@ -150,7 +150,7 @@ class CryptoTradingEnv(gym.Env):
         risk_adjusted = step_log_return / effective_std
 
         # 6. HARD CLIP: Sécurité ultime contre explosion gradient
-        reward = np.clip(risk_adjusted * self.reward_scaling, -10.0, 10.0)
+        reward = np.clip(risk_adjusted * self.reward_scaling, -5.0, 5.0)
 
         return reward, step_log_return
 
