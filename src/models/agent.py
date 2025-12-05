@@ -43,13 +43,14 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
         ),
         net_arch=[256, 256],
         n_critics=2,
-        n_quantiles=25
+        n_quantiles=25,
+        optimizer_kwargs=dict(weight_decay=1e-5),  # Régularisation L2
     )
 
-    # Hyperparametres TQC SOTA par defaut
+    # Hyperparametres TQC SOTA par defaut (stabilisés)
     default_params = {
         "policy": "MlpPolicy",
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,  # Réduit de 3e-4 pour stabilité
         "buffer_size": 100_000,
         "batch_size": 256,
         "ent_coef": "auto",
@@ -58,6 +59,8 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
         "train_freq": 1,
         "gradient_steps": 1,
         "top_quantiles_to_drop_per_net": 2,  # Reduit l'optimisme (drop 2/25)
+        "use_sde": True,  # State Dependent Exploration (stabilité)
+        "use_sde_at_warmup": True,
         "policy_kwargs": policy_kwargs,
     }
 

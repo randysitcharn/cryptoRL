@@ -28,7 +28,7 @@ class CryptoTradingEnv(gym.Env):
         initial_balance: float = 10000.0,
         commission: float = 0.001,
         slippage: float = 0.0001,
-        reward_scaling: float = 10.0,
+        reward_scaling: float = 1.0,
         window_size: int = 64
     ):
         """
