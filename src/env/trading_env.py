@@ -44,14 +44,16 @@ class CryptoTradingEnv(gym.Env):
         """
         super().__init__()
 
-        # Convert DataFrame to float32 arrays
-        self.data = df.values.astype(np.float32)
-        self.n_steps = len(self.data)
-
-        # Store close prices for P&L calculation
+        # Store close prices for P&L calculation (needed for trading)
         self.prices = df['close'].values.astype(np.float32)
+        self.n_steps = len(df)
 
-        # Features for observation (all columns)
+        # Features for observation: exclude OHLC (keep only normalized features)
+        ohlc_cols = ['open', 'high', 'low', 'close']
+        feature_cols = [col for col in df.columns if col not in ohlc_cols]
+        self.data = df[feature_cols].values.astype(np.float32)
+
+        # Features for observation (excluding OHLC)
         self.n_features = self.data.shape[1]
 
         # Window size for Transformer (power of 2)
