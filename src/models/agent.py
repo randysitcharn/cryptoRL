@@ -30,36 +30,36 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
     Returns:
         TQC: Agent TQC instancie avec Transformer feature extractor.
     """
-    # Policy kwargs avec Transformer extractor
+    # Policy kwargs avec Transformer extractor (Architecture Nano pour stabilité)
     policy_kwargs = dict(
         features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(
             features_dim=256,
-            d_model=64,
-            nhead=4,
-            num_layers=2,
-            dim_feedforward=128,
-            dropout=0.2
+            d_model=32,       # Réduit de 64 (moins de variance)
+            nhead=2,          # Réduit de 4
+            num_layers=1,     # Réduit de 2
+            dim_feedforward=64,  # Réduit de 128
+            dropout=0.1       # Réduit de 0.2
         ),
         net_arch=[256, 256],
         n_critics=2,
         n_quantiles=25,
-        optimizer_kwargs=dict(weight_decay=1e-5),  # Régularisation L2
+        optimizer_kwargs=dict(weight_decay=1e-3),  # Régularisation L2 forte
     )
 
-    # Hyperparametres TQC SOTA par defaut (stabilisés)
+    # Hyperparametres TQC ULTRA-CONSERVATEURS (anti-explosion)
     default_params = {
         "policy": "MlpPolicy",
-        "learning_rate": 1e-4,  # Réduit de 3e-4 pour stabilité
-        "buffer_size": 100_000,
-        "batch_size": 256,
+        "learning_rate": 5e-5,    # Ultra-lent (0.00005) pour stabilité
+        "buffer_size": 50_000,    # Plus petit pour recycler plus vite
+        "batch_size": 128,        # Plus petit = plus de bruit régularisateur
         "ent_coef": "auto",
         "gamma": 0.99,
         "tau": 0.005,
         "train_freq": 1,
         "gradient_steps": 1,
         "top_quantiles_to_drop_per_net": 2,  # Reduit l'optimisme (drop 2/25)
-        "use_sde": True,  # State Dependent Exploration (stabilité)
+        "use_sde": True,          # State Dependent Exploration (stabilité)
         "use_sde_at_warmup": True,
         "policy_kwargs": policy_kwargs,
     }

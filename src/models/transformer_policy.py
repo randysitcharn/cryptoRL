@@ -88,11 +88,11 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         self,
         observation_space: spaces.Box,
         features_dim: int = 256,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 128,
-        dropout: float = 0.2
+        d_model: int = 32,
+        nhead: int = 2,
+        num_layers: int = 1,
+        dim_feedforward: int = 64,
+        dropout: float = 0.1
     ):
         """
         Args:
@@ -111,6 +111,9 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         self.window_size = observation_space.shape[0]
         self.n_features = observation_space.shape[1]
         self.d_model = d_model
+
+        # Input LayerNorm for stability
+        self.input_norm = nn.LayerNorm(self.n_features)
 
         # Input projection: n_features -> d_model
         self.input_projection = nn.Linear(self.n_features, d_model)
@@ -136,11 +139,15 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
             enable_nested_tensor=True  # Optimized for batch_first=True
         )
 
+        # Output LayerNorm for stability before projection
+        self.output_norm = nn.LayerNorm(d_model)
+
         # Output projection: flatten -> linear -> features_dim
         self.output_projection = nn.Sequential(
             nn.Flatten(),
             nn.Linear(self.window_size * d_model, features_dim),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.LayerNorm(features_dim)  # Final LayerNorm for stability
         )
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -155,17 +162,23 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         """
         # Input: (Batch, Window, Features)
 
-        # 1. Project input features to d_model
-        # (Batch, Window, Features) -> (Batch, Window, d_model)
-        x = self.input_projection(observations)
+        # 1. Input LayerNorm for stability
+        x = self.input_norm(observations)
 
-        # 2. Add positional encoding
+        # 2. Project input features to d_model
+        # (Batch, Window, Features) -> (Batch, Window, d_model)
+        x = self.input_projection(x)
+
+        # 3. Add positional encoding
         x = self.pos_encoder(x)
 
-        # 3. Pass through Transformer encoder (batch_first=True, no permute needed)
+        # 4. Pass through Transformer encoder (batch_first=True, no permute needed)
         x = self.transformer_encoder(x)
 
-        # 4. Output projection: flatten and project to features_dim
+        # 5. Output LayerNorm for stability
+        x = self.output_norm(x)
+
+        # 6. Output projection: flatten and project to features_dim
         x = self.output_projection(x)
 
         return x
