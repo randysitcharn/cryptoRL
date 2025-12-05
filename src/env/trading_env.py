@@ -28,7 +28,8 @@ class CryptoTradingEnv(gym.Env):
         initial_balance: float = 10000.0,
         commission: float = 0.001,
         slippage: float = 0.0001,
-        reward_scaling: float = 10.0
+        reward_scaling: float = 10.0,
+        window_size: int = 64
     ):
         """
         Initialize the trading environment.
@@ -39,6 +40,7 @@ class CryptoTradingEnv(gym.Env):
             commission (float): Transaction fee (0.001 = 0.1%).
             slippage (float): Slippage cost (0.0001 = 0.01%).
             reward_scaling (float): Multiplier for risk-adjusted reward.
+            window_size (int): Lookback window for Transformer (default 64).
         """
         super().__init__()
 
@@ -51,6 +53,9 @@ class CryptoTradingEnv(gym.Env):
 
         # Features for observation (all columns)
         self.n_features = self.data.shape[1]
+
+        # Window size for Transformer (power of 2)
+        self.window_size = window_size
 
         # Trading parameters
         self.initial_balance = initial_balance
@@ -67,11 +72,12 @@ class CryptoTradingEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation: all features from DataFrame
+        # Observation: (window_size, n_features) for Transformer
+        # SB3 will see shape (Batch, Window, Features)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.n_features,),
+            shape=(self.window_size, self.n_features),
             dtype=np.float32
         )
 
@@ -80,7 +86,8 @@ class CryptoTradingEnv(gym.Env):
 
     def _reset_state(self):
         """Reset internal environment state."""
-        self.current_step = 0
+        # Start at window_size - 1 to have full lookback window
+        self.current_step = self.window_size - 1
         self.cash = self.initial_balance
         self.asset_holdings = 0.0  # Quantity of crypto held
 
@@ -232,8 +239,10 @@ class CryptoTradingEnv(gym.Env):
         return observation, float(reward), terminated, truncated, info
 
     def _get_observation(self):
-        """Return current observation."""
-        return self.data[self.current_step].copy()
+        """Return current observation as (window_size, n_features) array."""
+        # Get the last window_size rows ending at current_step
+        start_idx = self.current_step - self.window_size + 1
+        return self.data[start_idx:self.current_step + 1].copy()
 
     def _get_info(self, action=0.0, log_return=0.0):
         """Return additional information including monitoring metrics."""

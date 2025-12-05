@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-train.py - Script d'entrainement principal pour l'agent TQC + Transformer.
+train_demo.py - Script de smoke test rapide pour TQC + Transformer.
 
-Lance l'entrainement de l'agent sur les donnees de trading crypto
-avec evaluation periodique sur les donnees de validation.
+Version allegee de train.py pour verifier le bon fonctionnement
+du pipeline sans attendre un entrainement complet.
+
+Parametres reduits:
+- TOTAL_TIMESTEPS: 1,000 (vs 50,000)
+- EVAL_FREQ: 500 (vs 2,000)
+- buffer_size: 1,000 (vs 100,000)
+- batch_size: 64 (vs 256)
 """
 
 import os
@@ -20,22 +26,29 @@ from src.data_engineering.splitter import TimeSeriesSplitter
 
 
 def main():
-    """Main training function."""
+    """Main demo training function."""
     print("=" * 60)
-    print("CryptoRL - TQC + Transformer Training Script")
+    print("CryptoRL - TQC + Transformer [DEMO MODE]")
     print("=" * 60)
+    print("\n*** DEMO MODE: Parametres alleges pour test rapide ***\n")
 
-    # ==================== Configuration ====================
+    # ==================== Configuration (DEMO) ====================
     DATA_PATH = "data/processed/BTC-USD_processed.csv"
     WINDOW_SIZE = 64
-    TOTAL_TIMESTEPS = 50_000
-    EVAL_FREQ = 2000
+    TOTAL_TIMESTEPS = 1_000      # Reduit pour demo
+    EVAL_FREQ = 500              # Reduit pour demo
+
+    # Hyperparametres alleges pour demo
+    DEMO_HYPERPARAMS = {
+        "buffer_size": 1_000,    # Reduit (vs 100,000)
+        "batch_size": 64,        # Reduit (vs 256)
+    }
 
     # Create directories if they don't exist
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("logs/tensorboard", exist_ok=True)
-    print("\n[OK] Directories created: models/, logs/, logs/tensorboard/")
+    os.makedirs("models/demo", exist_ok=True)
+    os.makedirs("logs/demo", exist_ok=True)
+    os.makedirs("logs/demo/tensorboard", exist_ok=True)
+    print("[OK] Directories created: models/demo/, logs/demo/, logs/demo/tensorboard/")
 
     # ==================== Data Loading ====================
     print(f"\n[INFO] Loading data from {DATA_PATH}...")
@@ -56,13 +69,9 @@ def main():
     assert len(val_df) >= WINDOW_SIZE, f"Val set too small: {len(val_df)} < {WINDOW_SIZE}"
     print(f"[OK] Data validation passed (min window_size={WINDOW_SIZE})")
 
-    # test_df is reserved for final evaluation (not used during training)
-    print(f"\n[INFO] Test set ({len(test_df)} rows) reserved for final evaluation")
-
     # ==================== Environment Setup ====================
     print("\n[INFO] Creating environments...")
 
-    # DummyVecEnv expects a list of callables (lambda functions)
     # Monitor wrapper required for TensorBoard episode rewards logging
     train_env = DummyVecEnv([lambda df=train_df: Monitor(CryptoTradingEnv(df, window_size=WINDOW_SIZE))])
     # Wrap eval env with Monitor for proper episode tracking
@@ -75,8 +84,8 @@ def main():
     print("\n[INFO] Setting up evaluation callback...")
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path='./models/',
-        log_path='./logs/',
+        best_model_save_path='./models/demo/',
+        log_path='./logs/demo/',
         eval_freq=EVAL_FREQ,
         deterministic=True,
         render=False
@@ -84,18 +93,22 @@ def main():
     print(f"[OK] EvalCallback: eval every {EVAL_FREQ} steps")
 
     # ==================== Agent Creation ====================
-    print("\n[INFO] Creating TQC agent with Transformer...")
-    model = create_tqc_agent(train_env, tensorboard_log="./logs/tensorboard/")
-    print("[OK] Agent created (TensorBoard: logs/tensorboard/)")
+    print("\n[INFO] Creating TQC agent with Transformer (DEMO params)...")
+    model = create_tqc_agent(
+        train_env,
+        hyperparams=DEMO_HYPERPARAMS,
+        tensorboard_log="./logs/demo/tensorboard/"
+    )
+    print("[OK] Agent created (TensorBoard: logs/demo/tensorboard/)")
 
     # ==================== Training ====================
     print("\n" + "=" * 60)
-    print(f"Starting training for {TOTAL_TIMESTEPS:,} timesteps...")
+    print(f"[DEMO] Starting training for {TOTAL_TIMESTEPS:,} timesteps...")
     print("=" * 60 + "\n")
 
     # Callbacks: EvalCallback + TensorBoard step logging
     tb_callback = TensorBoardStepCallback(
-        log_dir="./logs/tensorboard_steps/",
+        log_dir="./logs/demo/tensorboard_steps/",
         log_freq=1,
         verbose=1
     )
@@ -108,20 +121,21 @@ def main():
     )
 
     # ==================== Save Final Model ====================
-    print("\n[INFO] Saving final model...")
-    model.save("models/final_model")
-    print("[OK] Model saved to models/final_model.zip")
+    print("\n[INFO] Saving demo model...")
+    model.save("models/demo/final_model_demo")
+    print("[OK] Model saved to models/demo/final_model_demo.zip")
 
     print("\n" + "=" * 60)
-    print("Training Complete!")
+    print("[DEMO] Training Complete!")
     print("=" * 60)
-    print("\nArtifacts:")
-    print("  - Best model: models/best_model.zip")
-    print("  - Final model: models/final_model.zip")
-    print("  - Logs: logs/evaluations.npz")
-    print("  - TensorBoard: logs/tensorboard/")
+    print("\nDemo Artifacts:")
+    print("  - Best model: models/demo/best_model.zip")
+    print("  - Final model: models/demo/final_model_demo.zip")
+    print("  - Logs: logs/demo/evaluations.npz")
+    print("  - TensorBoard: logs/demo/tensorboard/")
     print("\nTo view TensorBoard:")
-    print("  tensorboard --logdir=logs/tensorboard/")
+    print("  tensorboard --logdir=logs/demo/tensorboard/")
+    print("\n*** Si ce test passe, le pipeline TQC/Transformer fonctionne! ***")
 
 
 if __name__ == "__main__":
