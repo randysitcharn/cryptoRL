@@ -45,21 +45,22 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
         n_critics=2,
         n_quantiles=25,
         optimizer_kwargs=dict(weight_decay=1e-3),  # Régularisation L2 forte
+        log_std_init=-2,      # gSDE: exploration modérée au départ
     )
 
-    # Hyperparametres TQC ULTRA-CONSERVATEURS (anti-explosion)
+    # Hyperparametres TQC STABILISATION ACTOR (anti-explosion entropie)
     default_params = {
         "policy": "MlpPolicy",
         "learning_rate": 5e-5,    # Ultra-lent (0.00005) pour stabilité
         "buffer_size": 50_000,    # Plus petit pour recycler plus vite
         "batch_size": 128,        # Plus petit = plus de bruit régularisateur
-        "ent_coef": "auto",
+        "ent_coef": 0.05,         # FIXE (auto fait exploser le Transformer)
         "gamma": 0.99,
         "tau": 0.005,
-        "train_freq": 1,
-        "gradient_steps": 1,
+        "train_freq": 4,          # 1 update tous les 4 steps (stabilise gradients)
+        "gradient_steps": 4,      # 4 updates d'un coup
         "top_quantiles_to_drop_per_net": 2,  # Reduit l'optimisme (drop 2/25)
-        "use_sde": True,          # State Dependent Exploration (stabilité)
+        "use_sde": True,          # gSDE: State Dependent Exploration (SOTA)
         "use_sde_at_warmup": True,
         "policy_kwargs": policy_kwargs,
     }
