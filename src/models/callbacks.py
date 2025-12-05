@@ -47,6 +47,8 @@ class TensorBoardStepCallback(BaseCallback):
 
     Métriques loggées:
     - rollout/reward: Reward instantané
+    - rollout/ep_rew_mean: Reward total de l'épisode (à chaque fin d'épisode)
+    - rollout/ep_len_mean: Longueur de l'épisode (à chaque fin d'épisode)
     - env/portfolio_value: Valeur du portfolio (NAV)
     - env/price: Prix actuel de l'actif
     - env/max_drawdown: Max drawdown depuis le début (%)
@@ -122,6 +124,14 @@ class TensorBoardStepCallback(BaseCallback):
 
                         if 'max_drawdown' in info:
                             self.writer.add_scalar("env/max_drawdown", info['max_drawdown'] * 100, step)
+
+                        # Log episode metrics when episode ends (from Monitor wrapper)
+                        if 'episode' in info:
+                            ep_info = info['episode']
+                            if 'r' in ep_info:
+                                self.writer.add_scalar("rollout/ep_rew_mean", ep_info['r'], step)
+                            if 'l' in ep_info:
+                                self.writer.add_scalar("rollout/ep_len_mean", ep_info['l'], step)
 
             # Log training metrics (losses, entropy)
             if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):

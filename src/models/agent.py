@@ -12,10 +12,30 @@ TQC ameliorations vs SAC:
 - Plus robuste a l'overestimation bias
 """
 
+from typing import Callable
+
 from sb3_contrib import TQC
+from torch.optim import AdamW
 
 from src.config import DEVICE, SEED
 from src.models.transformer_policy import TransformerFeatureExtractor
+
+
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    """
+    Linear learning rate schedule.
+
+    Decroit lineairement le LR de initial_value a 0 au cours du training.
+
+    Args:
+        initial_value: Valeur initiale du learning rate.
+
+    Returns:
+        Callable qui prend progress_remaining (1.0 -> 0.0) et retourne le LR.
+    """
+    def func(progress_remaining: float) -> float:
+        return progress_remaining * initial_value
+    return func
 
 
 def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
@@ -44,14 +64,19 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
         net_arch=[256, 256],
         n_critics=2,
         n_quantiles=25,
-        optimizer_kwargs=dict(weight_decay=1e-3),  # Régularisation L2 forte
+        # AdamW avec régularisation propre (SOTA)
+        optimizer_class=AdamW,
+        optimizer_kwargs=dict(
+            weight_decay=1e-4,  # Régularisation L2 propre
+            eps=1e-5            # Stabilité numérique
+        ),
         log_std_init=-2,      # gSDE: exploration modérée au départ
     )
 
     # Hyperparametres TQC STABILISATION ACTOR (anti-explosion entropie)
     default_params = {
         "policy": "MlpPolicy",
-        "learning_rate": 5e-5,    # Ultra-lent (0.00005) pour stabilité
+        "learning_rate": linear_schedule(5e-5),  # Scheduler linéaire décroissant
         "buffer_size": 50_000,    # Plus petit pour recycler plus vite
         "batch_size": 128,        # Plus petit = plus de bruit régularisateur
         "ent_coef": 0.05,         # FIXE (auto fait exploser le Transformer)

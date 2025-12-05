@@ -131,7 +131,8 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True  # Native batch-first for efficiency
+            batch_first=True,  # Native batch-first for efficiency
+            norm_first=True    # Pre-LayerNorm: SOTA pour stabiliser gradients RL
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
