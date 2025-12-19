@@ -15,12 +15,14 @@ __all__ = ['CryptoMAE', 'SinusoidalPositionalEncoding']
 try:
     from src.models.agent import create_tqc_agent, create_agent
     from src.models.transformer_policy import TransformerFeatureExtractor
+    from src.models.rl_adapter import FoundationFeatureExtractor
     from src.models.callbacks import TensorBoardStepCallback
 
     __all__.extend([
         'create_tqc_agent',
         'create_agent',
         'TransformerFeatureExtractor',
+        'FoundationFeatureExtractor',
         'TensorBoardStepCallback'
     ])
 except ImportError:
