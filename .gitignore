@@ -27,6 +27,8 @@ data/*
 data/processed/*.csv
 logs/*
 !logs/.gitkeep
+weights/*.pth
+!weights/.gitkeep
 
 # Claude Code
 .claude/

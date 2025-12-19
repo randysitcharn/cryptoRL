@@ -1,0 +1,410 @@
+"""
+train_foundation.py - Script d'entraînement pour le Masked Auto-Encoder (MAE).
+
+Ce script:
+1. Charge les données avec split chronologique (80/20)
+2. Entraîne le CryptoMAE avec reconstruction masquée
+3. Implémente Early Stopping (patience=5)
+4. Sauvegarde le modèle complet et l'encodeur seul
+
+Usage:
+    python src/training/train_foundation.py
+"""
+
+import os
+import sys
+import time
+from datetime import datetime
+
+# Ajouter le chemin racine pour les imports
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ROOT_DIR)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
+
+from src.data.dataset import CryptoDataset
+from src.models.foundation import CryptoMAE
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+class TrainingConfig:
+    """Configuration d'entraînement."""
+
+    # Data
+    seq_len: int = 64
+    batch_size: int = 64
+    train_ratio: float = 0.8
+
+    # Model
+    d_model: int = 128
+    n_heads: int = 4
+    n_layers: int = 2
+    dropout: float = 0.1
+    mask_ratio: float = 0.15
+
+    # Training
+    epochs: int = 50
+    lr: float = 1e-4
+    weight_decay: float = 1e-5
+    patience: int = 5  # Early stopping
+
+    # Paths
+    data_path: str = "data/processed_data.parquet"
+    weights_dir: str = "weights"
+    checkpoint_path: str = "weights/best_foundation_full.pth"
+    encoder_path: str = "weights/pretrained_encoder.pth"
+
+
+# =============================================================================
+# Device Detection
+# =============================================================================
+
+def get_device() -> torch.device:
+    """Détecte automatiquement le meilleur device disponible."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"[Device] Using CUDA: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("[Device] Using Apple MPS")
+    else:
+        device = torch.device("cpu")
+        print("[Device] Using CPU")
+    return device
+
+
+# =============================================================================
+# Data Preparation
+# =============================================================================
+
+def prepare_data(config: TrainingConfig):
+    """
+    Prépare les données avec split chronologique.
+
+    Args:
+        config: Configuration d'entraînement.
+
+    Returns:
+        train_loader, val_loader, n_features
+    """
+    print("\n[Data] Loading dataset...")
+
+    # Charger le dataset complet
+    dataset = CryptoDataset(
+        parquet_path=os.path.join(ROOT_DIR, config.data_path),
+        seq_len=config.seq_len
+    )
+
+    n_samples = len(dataset)
+    n_features = dataset.n_features
+
+    # Split chronologique (PAS de mélange futur/passé)
+    train_size = int(config.train_ratio * n_samples)
+    val_size = n_samples - train_size
+
+    print(f"[Data] Total samples: {n_samples}")
+    print(f"[Data] Train: {train_size} ({config.train_ratio:.0%})")
+    print(f"[Data] Val: {val_size} ({1 - config.train_ratio:.0%})")
+
+    # Créer les subsets
+    train_dataset = Subset(dataset, range(0, train_size))
+    val_dataset = Subset(dataset, range(train_size, n_samples))
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,  # OK de mélanger DANS le train set
+        num_workers=0,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False
+    )
+
+    print(f"[Data] Train batches: {len(train_loader)}")
+    print(f"[Data] Val batches: {len(val_loader)}")
+
+    return train_loader, val_loader, n_features
+
+
+# =============================================================================
+# Training Functions
+# =============================================================================
+
+def train_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    device: torch.device,
+    config: TrainingConfig
+) -> float:
+    """
+    Entraîne le modèle pour une époque.
+
+    Returns:
+        Loss moyenne sur l'époque.
+    """
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+
+    pbar = tqdm(loader, desc="Training", leave=False)
+
+    for batch in pbar:
+        batch = batch.to(device)
+
+        optimizer.zero_grad()
+
+        # Mixed precision forward
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+            pred, target, mask = model(batch, mask_ratio=config.mask_ratio)
+
+            # MSE Loss sur les tokens masqués uniquement
+            # pred[mask] et target ont la même shape: (n_masked, n_features)
+            pred_masked = pred[mask]
+            loss = nn.functional.mse_loss(pred_masked, target)
+
+        # Backward avec scaling
+        if device.type == 'cuda':
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+    return total_loss / n_batches
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    config: TrainingConfig
+) -> float:
+    """
+    Valide le modèle.
+
+    Returns:
+        Loss moyenne sur la validation.
+    """
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        batch = batch.to(device)
+
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+            pred, target, mask = model(batch, mask_ratio=config.mask_ratio)
+            pred_masked = pred[mask]
+            loss = nn.functional.mse_loss(pred_masked, target)
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / n_batches
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    val_loss: float,
+    config: TrainingConfig
+):
+    """Sauvegarde le checkpoint complet et l'encodeur seul."""
+
+    # Créer le dossier si nécessaire
+    os.makedirs(config.weights_dir, exist_ok=True)
+
+    # 1. Checkpoint complet (pour reprendre l'entraînement)
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss,
+        'config': {
+            'd_model': config.d_model,
+            'n_heads': config.n_heads,
+            'n_layers': config.n_layers,
+            'dropout': config.dropout,
+            'seq_len': config.seq_len,
+        }
+    }
+    torch.save(checkpoint, os.path.join(ROOT_DIR, config.checkpoint_path))
+    print(f"  [Checkpoint] Saved: {config.checkpoint_path}")
+
+    # 2. CRUCIAL: Encodeur seul (pour l'agent RL Phase 3)
+    # Inclut: embedding + pos_encoder + encoder
+    encoder_state = {
+        'embedding': model.embedding.state_dict(),
+        'pos_encoder': model.pos_encoder.state_dict(),
+        'encoder': model.encoder.state_dict(),
+        'd_model': config.d_model,
+    }
+    torch.save(encoder_state, os.path.join(ROOT_DIR, config.encoder_path))
+    print(f"  [Encoder] Saved: {config.encoder_path}")
+
+
+# =============================================================================
+# Main Training Loop
+# =============================================================================
+
+def train(config: TrainingConfig = None):
+    """
+    Boucle d'entraînement principale.
+
+    Args:
+        config: Configuration (utilise défauts si None).
+    """
+    if config is None:
+        config = TrainingConfig()
+
+    print("=" * 70)
+    print("FOUNDATION MODEL TRAINING - CryptoMAE")
+    print("=" * 70)
+    print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Device
+    device = get_device()
+
+    # Data
+    train_loader, val_loader, n_features = prepare_data(config)
+
+    # Model
+    print("\n[Model] Creating CryptoMAE...")
+    model = CryptoMAE(
+        input_dim=n_features,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_layers=config.n_layers,
+        dropout=config.dropout
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[Model] Parameters: {n_params:,}")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay
+    )
+
+    # Mixed Precision Scaler
+    scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
+
+    # Training state
+    best_val_loss = float('inf')
+    patience_counter = 0
+    start_time = time.time()
+
+    print("\n[Training] Starting...")
+    print(f"  Epochs: {config.epochs}")
+    print(f"  Batch size: {config.batch_size}")
+    print(f"  Learning rate: {config.lr}")
+    print(f"  Mask ratio: {config.mask_ratio}")
+    print(f"  Early stopping patience: {config.patience}")
+    print()
+
+    # ==========================================================================
+    # Epoch Loop
+    # ==========================================================================
+
+    for epoch in range(1, config.epochs + 1):
+        epoch_start = time.time()
+
+        # Train
+        train_loss = train_epoch(model, train_loader, optimizer, scaler, device, config)
+
+        # Validate
+        val_loss = validate(model, val_loader, device, config)
+
+        epoch_time = time.time() - epoch_start
+
+        # Print progress
+        print(f"Epoch {epoch:02d}/{config.epochs} | "
+              f"Train Loss: {train_loss:.4f} | "
+              f"Val Loss: {val_loss:.4f} | "
+              f"Time: {epoch_time:.1f}s")
+
+        # Early Stopping Check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+
+            # Save best model
+            save_checkpoint(model, optimizer, epoch, val_loss, config)
+        else:
+            patience_counter += 1
+            print(f"  [Early Stopping] No improvement ({patience_counter}/{config.patience})")
+
+            if patience_counter >= config.patience:
+                print(f"\n[Early Stopping] Triggered at epoch {epoch}")
+                break
+
+    # ==========================================================================
+    # Training Complete
+    # ==========================================================================
+
+    total_time = time.time() - start_time
+
+    print("\n" + "=" * 70)
+    print("TRAINING COMPLETE")
+    print("=" * 70)
+    print(f"Total time: {total_time / 60:.1f} minutes")
+    print(f"Best Val Loss: {best_val_loss:.4f}")
+    print(f"Checkpoint: {config.checkpoint_path}")
+    print(f"Encoder weights: {config.encoder_path}")
+    print("=" * 70)
+
+    return model, best_val_loss
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+if __name__ == "__main__":
+    # Parse arguments si besoin
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train CryptoMAE Foundation Model")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+
+    args = parser.parse_args()
+
+    # Create config
+    config = TrainingConfig()
+    config.epochs = args.epochs
+    config.batch_size = args.batch_size
+    config.lr = args.lr
+    config.patience = args.patience
+
+    # Train
+    train(config)
