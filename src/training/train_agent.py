@@ -17,6 +17,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from torch.optim import AdamW
+import torch
 import numpy as np
 
 
@@ -90,6 +91,24 @@ class StepLoggingCallback(BaseCallback):
                   f"FPS: {fps:>5.0f}")
 
         return True
+
+
+class GradientClippingCallback(BaseCallback):
+    """
+    Callback pour clipper les gradients à chaque step.
+    Prévient l'explosion de gradient dans TQC.
+    """
+    def __init__(self, max_grad_norm: float = 0.5, verbose: int = 0):
+        super().__init__(verbose)
+        self.max_grad_norm = max_grad_norm
+
+    def _on_step(self) -> bool:
+        # Clip gradients for all networks
+        for param_group in self.model.policy.parameters():
+            if param_group.grad is not None:
+                torch.nn.utils.clip_grad_norm_([param_group], self.max_grad_norm)
+        return True
+
 
 from src.config import DEVICE, SEED
 from src.models.rl_adapter import FoundationFeatureExtractor
@@ -235,6 +254,10 @@ def create_callbacks(config: TrainingConfig, eval_env) -> list:
     step_callback = StepLoggingCallback(log_freq=config.log_freq)
     callbacks.append(step_callback)
 
+    # Gradient clipping callback (prevents explosion)
+    grad_clip_callback = GradientClippingCallback(max_grad_norm=0.5)
+    callbacks.append(grad_clip_callback)
+
     # Evaluation callback
     eval_callback = EvalCallback(
         eval_env,
@@ -318,7 +341,6 @@ def train(config: TrainingConfig = None) -> TQC:
         verbose=1,
         seed=SEED,
         device=DEVICE,
-        max_grad_norm=0.5,  # Gradient clipping for stability
     )
 
     print(f"      Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
