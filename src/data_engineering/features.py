@@ -28,7 +28,10 @@ class FeatureEngineer:
     ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
 
     # Actifs pour Fracdiff (Close uniquement)
-    FRACDIFF_ASSETS = ['BTC', 'ETH', 'SPX', 'DXY']
+    FRACDIFF_ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
+
+    # Actifs pour Volume relatif
+    VOLUME_ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
 
     def __init__(
         self,
@@ -353,6 +356,87 @@ class FeatureEngineer:
         return df
 
     # =========================================================================
+    # VOLUME FEATURES
+    # =========================================================================
+
+    def add_volume_features(
+        self,
+        df: pd.DataFrame,
+        zscore_window: int = 336  # 14 jours = 336 heures
+    ) -> pd.DataFrame:
+        """
+        Ajoute les features de volume pour chaque actif.
+
+        Features créées:
+        - {ASSET}_Vol_LogRet: Log-return du volume (momentum)
+        - {ASSET}_Vol_ZScore: Z-Score glissant 14j (détection d'anomalies)
+
+        Gestion des volumes manquants (DXY, SPX):
+        - Si pas de volume valide, force les deux features à 0.0
+        - Cela agit comme "zero padding" pour le réseau de neurones
+
+        Args:
+            df: DataFrame avec colonnes {ASSET}_Volume.
+            zscore_window: Fenêtre pour Z-Score (défaut: 336h = 14 jours).
+
+        Returns:
+            DataFrame avec colonnes Vol_LogRet et Vol_ZScore ajoutées.
+        """
+        print(f"\n[Volume] Calculating Vol_LogRet and Vol_ZScore (window={zscore_window}h)...")
+
+        for asset in self.VOLUME_ASSETS:
+            vol_col = f"{asset}_Volume"
+
+            if vol_col not in df.columns:
+                print(f"  [WARNING] {vol_col} not found, setting to 0.")
+                df[f"{asset}_Vol_LogRet"] = 0.0
+                df[f"{asset}_Vol_ZScore"] = 0.0
+                continue
+
+            volume = df[vol_col].copy()
+
+            # Vérifier si le volume est valide (non-zéro)
+            has_valid_volume = volume.sum() > 0 and not volume.isna().all()
+
+            if not has_valid_volume:
+                # Pas de volume valide -> Zero Padding
+                print(f"  {asset}: No valid volume -> Zero Padding")
+                df[f"{asset}_Vol_LogRet"] = 0.0
+                df[f"{asset}_Vol_ZScore"] = 0.0
+                continue
+
+            # ===== Vol_LogRet (Momentum) =====
+            # Remplacer 0 par 1 avant le log pour éviter -inf
+            volume_safe = volume.replace(0, 1)
+            vol_logret = np.log(volume_safe / volume_safe.shift(1))
+            vol_logret = vol_logret.replace([np.inf, -np.inf], 0.0)
+            vol_logret = vol_logret.fillna(0.0)
+            df[f"{asset}_Vol_LogRet"] = vol_logret
+
+            # ===== Vol_ZScore (Anomalie) =====
+            rolling_mean = volume.rolling(window=zscore_window, min_periods=1).mean()
+            rolling_std = volume.rolling(window=zscore_window, min_periods=1).std()
+
+            # Éviter division par zéro
+            vol_zscore = (volume - rolling_mean) / (rolling_std + 1e-8)
+            vol_zscore = vol_zscore.replace([np.inf, -np.inf], 0.0)
+            vol_zscore = vol_zscore.fillna(0.0)
+            df[f"{asset}_Vol_ZScore"] = vol_zscore
+
+            print(f"  {asset}: Vol_LogRet and Vol_ZScore computed")
+
+        # Vérification de contrôle
+        print("\n  [VERIFICATION]")
+        if 'BTC_Vol_ZScore' in df.columns:
+            btc_sample = df['BTC_Vol_ZScore'].iloc[400:405].values
+            print(f"    BTC_Vol_ZScore (sample): {btc_sample}")
+        if 'DXY_Vol_ZScore' in df.columns:
+            dxy_sample = df['DXY_Vol_ZScore'].iloc[400:405].values
+            print(f"    DXY_Vol_ZScore (sample): {dxy_sample}")
+
+        return df
+
+    # =========================================================================
     # PIPELINE
     # =========================================================================
 
@@ -382,11 +466,12 @@ class FeatureEngineer:
 
         Ordre d'exécution:
         1. Log-Returns
-        2. Parkinson Volatility
-        3. Garman-Klass Volatility
-        4. Rolling Z-Score
-        5. Fractional Differentiation (FFD)
-        6. Clean (drop NaN)
+        2. Volume Relatif (log)
+        3. Parkinson Volatility
+        4. Garman-Klass Volatility
+        5. Rolling Z-Score
+        6. Fractional Differentiation (FFD)
+        7. Clean (drop NaN)
 
         Args:
             df: DataFrame multi-actifs brut.
@@ -401,19 +486,22 @@ class FeatureEngineer:
         # 1. Log-Returns (pas de NaN créés, juste shift de 1)
         df = self.add_log_returns(df)
 
-        # 2. Parkinson Volatility
+        # 2. Volume Relatif (log)
+        df = self.add_volume_features(df)
+
+        # 3. Parkinson Volatility
         df = self.add_parkinson_volatility(df)
 
-        # 3. Garman-Klass Volatility
+        # 4. Garman-Klass Volatility
         df = self.add_garman_klass_volatility(df)
 
-        # 4. Rolling Z-Score
+        # 5. Rolling Z-Score
         df = self.add_rolling_zscore(df)
 
-        # 5. Fractional Differentiation (le plus coûteux)
+        # 6. Fractional Differentiation (le plus coûteux)
         df = self.add_fracdiff(df)
 
-        # 6. Clean NaN
+        # 7. Clean NaN
         df = self.clean(df)
 
         print("\n" + "=" * 60)

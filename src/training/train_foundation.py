@@ -268,16 +268,40 @@ def save_checkpoint(
     print(f"  [Encoder] Saved: {config.encoder_path}")
 
 
+def load_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str,
+    device: torch.device
+) -> tuple[int, float]:
+    """
+    Charge un checkpoint et retourne l'état d'entraînement.
+
+    Returns:
+        (epoch, val_loss) du checkpoint.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['epoch'], checkpoint['val_loss']
+
+
 # =============================================================================
 # Main Training Loop
 # =============================================================================
 
-def train(config: TrainingConfig = None):
+def train(
+    config: TrainingConfig = None,
+    from_scratch: bool = False,
+    extra_epochs: int = None
+):
     """
     Boucle d'entraînement principale.
 
     Args:
         config: Configuration (utilise défauts si None).
+        from_scratch: Force un entraînement depuis zéro.
+        extra_epochs: Nombre d'epochs supplémentaires (mode reprise).
     """
     if config is None:
         config = TrainingConfig()
@@ -316,13 +340,50 @@ def train(config: TrainingConfig = None):
     # Mixed Precision Scaler
     scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
 
-    # Training state
+    # ==========================================================================
+    # Resume Logic
+    # ==========================================================================
+
+    checkpoint_file = os.path.join(ROOT_DIR, config.checkpoint_path)
+    start_epoch = 1
     best_val_loss = float('inf')
     patience_counter = 0
+
+    if not from_scratch and os.path.exists(checkpoint_file):
+        # Charger le checkpoint
+        loaded_epoch, loaded_val_loss = load_checkpoint(
+            model, optimizer, checkpoint_file, device
+        )
+        best_val_loss = loaded_val_loss
+
+        if extra_epochs is not None:
+            # Mode: epochs supplémentaires
+            start_epoch = loaded_epoch + 1
+            end_epoch = loaded_epoch + extra_epochs
+            print(f"\n[Resume] Loaded checkpoint from epoch {loaded_epoch} (val_loss: {loaded_val_loss:.4f})")
+            print(f"[Resume] Training for {extra_epochs} additional epochs ({start_epoch} → {end_epoch})")
+        else:
+            # Mode: continuer jusqu'à config.epochs
+            start_epoch = loaded_epoch + 1
+            end_epoch = config.epochs
+            if start_epoch > end_epoch:
+                print(f"\n[Resume] Already trained {loaded_epoch} epochs (target: {config.epochs})")
+                print("[Resume] Nothing to do. Use --extra-epochs or increase --epochs.")
+                return model, best_val_loss
+            print(f"\n[Resume] Loaded checkpoint from epoch {loaded_epoch} (val_loss: {loaded_val_loss:.4f})")
+            print(f"[Resume] Continuing to epoch {end_epoch} ({start_epoch} → {end_epoch})")
+    else:
+        # Entraînement depuis zéro
+        end_epoch = config.epochs
+        if from_scratch and os.path.exists(checkpoint_file):
+            print("\n[Training] Starting from scratch (--from-scratch flag)")
+        else:
+            print("\n[Training] Starting fresh (no checkpoint found)")
+
     start_time = time.time()
 
-    print("\n[Training] Starting...")
-    print(f"  Epochs: {config.epochs}")
+    print(f"\n[Training] Configuration:")
+    print(f"  Epochs: {start_epoch} → {end_epoch}")
     print(f"  Batch size: {config.batch_size}")
     print(f"  Learning rate: {config.lr}")
     print(f"  Mask ratio: {config.mask_ratio}")
@@ -333,7 +394,7 @@ def train(config: TrainingConfig = None):
     # Epoch Loop
     # ==========================================================================
 
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(start_epoch, end_epoch + 1):
         epoch_start = time.time()
 
         # Train
@@ -345,7 +406,7 @@ def train(config: TrainingConfig = None):
         epoch_time = time.time() - epoch_start
 
         # Print progress
-        print(f"Epoch {epoch:02d}/{config.epochs} | "
+        print(f"Epoch {epoch:02d}/{end_epoch} | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
               f"Time: {epoch_time:.1f}s")
@@ -396,6 +457,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+    parser.add_argument("--from-scratch", action="store_true",
+                        help="Force training from scratch, ignoring checkpoints")
+    parser.add_argument("--extra-epochs", type=int, default=None,
+                        help="Additional epochs to train (resume mode)")
 
     args = parser.parse_args()
 
@@ -407,4 +472,4 @@ if __name__ == "__main__":
     config.patience = args.patience
 
     # Train
-    train(config)
+    train(config, from_scratch=args.from_scratch, extra_epochs=args.extra_epochs)
