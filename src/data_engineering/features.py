@@ -62,6 +62,83 @@ class FeatureEngineer:
     # FRACTIONAL DIFFERENTIATION (FFD)
     # =========================================================================
 
+    # =========================================================================
+    # DATA SANITIZATION
+    # =========================================================================
+
+    def _sanitize_prices(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Replace 0 prices with NaN and forward-fill.
+
+        Prevents division by zero in log-return calculations that cause
+        extreme values like -35 (which crashed the RL training).
+
+        Args:
+            df: DataFrame with price columns.
+
+        Returns:
+            DataFrame with sanitized prices.
+        """
+        print("\n[Sanitize] Cleaning price data (0 -> NaN -> ffill)...")
+
+        price_cols = []
+        for asset in self.ASSETS:
+            price_cols.extend([
+                f"{asset}_Close", f"{asset}_Open",
+                f"{asset}_High", f"{asset}_Low"
+            ])
+
+        zeros_replaced = 0
+        for col in price_cols:
+            if col in df.columns:
+                # Count zeros before replacing
+                n_zeros = (df[col] == 0).sum()
+                zeros_replaced += n_zeros
+
+                # Replace 0 with NaN
+                df[col] = df[col].replace(0, np.nan)
+
+                # Forward fill to maintain continuity
+                df[col] = df[col].ffill()
+
+                # Backward fill for any remaining NaN at the start
+                df[col] = df[col].bfill()
+
+        print(f"  Replaced {zeros_replaced} zero values across price columns")
+
+        return df
+
+    def _validate_features(self, df: pd.DataFrame) -> None:
+        """
+        Check for extreme values that indicate data corruption.
+
+        Prints warnings for any feature with |value| > 10.
+
+        Args:
+            df: DataFrame to validate.
+        """
+        print("\n[Validate] Checking for extreme values...")
+
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        warnings_count = 0
+
+        for col in numeric_cols:
+            max_val = df[col].max()
+            min_val = df[col].min()
+
+            if abs(max_val) > 10 or abs(min_val) > 10:
+                print(f"  [WARNING] {col}: min={min_val:.2f}, max={max_val:.2f}")
+                warnings_count += 1
+
+        if warnings_count == 0:
+            print("  All features within normal range [-10, 10]")
+        else:
+            print(f"  Found {warnings_count} features with extreme values!")
+
+    # =========================================================================
+    # FRACTIONAL DIFFERENTIATION (FFD)
+    # =========================================================================
+
     def _get_weights_ffd(self, d: float, threshold: float = 1e-5) -> np.ndarray:
         """
         Calcule les poids pour la Différenciation Fractionnaire (FFD).
@@ -351,6 +428,10 @@ class FeatureEngineer:
             # Remplacer inf par 0
             log_ret = log_ret.replace([np.inf, -np.inf], 0)
 
+            # Hard clip: +/- 20% max per hour (prevents data corruption explosions)
+            # A 20% hourly move is already extreme; anything beyond is data error
+            log_ret = np.clip(log_ret, -0.20, 0.20)
+
             df[f"{asset}_LogRet"] = log_ret
 
         return df
@@ -465,13 +546,15 @@ class FeatureEngineer:
         Pipeline complet de feature engineering.
 
         Ordre d'exécution:
-        1. Log-Returns
+        0. Sanitize prices (0 -> NaN -> ffill)
+        1. Log-Returns (with hard clip +/- 20%)
         2. Volume Relatif (log)
         3. Parkinson Volatility
         4. Garman-Klass Volatility
         5. Rolling Z-Score
         6. Fractional Differentiation (FFD)
         7. Clean (drop NaN)
+        8. Validate (check for extreme values)
 
         Args:
             df: DataFrame multi-actifs brut.
@@ -483,7 +566,10 @@ class FeatureEngineer:
         print("FEATURE ENGINEERING - Starting...")
         print("=" * 60)
 
-        # 1. Log-Returns (pas de NaN créés, juste shift de 1)
+        # 0. Sanitize prices (prevents log(0) = -inf explosions)
+        df = self._sanitize_prices(df)
+
+        # 1. Log-Returns (with hard clip +/- 20%)
         df = self.add_log_returns(df)
 
         # 2. Volume Relatif (log)
@@ -503,6 +589,9 @@ class FeatureEngineer:
 
         # 7. Clean NaN
         df = self.clean(df)
+
+        # 8. Validate features (check for extreme values)
+        self._validate_features(df)
 
         print("\n" + "=" * 60)
         print("FEATURE ENGINEERING - Complete!")
