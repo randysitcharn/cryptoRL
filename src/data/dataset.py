@@ -28,14 +28,17 @@ class CryptoDataset(Dataset):
         feature_cols: Liste des noms de colonnes utilisées
     """
 
-    # Colonnes à exclure (prix bruts non-scalés)
+    # Colonnes à exclure (prix bruts et volumes bruts non-scalés)
     EXCLUDE_COLS = [
+        # Prix OHLC bruts
         'BTC_Close', 'ETH_Close', 'SPX_Close', 'DXY_Close', 'NASDAQ_Close',
-        'BTC_Open', 'BTC_High', 'BTC_Low', 'BTC_Volume',
+        'BTC_Open', 'BTC_High', 'BTC_Low',
         'ETH_Open', 'ETH_High', 'ETH_Low',
         'SPX_Open', 'SPX_High', 'SPX_Low',
         'DXY_Open', 'DXY_High', 'DXY_Low',
         'NASDAQ_Open', 'NASDAQ_High', 'NASDAQ_Low',
+        # Volumes bruts (utiliser VolRel à la place)
+        'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
     ]
 
     def __init__(
