@@ -22,27 +22,39 @@ import numpy as np
 
 class StepLoggingCallback(BaseCallback):
     """
-    Callback pour logger à chaque N steps.
+    Callback pour logger à chaque N steps (console + TensorBoard).
     """
     def __init__(self, log_freq: int = 1000, verbose: int = 1):
         super().__init__(verbose)
         self.log_freq = log_freq
         self.episode_rewards = []
         self.episode_lengths = []
+        self.last_episode_info = {}
 
     def _on_step(self) -> bool:
         # Collecter les infos d'épisode si disponibles
         if self.locals.get("infos"):
             for info in self.locals["infos"]:
                 if "episode" in info:
-                    self.episode_rewards.append(info["episode"]["r"])
-                    self.episode_lengths.append(info["episode"]["l"])
+                    ep_reward = info["episode"]["r"]
+                    ep_length = info["episode"]["l"]
+                    self.episode_rewards.append(ep_reward)
+                    self.episode_lengths.append(ep_length)
+                    self.last_episode_info = {
+                        "reward": ep_reward,
+                        "length": ep_length,
+                    }
+
+                # Collecter les infos de trading (NAV, position, etc.)
+                if "nav" in info:
+                    self.last_episode_info["nav"] = info["nav"]
+                if "position_pct" in info:
+                    self.last_episode_info["position"] = info["position_pct"]
+                if "total_trades" in info:
+                    self.last_episode_info["trades"] = info["total_trades"]
 
         # Logger tous les log_freq steps
         if self.num_timesteps % self.log_freq == 0:
-            # Récupérer les métriques du logger
-            fps = self.model.logger.name_to_value.get("time/fps", 0)
-
             # Calculer les stats des derniers épisodes
             if self.episode_rewards:
                 mean_reward = np.mean(self.episode_rewards[-10:])
@@ -51,9 +63,30 @@ class StepLoggingCallback(BaseCallback):
                 mean_reward = 0
                 mean_length = 0
 
+            # Log to TensorBoard
+            self.logger.record("custom/mean_reward_10ep", mean_reward)
+            self.logger.record("custom/mean_length_10ep", mean_length)
+
+            if self.last_episode_info:
+                if "nav" in self.last_episode_info:
+                    self.logger.record("custom/nav", self.last_episode_info["nav"])
+                if "position" in self.last_episode_info:
+                    self.logger.record("custom/position", self.last_episode_info["position"])
+                if "trades" in self.last_episode_info:
+                    self.logger.record("custom/total_trades", self.last_episode_info["trades"])
+
+            # Force dump to TensorBoard
+            self.logger.dump(self.num_timesteps)
+
+            # Console log
+            fps = self.model.logger.name_to_value.get("time/fps", 0)
+            nav = self.last_episode_info.get("nav", 0)
+            pos = self.last_episode_info.get("position", 0)
+
             print(f"Step {self.num_timesteps:>7} | "
                   f"Reward: {mean_reward:>8.2f} | "
-                  f"Length: {mean_length:>6.0f} | "
+                  f"NAV: {nav:>10.2f} | "
+                  f"Pos: {pos:>+5.2f} | "
                   f"FPS: {fps:>5.0f}")
 
         return True
