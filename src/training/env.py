@@ -61,7 +61,7 @@ class CryptoTradingEnv(gym.Env):
         commission: float = 0.0006,  # 0.06% per trade
         slippage: float = 0.0001,    # 0.01% slippage
         window_size: int = 64,
-        reward_scaling: float = 1.0,
+        reward_scaling: float = 0.1,  # Reduced for stability
         random_start: bool = True,
         episode_length: Optional[int] = None,
         eta: float = 0.01,  # DSR EMA decay factor
@@ -227,8 +227,8 @@ class CryptoTradingEnv(gym.Env):
                 / (variance ** 1.5 + 1e-8)
             )
         else:
-            # Fall back to simple return when variance is too small
-            dsr = step_return * 100
+            # No reward when variance too small (prevents gradient explosion)
+            dsr = 0.0
 
         return dsr
 
@@ -310,8 +310,8 @@ class CryptoTradingEnv(gym.Env):
         # 7. Calculate reward (Differential Sharpe Ratio)
         reward = self._calculate_dsr(step_return) * self.reward_scaling
 
-        # Clip reward for stability
-        reward = float(np.clip(reward, -10.0, 10.0))
+        # Clip reward for stability (tight bounds to prevent gradient explosion)
+        reward = float(np.clip(reward, -1.0, 1.0))
 
         # 8. Check termination
         terminated = False

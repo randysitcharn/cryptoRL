@@ -122,8 +122,8 @@ class TrainingConfig:
 
     # TQC Hyperparameters
     total_timesteps: int = 1_000_000
-    learning_rate: float = 3e-4
-    buffer_size: int = 100_000
+    learning_rate: float = 5e-5  # Reduced for stability
+    buffer_size: int = 200_000  # Increased for stability
     batch_size: int = 256
     gamma: float = 0.99
     tau: float = 0.005
@@ -318,6 +318,7 @@ def train(config: TrainingConfig = None) -> TQC:
         verbose=1,
         seed=SEED,
         device=DEVICE,
+        max_grad_norm=0.5,  # Gradient clipping for stability
     )
 
     print(f"      Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
