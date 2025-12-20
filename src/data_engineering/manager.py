@@ -355,7 +355,7 @@ class DataManager:
         self.scaler = RobustScaler()
         self.scaler_path: Optional[str] = None
 
-        # Colonnes à exclure du scaling (prix bruts et volumes bruts)
+        # Colonnes à exclure du scaling (prix bruts, volumes bruts, et log-returns)
         self.exclude_from_scaling = [
             # Prix OHLC bruts
             'BTC_Close', 'ETH_Close', 'SPX_Close', 'DXY_Close', 'NASDAQ_Close',
@@ -366,6 +366,8 @@ class DataManager:
             'NASDAQ_Open', 'NASDAQ_High', 'NASDAQ_Low',
             # Volumes bruts (VolRel sera scalé)
             'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
+            # Log-returns (déjà clippés à +/- 20%, pas besoin de scaler)
+            'BTC_LogRet', 'ETH_LogRet', 'SPX_LogRet', 'DXY_LogRet', 'NASDAQ_LogRet',
         ]
 
     def pipeline(
