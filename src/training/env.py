@@ -320,7 +320,7 @@ class CryptoTradingEnv(gym.Env):
         # Bankruptcy
         if new_nav <= 0:
             terminated = True
-            reward = -100.0
+            reward = -2.0  # Strong penalty but finite (will be clipped to -1.0)
 
         # End of episode
         if self.current_step >= self.episode_end:
@@ -330,7 +330,8 @@ class CryptoTradingEnv(gym.Env):
         observation = self._get_observation()
         info = self._get_info(action[0], step_return, new_nav)
 
-        return observation, reward, terminated, truncated, info
+        # Final clip to ensure reward is always in [-1, 1] (safety net)
+        return observation, float(np.clip(reward, -1.0, 1.0)), terminated, truncated, info
 
     def _get_observation(self) -> np.ndarray:
         """Get current observation window."""
