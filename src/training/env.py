@@ -192,18 +192,26 @@ class CryptoTradingEnv(gym.Env):
 
     def _calculate_reward(self, step_return: float) -> float:
         """
-        Calculate Robust Simple Reward.
+        Asymmetric Reward Function.
 
-        PnL simple normalisé: 1% return ≈ 1.0 reward.
-        Clippé agressivement pour empêcher tout gradient > 1.0.
+        - Gains: Capped at +1.0 (Soft Cap) to prevent exploding gradients on pumps.
+        - Losses: Allowed down to -10.0 (Hard Floor) to punish bad trades severely.
 
         Args:
             step_return: Log return for this step.
 
         Returns:
-            Reward value clipped to [-1.0, 1.0].
+            Reward value clipped to [-10.0, +1.0].
         """
-        return float(np.clip(step_return * 100.0, -1.0, 1.0))
+        # 1. Scale: 1% return -> 1.0 reward
+        raw_reward = step_return * 100.0
+
+        # 2. Asymmetric Clip
+        # Min: -10.0 (Punition max pour -10% ou plus)
+        # Max: +1.0 (Gain max capé pour +1% ou plus)
+        reward = float(np.clip(raw_reward, -10.0, 1.0))
+
+        return reward
 
     def reset(
         self,
