@@ -15,8 +15,48 @@ from typing import Callable
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from torch.optim import AdamW
+import numpy as np
+
+
+class StepLoggingCallback(BaseCallback):
+    """
+    Callback pour logger à chaque N steps.
+    """
+    def __init__(self, log_freq: int = 1000, verbose: int = 1):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.episode_rewards = []
+        self.episode_lengths = []
+
+    def _on_step(self) -> bool:
+        # Collecter les infos d'épisode si disponibles
+        if self.locals.get("infos"):
+            for info in self.locals["infos"]:
+                if "episode" in info:
+                    self.episode_rewards.append(info["episode"]["r"])
+                    self.episode_lengths.append(info["episode"]["l"])
+
+        # Logger tous les log_freq steps
+        if self.num_timesteps % self.log_freq == 0:
+            # Récupérer les métriques du logger
+            fps = self.model.logger.name_to_value.get("time/fps", 0)
+
+            # Calculer les stats des derniers épisodes
+            if self.episode_rewards:
+                mean_reward = np.mean(self.episode_rewards[-10:])
+                mean_length = np.mean(self.episode_lengths[-10:])
+            else:
+                mean_reward = 0
+                mean_length = 0
+
+            print(f"Step {self.num_timesteps:>7} | "
+                  f"Reward: {mean_reward:>8.2f} | "
+                  f"Length: {mean_length:>6.0f} | "
+                  f"FPS: {fps:>5.0f}")
+
+        return True
 
 from src.config import DEVICE, SEED
 from src.models.rl_adapter import FoundationFeatureExtractor
@@ -68,6 +108,7 @@ class TrainingConfig:
     # Callbacks
     eval_freq: int = 10_000
     checkpoint_freq: int = 50_000
+    log_freq: int = 1000  # Log every N steps
 
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -156,6 +197,10 @@ def create_callbacks(config: TrainingConfig, eval_env) -> list:
         List of callbacks.
     """
     callbacks = []
+
+    # Step logging callback
+    step_callback = StepLoggingCallback(log_freq=config.log_freq)
+    callbacks.append(step_callback)
 
     # Evaluation callback
     eval_callback = EvalCallback(
@@ -281,4 +326,20 @@ def train(config: TrainingConfig = None) -> TQC:
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train TQC agent with Foundation Model")
+    parser.add_argument("--timesteps", type=int, default=1_000_000, help="Total timesteps")
+    parser.add_argument("--log-freq", type=int, default=1000, help="Log frequency (steps)")
+    parser.add_argument("--eval-freq", type=int, default=10_000, help="Eval frequency (steps)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+
+    args = parser.parse_args()
+
+    config = TrainingConfig()
+    config.total_timesteps = args.timesteps
+    config.log_freq = args.log_freq
+    config.eval_freq = args.eval_freq
+    config.learning_rate = args.lr
+
+    train(config)
