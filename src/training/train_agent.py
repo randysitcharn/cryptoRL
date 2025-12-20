@@ -145,7 +145,7 @@ class TrainingConfig:
     learning_rate: float = 1e-5  # Ultra-conservative for stability
     buffer_size: int = 200_000  # Increased for stability
     batch_size: int = 256
-    gamma: float = 0.99
+    gamma: float = 0.95  # Reduced from 0.99 to prevent Q-value explosion
     tau: float = 0.005
     ent_coef: str = "auto"  # Automatic entropy tuning
     train_freq: int = 1
@@ -390,7 +390,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=1_000_000, help="Total timesteps")
     parser.add_argument("--log-freq", type=int, default=100, help="Log frequency (steps)")
     parser.add_argument("--eval-freq", type=int, default=10_000, help="Eval frequency (steps)")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
 
     args = parser.parse_args()
 
