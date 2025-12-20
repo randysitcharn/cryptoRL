@@ -141,7 +141,7 @@ class TrainingConfig:
     # Callbacks
     eval_freq: int = 10_000
     checkpoint_freq: int = 50_000
-    log_freq: int = 1000  # Log every N steps
+    log_freq: int = 100  # Log every N steps
 
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
