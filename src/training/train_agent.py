@@ -133,6 +133,7 @@ class TrainingConfig:
     window_size: int = 64
     commission: float = 0.0006  # 0.06%
     train_ratio: float = 0.8
+    episode_length: int = 2048  # Épisodes plus courts pour tracking des rewards
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -141,7 +142,7 @@ class TrainingConfig:
 
     # TQC Hyperparameters
     total_timesteps: int = 1_000_000
-    learning_rate: float = 5e-5  # Reduced for stability
+    learning_rate: float = 1e-5  # Ultra-conservative for stability
     buffer_size: int = 200_000  # Increased for stability
     batch_size: int = 256
     gamma: float = 0.99
@@ -224,6 +225,7 @@ def create_environments(config: TrainingConfig):
         train_ratio=config.train_ratio,
         window_size=config.window_size,
         commission=config.commission,
+        episode_length=config.episode_length,
     )
 
     # Wrap in Monitor for episode tracking

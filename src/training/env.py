@@ -3,9 +3,7 @@
 env.py - Trading Environment for RL with Foundation Model.
 
 Gymnasium environment optimized for TQC training with pre-trained encoder.
-Uses Differential Sharpe Ratio (DSR) for more stable reward signal.
-
-Reference: Moody & Saffell (2001) - Learning to Trade via Direct Reinforcement
+Uses Robust Simple Reward (scaled log-return) for numerical stability.
 """
 
 import gymnasium as gym
@@ -36,7 +34,7 @@ class CryptoTradingEnv(gym.Env):
 
     Features:
     - Continuous action space [-1, 1] for position sizing
-    - Differential Sharpe Ratio reward (SOTA for trading)
+    - Robust Simple Reward (scaled log-return, numerically stable)
     - Realistic transaction costs (0.06% commission)
     - Random or sequential episode starts
     - Compatible with FoundationFeatureExtractor
@@ -128,8 +126,7 @@ class CryptoTradingEnv(gym.Env):
         self.random_start = random_start
         self.episode_length = episode_length
 
-        # DSR parameters
-        self.eta = eta  # EMA decay factor
+        # Note: DSR removed, using simple reward now
 
         # Action space: continuous [-1, 1]
         self.action_space = spaces.Box(
@@ -176,9 +173,7 @@ class CryptoTradingEnv(gym.Env):
         self.position = 0.0  # Number of units held
         self.current_position_pct = 0.0  # Current position as % [-1, 1]
 
-        # DSR state (Differential Sharpe Ratio)
-        self.A = 0.0  # EMA of returns
-        self.B = 0.0  # EMA of squared returns
+        # Reward tracking (DSR removed - using simple reward now)
 
         # Tracking
         self.total_trades = 0
@@ -195,42 +190,20 @@ class CryptoTradingEnv(gym.Env):
         price = self._get_price()
         return self.cash + self.position * price
 
-    def _calculate_dsr(self, step_return: float) -> float:
+    def _calculate_reward(self, step_return: float) -> float:
         """
-        Calculate Differential Sharpe Ratio.
+        Calculate Robust Simple Reward.
 
-        DSR provides a gradient-friendly reward that captures both
-        return and risk in a single value.
-
-        Reference: Moody & Saffell (2001)
+        PnL simple normalisé: 1% return ≈ 1.0 reward.
+        Clippé agressivement pour empêcher tout gradient > 1.0.
 
         Args:
             step_return: Log return for this step.
 
         Returns:
-            Differential Sharpe Ratio value.
+            Reward value clipped to [-1.0, 1.0].
         """
-        # Update EMAs
-        delta_A = step_return - self.A
-        delta_B = step_return ** 2 - self.B
-
-        self.A += self.eta * delta_A
-        self.B += self.eta * delta_B
-
-        # Calculate DSR
-        # DSR = (B_{t-1} * δA - 0.5 * A_{t-1} * δB) / (B_{t-1} - A_{t-1}²)^{3/2}
-        variance = self.B - self.A ** 2
-
-        if variance > 1e-8:
-            dsr = (
-                (self.B * delta_A - 0.5 * self.A * delta_B)
-                / (variance ** 1.5 + 1e-8)
-            )
-        else:
-            # No reward when variance too small (prevents gradient explosion)
-            dsr = 0.0
-
-        return dsr
+        return float(np.clip(step_return * 100.0, -1.0, 1.0))
 
     def reset(
         self,
@@ -307,11 +280,8 @@ class CryptoTradingEnv(gym.Env):
 
         self.returns_history.append(step_return)
 
-        # 7. Calculate reward (Differential Sharpe Ratio)
-        reward = self._calculate_dsr(step_return) * self.reward_scaling
-
-        # Clip reward for stability (tight bounds to prevent gradient explosion)
-        reward = float(np.clip(reward, -1.0, 1.0))
+        # 7. Calculate reward (Robust Simple Reward)
+        reward = self._calculate_reward(step_return)
 
         # 8. Check termination
         terminated = False
@@ -360,8 +330,6 @@ class CryptoTradingEnv(gym.Env):
             'return': step_return,
             'total_trades': self.total_trades,
             'total_commission': self.total_commission,
-            'sharpe_ema_A': self.A,
-            'sharpe_ema_B': self.B,
         }
 
     def render(self) -> None:
