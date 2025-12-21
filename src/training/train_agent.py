@@ -158,6 +158,11 @@ class TrainingConfig:
     net_arch: list = [256, 256]
     freeze_encoder: bool = True
 
+    # gSDE (State-Dependent Exploration)
+    use_sde: bool = True
+    sde_sample_freq: int = -1  # -1 = resample noise once per episode
+    use_sde_at_warmup: bool = True
+
     # Callbacks
     eval_freq: int = 10_000
     checkpoint_freq: int = 50_000
@@ -323,6 +328,7 @@ def train(config: TrainingConfig = None) -> TQC:
     print(f"      Frozen: {config.freeze_encoder}")
     print(f"      Net arch: {config.net_arch}")
     print(f"      features_dim: {obs_shape[0]} * {config.d_model} = {obs_shape[0] * config.d_model}")
+    print(f"      gSDE: {config.use_sde} (sample_freq={config.sde_sample_freq})")
 
     # ==================== Model Creation ====================
     print("\n[3/4] Creating TQC model...")
@@ -338,6 +344,9 @@ def train(config: TrainingConfig = None) -> TQC:
         train_freq=config.train_freq,
         gradient_steps=config.gradient_steps,
         top_quantiles_to_drop_per_net=config.top_quantiles_to_drop,
+        use_sde=config.use_sde,
+        sde_sample_freq=config.sde_sample_freq,
+        use_sde_at_warmup=config.use_sde_at_warmup,
         policy_kwargs=policy_kwargs,
         tensorboard_log=config.tensorboard_log,
         verbose=1,
