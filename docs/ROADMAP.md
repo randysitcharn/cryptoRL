@@ -27,11 +27,11 @@ Normalise avec RobustScaler.
 ```
 
 ### Tâches
-- [ ] Implémenter FFD (Fractional Differentiation) avec fenêtre fixe
-- [ ] Configurer pipeline multi-asset (BTC, ETH, SPX, DXY, Funding Rates)
-- [ ] Intégrer GMM-HMM avec hmmlearn (3 états, 2 mixtures)
-- [ ] Créer fonction `predict_proba` pour probabilités de régime
-- [ ] Normalisation avec RobustScaler
+- [x] Implémenter FFD (Fractional Differentiation) avec fenêtre fixe
+- [x] Configurer pipeline multi-asset (BTC, ETH, SPX, DXY, NASDAQ)
+- [x] Intégrer GMM-HMM avec hmmlearn (3 états, 2 mixtures)
+- [x] Créer fonction `predict_proba` pour probabilités de régime
+- [x] Normalisation avec RobustScaler
 
 ---
 
@@ -55,42 +55,39 @@ Sauvegarde les poids de l'encodeur pour le RL.
 ```
 
 ### Tâches
-- [ ] Créer classe `PretrainTrainer`
-- [ ] Implémenter architecture Pre-Norm Transformer (Encoder-only)
-- [ ] Configurer masquage aléatoire (15% des bougies)
-- [ ] Implémenter MSE Loss pour reconstruction
-- [ ] Configurer AdamW avec Learning Rate Scheduler
-- [ ] Pipeline de sauvegarde des poids pré-entraînés
+- [x] Créer classe `CryptoMAE` (Masked Auto-Encoder)
+- [x] Implémenter architecture Pre-Norm Transformer (Encoder-only)
+- [x] Configurer masquage aléatoire (15% des bougies)
+- [x] Implémenter MSE Loss pour reconstruction
+- [x] Configurer AdamW avec Learning Rate Scheduler
+- [x] Pipeline de sauvegarde des poids pré-entraînés (`weights/pretrained_encoder.pth`)
 
 ---
 
-## Phase 3 : Ensemble Strategy (La Stratégie)
+## Phase 3 : Single Agent TQC (La Stratégie v1)
 
 ### Technologies Clés
 - **TQC (Truncated Quantile Critics)** : Distributional RL
-- **Mixture of Experts (MoE)** : 3 sous-agents + Gating Network
-- **gSDE** : Exploration d'état dépendante
+- **FoundationFeatureExtractor** : Encoder pré-entraîné gelé
+- **DSR v3** : Differential Sharpe Ratio avec tanh squashing
 
 ### Objectif & Justification SOTA
-**Robustesse & Adaptabilité**
-Au lieu d'un seul agent, 3 experts (Sniper, Swing, Risk-Manager) votent. Le TQC coupe l'optimisme (FOMO) et le gSDE assure une exécution fluide.
+**Stabilité & Baseline**
+Un agent unique stable avant de complexifier. Le TQC coupe l'optimisme (FOMO) et le DSR v3 avec tanh garantit des gradients stables.
 
 ### Instructions d'Implémentation
 ```
-Charge les poids pré-entraînés.
-Architecture MoE : Le Gating Network pondère les actions des 3 experts
-selon le régime détecté.
+Charge les poids pré-entraînés (encoder gelé).
 Utilise sb3_contrib pour TQC avec top_quantiles_dropped=2.
+Reward: DSR avec tanh squashing pour stabilité numérique.
 ```
 
 ### Tâches
-- [ ] Charger poids pré-entraînés du Transformer
-- [ ] Implémenter Expert 1 : Sniper (trading haute fréquence)
-- [ ] Implémenter Expert 2 : Swing (positions moyennes)
-- [ ] Implémenter Expert 3 : Risk-Manager (gestion du risque)
-- [ ] Créer Gating Network pour pondération dynamique
-- [ ] Configurer TQC avec sb3_contrib (`top_quantiles_dropped=2`)
-- [ ] Intégrer gSDE pour exploration
+- [x] Charger poids pré-entraînés du Transformer
+- [x] Configurer TQC avec sb3_contrib (`top_quantiles_dropped=2`)
+- [x] Implémenter DSR v3 avec tanh squashing
+- [x] Training stable sur 500k steps
+- [ ] Évaluation sur données de test (out-of-sample)
 
 ---
 
@@ -119,6 +116,35 @@ Calcule la probabilité de sur-apprentissage.
 - [ ] Générer 100 chemins de backtest
 - [ ] Calculer probabilité de sur-apprentissage (PBO)
 - [ ] Rapport de validation finale
+
+---
+
+## Phase 5 : Ensemble Strategy v2 (Future Version)
+
+### Technologies Clés
+- **Mixture of Experts (MoE)** : 3 sous-agents + Gating Network
+- **gSDE** : Exploration d'état dépendante
+- **Regime-Conditioned Gating** : Pondération selon GMM-HMM
+
+### Objectif & Justification SOTA
+**Robustesse & Adaptabilité**
+Au lieu d'un seul agent, 3 experts (Sniper, Swing, Risk-Manager) votent. Le Gating Network pondère dynamiquement selon le régime de marché détecté.
+
+### Instructions d'Implémentation
+```
+Architecture MoE : Le Gating Network pondère les actions des 3 experts
+selon le régime détecté par GMM-HMM.
+Chaque expert est un TQC spécialisé.
+Intégrer gSDE pour exploration fluide.
+```
+
+### Tâches
+- [ ] Implémenter Expert 1 : Sniper (trading haute fréquence)
+- [ ] Implémenter Expert 2 : Swing (positions moyennes)
+- [ ] Implémenter Expert 3 : Risk-Manager (gestion du risque)
+- [ ] Créer Gating Network pour pondération dynamique
+- [ ] Intégrer régimes GMM-HMM dans le Gating
+- [ ] Intégrer gSDE pour exploration
 
 ---
 
@@ -151,16 +177,22 @@ scikit-learn>=1.3.0
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                  Phase 3: La Stratégie                      │
-│  [Sniper] ─┐                                                │
-│  [Swing]  ─┼─→ [Gating Network] → [TQC + gSDE] → [Actions] │
-│  [Risk]   ─┘                                                │
+│                Phase 3: La Stratégie v1                     │
+│  [Encoder Gelé] → [TQC + DSR v3] → [Actions]               │
 └─────────────────────────┬───────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    Phase 4: L'Audit                         │
 │  [CPCV] → [WFO] → [Deflated Sharpe] → [Validation Finale]  │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Phase 5: La Stratégie v2 (Future)              │
+│  [Sniper] ─┐                                                │
+│  [Swing]  ─┼─→ [Gating Network] → [TQC + gSDE] → [Actions] │
+│  [Risk]   ─┘                                                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
