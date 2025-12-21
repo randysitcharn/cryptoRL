@@ -3,7 +3,7 @@
 env.py - Trading Environment for RL with Foundation Model.
 
 Gymnasium environment optimized for TQC training with pre-trained encoder.
-Uses Robust Simple Reward (scaled log-return) for numerical stability.
+Uses DSR v3 (Differential Sharpe Ratio) with tanh squashing for stability.
 """
 
 import gymnasium as gym
@@ -34,7 +34,7 @@ class CryptoTradingEnv(gym.Env):
 
     Features:
     - Continuous action space [-1, 1] for position sizing
-    - Robust Simple Reward (scaled log-return, numerically stable)
+    - DSR v3 reward (tanh-squashed Differential Sharpe Ratio)
     - Realistic transaction costs (0.06% commission)
     - Random or sequential episode starts
     - Compatible with FoundationFeatureExtractor
@@ -125,8 +125,7 @@ class CryptoTradingEnv(gym.Env):
         self.reward_scaling = reward_scaling
         self.random_start = random_start
         self.episode_length = episode_length
-
-        # Note: DSR removed, using simple reward now
+        self.eta = eta  # DSR EMA decay factor
 
         # Action space: continuous [-1, 1]
         self.action_space = spaces.Box(
@@ -173,7 +172,9 @@ class CryptoTradingEnv(gym.Env):
         self.position = 0.0  # Number of units held
         self.current_position_pct = 0.0  # Current position as % [-1, 1]
 
-        # Reward tracking (DSR removed - using simple reward now)
+        # DSR state (Exponential Moving Averages)
+        self.A = 0.0  # EMA of returns
+        self.B = 0.0  # EMA of returns²
 
         # Tracking
         self.total_trades = 0
@@ -192,24 +193,34 @@ class CryptoTradingEnv(gym.Env):
 
     def _calculate_reward(self, step_return: float) -> float:
         """
-        Asymmetric Reward Function.
+        Differential Sharpe Ratio (DSR) v3 - Tanh Squashing.
 
-        - Gains: Capped at +1.0 (Soft Cap) to prevent exploding gradients on pumps.
-        - Losses: Allowed down to -10.0 (Hard Floor) to punish bad trades severely.
+        Stabilisé par:
+        1. Variance floor (min 1e-4) pour éviter division par ~0
+        2. tanh squashing pour forcer output dans [-1, 1]
 
         Args:
             step_return: Log return for this step.
 
         Returns:
-            Reward value clipped to [-10.0, +1.0].
+            Reward value in [-1.0, +1.0] (guaranteed by tanh).
         """
-        # 1. Scale: 1% return -> 1.0 reward
-        raw_reward = step_return * 100.0
+        # 1. Update EMAs
+        delta_A = step_return - self.A
+        delta_B = step_return ** 2 - self.B
+        self.A += self.eta * delta_A
+        self.B += self.eta * delta_B
 
-        # 2. Asymmetric Clip
-        # Min: -10.0 (Punition max pour -10% ou plus)
-        # Max: +1.0 (Gain max capé pour +1% ou plus)
-        reward = float(np.clip(raw_reward, -10.0, 1.0))
+        # 2. Variance avec floor (Sécurité 1)
+        variance = self.B - self.A ** 2
+        sigma = np.sqrt(max(variance, 1e-4))
+
+        # 3. Calcul DSR brut
+        dsr = (delta_A - 0.5 * self.A * delta_B) / sigma
+
+        # 4. Squashing par tanh (Sécurité 2)
+        # Factor 0.1 : DSR=10 -> tanh(1.0) ≈ 0.76
+        reward = float(np.tanh(dsr * 0.1))
 
         return reward
 
@@ -288,7 +299,7 @@ class CryptoTradingEnv(gym.Env):
 
         self.returns_history.append(step_return)
 
-        # 7. Calculate reward (Robust Simple Reward)
+        # 7. Calculate reward (DSR v3 with tanh squashing)
         reward = self._calculate_reward(step_return)
 
         # 8. Check termination
@@ -298,7 +309,7 @@ class CryptoTradingEnv(gym.Env):
         # Bankruptcy
         if new_nav <= 0:
             terminated = True
-            reward = -2.0  # Strong penalty but finite (will be clipped to -1.0)
+            reward = -1.0  # Max penalty (tanh already bounds to [-1, 1])
 
         # End of episode
         if self.current_step >= self.episode_end:
@@ -308,8 +319,8 @@ class CryptoTradingEnv(gym.Env):
         observation = self._get_observation()
         info = self._get_info(action[0], step_return, new_nav)
 
-        # Final clip to ensure reward is always in [-1, 1] (safety net)
-        return observation, float(np.clip(reward, -1.0, 1.0)), terminated, truncated, info
+        # tanh guarantees reward is in [-1, 1], no clip needed
+        return observation, reward, terminated, truncated, info
 
     def _get_observation(self) -> np.ndarray:
         """Get current observation window."""
