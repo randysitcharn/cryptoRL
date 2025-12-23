@@ -140,16 +140,16 @@ class TrainingConfig:
     n_heads: int = 4
     n_layers: int = 2
 
-    # TQC Hyperparameters
-    total_timesteps: int = 1_000_000
-    learning_rate: float = 1e-5  # Ultra-conservative for stability
-    buffer_size: int = 200_000  # Increased for stability
-    batch_size: int = 256
-    gamma: float = 0.95  # Reduced from 0.99 to prevent Q-value explosion
-    tau: float = 0.005
-    ent_coef: str = "auto"  # Automatic entropy tuning
+    # TQC Hyperparameters (Optuna Trial 45 - Best Config)
+    total_timesteps: int = 500_000
+    learning_rate: float = 3.2e-4  # Optuna optimized (was 1e-5)
+    buffer_size: int = 200_000
+    batch_size: int = 128  # Optuna optimized (was 256)
+    gamma: float = 0.99  # Optuna optimized (was 0.95)
+    tau: float = 0.05  # Optuna optimized (was 0.005)
+    ent_coef: float = 0.01  # Optuna optimized (was "auto")
     train_freq: int = 1
-    gradient_steps: int = 1
+    gradient_steps: int = 2  # Optuna optimized (was 1)
     top_quantiles_to_drop: int = 2
     n_critics: int = 2
     n_quantiles: int = 25
@@ -399,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=1_000_000, help="Total timesteps")
     parser.add_argument("--log-freq", type=int, default=100, help="Log frequency (steps)")
     parser.add_argument("--eval-freq", type=int, default=10_000, help="Eval frequency (steps)")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=3.2e-4, help="Learning rate")
 
     args = parser.parse_args()
 

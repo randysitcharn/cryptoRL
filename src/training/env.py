@@ -59,7 +59,7 @@ class CryptoTradingEnv(gym.Env):
         commission: float = 0.0006,  # 0.06% per trade
         slippage: float = 0.0001,    # 0.01% slippage
         window_size: int = 64,
-        reward_scaling: float = 0.1,  # Reduced for stability
+        reward_scaling: float = 1.0,  # DSR Std≈0.2 -> tanh gives Std≈0.2
         random_start: bool = True,
         episode_length: Optional[int] = None,
         eta: float = 0.01,  # DSR EMA decay factor
@@ -219,8 +219,8 @@ class CryptoTradingEnv(gym.Env):
         dsr = (delta_A - 0.5 * self.A * delta_B) / sigma
 
         # 4. Squashing par tanh (Sécurité 2)
-        # Factor 0.1 : DSR=10 -> tanh(1.0) ≈ 0.76
-        reward = float(np.tanh(dsr * 0.1))
+        # Factor 1.0 : DSR raw has Std≈0.2, tanh(0.2)≈0.2 -> ideal range
+        reward = float(np.tanh(dsr * 1.0))
 
         return reward
 
