@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-tune.py - Optuna Hyperparameter Tuning for TQC Agent (TORTOISE MODE).
+tune.py - Optuna Hyperparameter Tuning for TQC Agent (GENIUS CATCHER MODE).
 
-Conservative search space optimized for STABILITY over speed.
-- Hard LR cap at 5e-5 to prevent mode collapse
+Tracks BEST mean reward during training, not final value.
+This catches "ephemeral geniuses" - agents that peak early then collapse.
+
+Key features:
+- EvalCallback tracks best_mean_reward throughout training
+- Returns peak performance, not final (catastrophic forgetting resistant)
 - Patient pruning (20k warmup) to let slow strategies emerge
-- Focus on exploration (ent_coef includes 'auto')
 
 Usage:
     python -m src.optimization.tune --n-trials 50
@@ -25,7 +28,7 @@ from optuna.samplers import TPESampler
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
 from torch.optim import AdamW
 
 # Suppress warnings during optimization
@@ -71,10 +74,11 @@ class TuningConfig:
     sde_sample_freq: int = -1
     use_sde_at_warmup: bool = True
 
-    # Tuning parameters (TORTOISE MODE - patient & stable)
+    # Tuning parameters (GENIUS CATCHER MODE)
     trial_timesteps: int = 60_000  # Longer trials for slow strategies
-    eval_episodes: int = 3
     n_trials: int = 50
+    eval_freq: int = 5000         # Eval every 5k steps
+    n_eval_episodes: int = 1      # Fast: 1 episode per eval
 
 
 # ============================================================================
@@ -139,7 +143,7 @@ def calculate_sharpe_ratio(returns: np.ndarray, periods_per_year: int = 252 * 24
 
 
 def create_environments(config: TuningConfig):
-    """Create training and validation environments."""
+    """Create training and validation environments (both vectorized)."""
     train_env, val_env = CryptoTradingEnv.create_train_val_envs(
         parquet_path=config.data_path,
         train_ratio=config.train_ratio,
@@ -148,10 +152,15 @@ def create_environments(config: TuningConfig):
         episode_length=config.episode_length,
     )
 
+    # Training env with Monitor for episode stats
     train_env_monitored = Monitor(train_env)
     train_vec_env = DummyVecEnv([lambda: train_env_monitored])
 
-    return train_vec_env, val_env
+    # Validation env vectorized for EvalCallback
+    val_env_monitored = Monitor(val_env)
+    val_vec_env = DummyVecEnv([lambda: val_env_monitored])
+
+    return train_vec_env, val_vec_env
 
 
 def create_policy_kwargs(config: TuningConfig) -> dict:
@@ -176,49 +185,17 @@ def create_policy_kwargs(config: TuningConfig) -> dict:
     )
 
 
-def evaluate_on_validation(model: TQC, val_env: CryptoTradingEnv, n_episodes: int = 3) -> float:
-    """
-    Run deterministic evaluation on validation environment.
-
-    Returns:
-        Sharpe Ratio (or -100 if NaN/explosion).
-    """
-    all_returns = []
-
-    for _ in range(n_episodes):
-        obs, _ = val_env.reset()
-        done = False
-        episode_returns = []
-
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = val_env.step(action)
-            done = terminated or truncated
-
-            if "return" in info:
-                episode_returns.append(info["return"])
-
-        all_returns.extend(episode_returns)
-
-    if not all_returns:
-        return -100.0
-
-    returns = np.array(all_returns)
-    sharpe = calculate_sharpe_ratio(returns)
-
-    return sharpe
-
-
 # ============================================================================
 # Objective Function
 # ============================================================================
 
 def objective(trial: optuna.Trial, config: TuningConfig) -> float:
     """
-    Optuna objective function.
+    Optuna objective function (GENIUS CATCHER).
 
     Samples hyperparameters, trains TQC for trial_timesteps,
-    then evaluates on validation to return Sharpe Ratio.
+    and returns the BEST mean reward achieved during training.
+    This catches ephemeral geniuses that peak early then collapse.
     """
     # ==================== Sample Hyperparameters (SMART & SAFE) ====================
     # LR capped at 1e-4 (signal is now x10 stronger with reward_scaling=1.0)
@@ -235,14 +212,14 @@ def objective(trial: optuna.Trial, config: TuningConfig) -> float:
     batch_size = trial.suggest_categorical("batch_size", [128, 256])
 
     print(f"\n{'='*60}")
-    print(f"Trial {trial.number} (SMART & SAFE)")
+    print(f"Trial {trial.number} (GENIUS CATCHER)")
     print(f"{'='*60}")
     print(f"  lr={lr:.2e}, gamma={gamma}, tau={tau}")
     print(f"  ent_coef={ent_coef}, gradient_steps={gradient_steps}, batch={batch_size}")
 
     try:
         # ==================== Create Environments ====================
-        train_env, val_env = create_environments(config)
+        train_env, val_vec_env = create_environments(config)
 
         # ==================== Create Model ====================
         policy_kwargs = create_policy_kwargs(config)
@@ -268,28 +245,43 @@ def objective(trial: optuna.Trial, config: TuningConfig) -> float:
             device=DEVICE,
         )
 
-        # ==================== Train with Pruning ====================
+        # ==================== Callbacks ====================
+        # EvalCallback: tracks best_mean_reward on validation env
+        eval_callback = EvalCallback(
+            val_vec_env,
+            eval_freq=config.eval_freq,           # Evaluate every 5k steps
+            n_eval_episodes=config.n_eval_episodes,  # Fast: 1 episode per eval
+            deterministic=True,                   # Deterministic policy for eval
+            verbose=0,
+        )
+
+        # Pruning callback for Optuna integration
         pruning_callback = TrialPruningCallback(
             trial=trial,
             eval_freq=10000,  # Report every 10k steps (matches pruner interval)
         )
 
+        # Combine callbacks
+        callbacks = CallbackList([eval_callback, pruning_callback])
+
+        # ==================== Train ====================
         model.learn(
             total_timesteps=config.trial_timesteps,
-            callback=pruning_callback,
+            callback=callbacks,
             progress_bar=False,
         )
 
-        # ==================== Evaluate on Validation ====================
-        sharpe = evaluate_on_validation(model, val_env, n_episodes=config.eval_episodes)
+        # ==================== Return BEST Mean Reward ====================
+        # This is the key: we return the PEAK performance, not final
+        best_reward = eval_callback.best_mean_reward
 
-        print(f"  -> Sharpe Ratio: {sharpe:.4f}")
+        print(f"  -> Best Mean Reward: {best_reward:.4f}")
 
         # Handle NaN/Inf
-        if not np.isfinite(sharpe):
+        if not np.isfinite(best_reward):
             return -100.0
 
-        return sharpe
+        return best_reward
 
     except optuna.TrialPruned:
         print("  -> PRUNED (divergence detected)")
@@ -322,13 +314,15 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
         config.n_trials = n_trials
 
     print("=" * 70)
-    print("OPTUNA HYPERPARAMETER TUNING")
+    print("OPTUNA HYPERPARAMETER TUNING (GENIUS CATCHER)")
     print("=" * 70)
     print(f"\nConfiguration:")
     print(f"  Trial timesteps: {config.trial_timesteps:,}")
     print(f"  Number of trials: {config.n_trials}")
-    print(f"  Eval episodes: {config.eval_episodes}")
+    print(f"  Eval freq: every {config.eval_freq:,} steps")
+    print(f"  Eval episodes: {config.n_eval_episodes}")
     print(f"  Device: {DEVICE}")
+    print(f"\n  Mode: Returns BEST mean reward (not final)")
 
     # Create output directory
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -343,7 +337,7 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
     )
 
     study = optuna.create_study(
-        study_name="tqc_smart_safe",  # New study with reward_scaling=1.0
+        study_name="tqc_genius_catcher",  # Tracks best_mean_reward (not final)
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
@@ -368,7 +362,7 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
     print("=" * 70)
 
     print(f"\nBest Trial: {study.best_trial.number}")
-    print(f"Best Sharpe Ratio: {study.best_value:.4f}")
+    print(f"Best Mean Reward: {study.best_value:.4f}")
     print(f"\nBest Hyperparameters:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
@@ -384,7 +378,7 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
     best_params_path = Path(config.output_dir) / "best_params.txt"
     with open(best_params_path, "w") as f:
         f.write(f"Best Trial: {study.best_trial.number}\n")
-        f.write(f"Best Sharpe Ratio: {study.best_value:.4f}\n\n")
+        f.write(f"Best Mean Reward: {study.best_value:.4f}\n\n")
         f.write("Best Hyperparameters:\n")
         for key, value in study.best_params.items():
             f.write(f"  {key}: {value}\n")
@@ -400,15 +394,13 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Optuna Hyperparameter Tuning for TQC (TORTOISE MODE)")
+    parser = argparse.ArgumentParser(description="Optuna Hyperparameter Tuning for TQC (GENIUS CATCHER MODE)")
     parser.add_argument("--n-trials", type=int, default=50, help="Number of trials")
     parser.add_argument("--timesteps", type=int, default=60_000, help="Steps per trial (60k for slow strategies)")
-    parser.add_argument("--eval-episodes", type=int, default=3, help="Eval episodes")
 
     args = parser.parse_args()
 
     config = TuningConfig()
     config.trial_timesteps = args.timesteps
-    config.eval_episodes = args.eval_episodes
 
     study = run_optimization(config, n_trials=args.n_trials)
