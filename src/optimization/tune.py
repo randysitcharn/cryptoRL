@@ -220,9 +220,9 @@ def objective(trial: optuna.Trial, config: TuningConfig) -> float:
     Samples hyperparameters, trains TQC for trial_timesteps,
     then evaluates on validation to return Sharpe Ratio.
     """
-    # ==================== Sample Hyperparameters (TORTOISE MODE) ====================
-    # STRICT: LR capped at 5e-5 to prevent mode collapse
-    lr = trial.suggest_float("lr", 1e-6, 5e-5, log=True)
+    # ==================== Sample Hyperparameters (SMART & SAFE) ====================
+    # LR capped at 1e-4 (signal is now x10 stronger with reward_scaling=1.0)
+    lr = trial.suggest_float("lr", 1e-6, 1e-4, log=True)
     # Long-term horizon
     gamma = trial.suggest_categorical("gamma", [0.98, 0.99, 0.995, 0.999])
     # Fixed tau for stability
@@ -235,7 +235,7 @@ def objective(trial: optuna.Trial, config: TuningConfig) -> float:
     batch_size = trial.suggest_categorical("batch_size", [128, 256])
 
     print(f"\n{'='*60}")
-    print(f"Trial {trial.number} (TORTOISE MODE)")
+    print(f"Trial {trial.number} (SMART & SAFE)")
     print(f"{'='*60}")
     print(f"  lr={lr:.2e}, gamma={gamma}, tau={tau}")
     print(f"  ent_coef={ent_coef}, gradient_steps={gradient_steps}, batch={batch_size}")
@@ -333,7 +333,7 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
     # Create output directory
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # ==================== Create Study (TORTOISE MODE) ====================
+    # ==================== Create Study (SMART & SAFE) ====================
     sampler = TPESampler(seed=SEED)
     # Patient pruning: don't judge before 20k steps
     pruner = MedianPruner(
@@ -343,7 +343,7 @@ def run_optimization(config: TuningConfig = None, n_trials: int = None) -> optun
     )
 
     study = optuna.create_study(
-        study_name="tqc_tortoise",  # New study for conservative search
+        study_name="tqc_smart_safe",  # New study with reward_scaling=1.0
         direction="maximize",
         sampler=sampler,
         pruner=pruner,
