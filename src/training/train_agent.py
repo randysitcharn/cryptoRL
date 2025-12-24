@@ -16,9 +16,10 @@ from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
-from torch.optim import AdamW
 import torch
 import numpy as np
+
+from src.training.clipped_optimizer import ClippedAdamW
 
 
 class StepLoggingCallback(BaseCallback):
@@ -90,23 +91,6 @@ class StepLoggingCallback(BaseCallback):
                   f"Pos: {pos:>+5.2f} | "
                   f"FPS: {fps:>5.0f}")
 
-        return True
-
-
-class GradientClippingCallback(BaseCallback):
-    """
-    Callback pour clipper les gradients à chaque step.
-    Prévient l'explosion de gradient dans TQC.
-    """
-    def __init__(self, max_grad_norm: float = 0.5, verbose: int = 0):
-        super().__init__(verbose)
-        self.max_grad_norm = max_grad_norm
-
-    def _on_step(self) -> bool:
-        # Clip gradients for all networks
-        for param_group in self.model.policy.parameters():
-            if param_group.grad is not None:
-                torch.nn.utils.clip_grad_norm_([param_group], self.max_grad_norm)
         return True
 
 
@@ -206,8 +190,9 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
         net_arch=config.net_arch,
         n_critics=config.n_critics,
         n_quantiles=config.n_quantiles,
-        optimizer_class=AdamW,
+        optimizer_class=ClippedAdamW,
         optimizer_kwargs=dict(
+            max_grad_norm=0.5,  # Gradient clipping intégré
             weight_decay=1e-4,
             eps=1e-5,
         ),
@@ -261,9 +246,7 @@ def create_callbacks(config: TrainingConfig, eval_env) -> list:
     step_callback = StepLoggingCallback(log_freq=config.log_freq)
     callbacks.append(step_callback)
 
-    # Gradient clipping callback (prevents explosion)
-    grad_clip_callback = GradientClippingCallback(max_grad_norm=0.5)
-    callbacks.append(grad_clip_callback)
+    # Note: Gradient clipping is now handled by ClippedAdamW optimizer
 
     # Evaluation callback
     eval_callback = EvalCallback(
