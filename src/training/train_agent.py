@@ -10,7 +10,7 @@ Usage:
 """
 
 import os
-from typing import Callable
+from typing import Callable, Union
 
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -124,16 +124,16 @@ class TrainingConfig:
     n_heads: int = 4
     n_layers: int = 2
 
-    # TQC Hyperparameters (Optuna Trial 4 - Genius Catcher Best)
+    # TQC Hyperparameters (Ultra Safe Baseline)
     total_timesteps: int = 500_000
-    learning_rate: float = 1.24e-5  # Trial 4 winner (best_mean_reward=1.528)
+    learning_rate: float = 5e-6  # Ultra Safe: priorité stabilité
     buffer_size: int = 200_000
-    batch_size: int = 256  # Trial 4
-    gamma: float = 0.99  # Trial 4
-    tau: float = 0.05  # Standard value
-    ent_coef: float = 0.01  # Trial 4
+    batch_size: int = 256
+    gamma: float = 0.99
+    tau: float = 0.05
+    ent_coef: Union[str, float] = "auto"  # Auto-tuned entropy
     train_freq: int = 1
-    gradient_steps: int = 2  # Trial 4
+    gradient_steps: int = 1  # Ultra Safe: 1 update per step
     top_quantiles_to_drop: int = 2
     n_critics: int = 2
     n_quantiles: int = 25
@@ -382,7 +382,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=500_000, help="Total timesteps")
     parser.add_argument("--log-freq", type=int, default=100, help="Log frequency (steps)")
     parser.add_argument("--eval-freq", type=int, default=5_000, help="Eval frequency (steps)")
-    parser.add_argument("--lr", type=float, default=1.24e-5, help="Learning rate (Trial 4)")
+    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate (Ultra Safe)")
 
     args = parser.parse_args()
 
