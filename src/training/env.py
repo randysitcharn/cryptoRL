@@ -3,7 +3,7 @@
 env.py - Trading Environment for RL with Foundation Model.
 
 Gymnasium environment optimized for TQC training with pre-trained encoder.
-Uses DSR v3 (Differential Sharpe Ratio) with tanh squashing for stability.
+Uses Hybrid Log-Sortino reward for stability and anti-churn.
 """
 
 import gymnasium as gym
@@ -34,7 +34,7 @@ class CryptoTradingEnv(gym.Env):
 
     Features:
     - Continuous action space [-1, 1] for position sizing
-    - DSR v3 reward (tanh-squashed Differential Sharpe Ratio)
+    - Hybrid Log-Sortino reward (log return + downside penalty + anti-churn)
     - Realistic transaction costs (0.06% commission)
     - Random or sequential episode starts
     - Compatible with FoundationFeatureExtractor
@@ -59,10 +59,9 @@ class CryptoTradingEnv(gym.Env):
         commission: float = 0.0006,  # 0.06% per trade
         slippage: float = 0.0001,    # 0.01% slippage
         window_size: int = 64,
-        reward_scaling: float = 1.0,  # DSR Std≈0.2 -> tanh gives Std≈0.2
+        reward_scaling: float = 1.0,  # Unused, kept for compatibility
         random_start: bool = True,
         episode_length: Optional[int] = None,
-        eta: float = 0.01,  # DSR EMA decay factor
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
     ):
@@ -76,10 +75,9 @@ class CryptoTradingEnv(gym.Env):
             commission: Transaction fee (0.0006 = 0.06%).
             slippage: Slippage cost (0.0001 = 0.01%).
             window_size: Lookback window size for observations.
-            reward_scaling: Multiplier for reward signal.
+            reward_scaling: Unused, kept for API compatibility.
             random_start: If True, start episodes at random positions.
             episode_length: Max steps per episode (None = full dataset).
-            eta: EMA decay factor for Differential Sharpe Ratio.
             start_idx: Start index for data slice (for train/val split).
             end_idx: End index for data slice (for train/val split).
         """
@@ -125,7 +123,6 @@ class CryptoTradingEnv(gym.Env):
         self.reward_scaling = reward_scaling
         self.random_start = random_start
         self.episode_length = episode_length
-        self.eta = eta  # DSR EMA decay factor
 
         # Action space: continuous [-1, 1]
         self.action_space = spaces.Box(
@@ -172,9 +169,10 @@ class CryptoTradingEnv(gym.Env):
         self.position = 0.0  # Number of units held
         self.current_position_pct = 0.0  # Current position as % [-1, 1]
 
-        # DSR state (Exponential Moving Averages)
-        self.A = 0.0  # EMA of returns
-        self.B = 0.0  # EMA of returns²
+        # Hybrid Log-Sortino state
+        self._prev_action = 0.0
+        self._current_action = 0.0
+        self._prev_valuation = self.initial_balance
 
         # Tracking
         self.total_trades = 0
@@ -191,38 +189,38 @@ class CryptoTradingEnv(gym.Env):
         price = self._get_price()
         return self.cash + self.position * price
 
-    def _calculate_reward(self, step_return: float) -> float:
+    def _calculate_reward(self) -> float:
         """
-        Differential Sharpe Ratio (DSR) v3 - Tanh Squashing.
+        Hybrid Log-Sortino Reward Function.
 
-        Stabilisé par:
-        1. Variance floor (min 1e-4) pour éviter division par ~0
-        2. tanh squashing pour forcer output dans [-1, 1]
-
-        Args:
-            step_return: Log return for this step.
+        Combines:
+        1. Log return for optimal growth (Kelly criterion alignment)
+        2. Sortino-style downside penalty (asymmetric risk)
+        3. Anti-churn smoothness penalty (reduce trading costs)
 
         Returns:
-            Reward value in [-1.0, +1.0] (guaranteed by tanh).
+            Reward value in [-1.0, +1.0] (clipped).
         """
-        # 1. Update EMAs
-        delta_A = step_return - self.A
-        delta_B = step_return ** 2 - self.B
-        self.A += self.eta * delta_A
-        self.B += self.eta * delta_B
+        # 1. PnL proportionnel
+        current_value = self._get_nav()
+        step_return = (current_value - self._prev_valuation) / self._prev_valuation
 
-        # 2. Variance avec floor (Sécurité 1)
-        variance = self.B - self.A ** 2
-        sigma = np.sqrt(max(variance, 1e-4))
+        # 2. Log Return (croissance optimale)
+        safe_return = max(step_return, -0.99)
+        reward_log_return = np.log(1.0 + safe_return)
 
-        # 3. Calcul DSR brut
-        dsr = (delta_A - 0.5 * self.A * delta_B) / sigma
+        # 3. Pénalité Sortino (downside)
+        downside_penalty = 0.0
+        if step_return < 0:
+            downside_penalty = -(step_return ** 2) * 50.0
 
-        # 4. Squashing par tanh (Sécurité 2)
-        # Factor 1.0 : DSR raw has Std≈0.2, tanh(0.2)≈0.2 -> ideal range
-        reward = float(np.tanh(dsr * 1.0))
+        # 4. Anti-Churn (smoothness)
+        action_diff = abs(self._current_action - self._prev_action)
+        smoothness_penalty = -(action_diff ** 2) * 0.1
 
-        return reward
+        # 5. Total + Clip
+        total_reward = reward_log_return + downside_penalty + smoothness_penalty
+        return float(np.clip(total_reward, -1.0, 1.0))
 
     def reset(
         self,
@@ -257,8 +255,9 @@ class CryptoTradingEnv(gym.Env):
         Returns:
             Tuple of (observation, reward, terminated, truncated, info).
         """
-        # 1. Parse action
+        # 1. Parse action and store for anti-churn calculation
         target_position_pct = float(np.clip(action[0], -1.0, 1.0))
+        self._current_action = target_position_pct
 
         # 2. Get current state
         old_nav = self._get_nav()
@@ -288,21 +287,24 @@ class CryptoTradingEnv(gym.Env):
         # 5. Advance time
         self.current_step += 1
 
-        # 6. Calculate new NAV and return
+        # 6. Calculate new NAV
         new_nav = self._get_nav()
 
-        # Log return
+        # 7. Calculate reward (Hybrid Log-Sortino)
+        reward = self._calculate_reward()
+
+        # 8. Update action tracking (for anti-churn)
+        self._prev_action = self._current_action
+        self._prev_valuation = new_nav
+
+        # Track log return for analysis
         if old_nav > 0 and new_nav > 0:
             step_return = np.log(new_nav / old_nav)
         else:
             step_return = 0.0
-
         self.returns_history.append(step_return)
 
-        # 7. Calculate reward (DSR v3 with tanh squashing)
-        reward = self._calculate_reward(step_return)
-
-        # 8. Check termination
+        # 9. Check termination
         terminated = False
         truncated = False
 
@@ -315,11 +317,10 @@ class CryptoTradingEnv(gym.Env):
         if self.current_step >= self.episode_end:
             terminated = True
 
-        # 9. Get observation and info
+        # 10. Get observation and info
         observation = self._get_observation()
         info = self._get_info(action[0], step_return, new_nav)
 
-        # tanh guarantees reward is in [-1, 1], no clip needed
         return observation, reward, terminated, truncated, info
 
     def _get_observation(self) -> np.ndarray:
