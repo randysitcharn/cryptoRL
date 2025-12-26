@@ -119,6 +119,7 @@ class TrainingConfig:
     train_ratio: float = 0.8
     episode_length: int = 2048  # Épisodes plus courts pour tracking des rewards
     downside_coef: float = 50.0  # Sortino downside penalty coefficient
+    smoothness_coef: float = 0.005  # Anti-churn smoothness penalty coefficient
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -218,6 +219,7 @@ def create_environments(config: TrainingConfig):
         commission=config.commission,
         episode_length=config.episode_length,
         downside_coef=config.downside_coef,
+        smoothness_coef=config.smoothness_coef,
     )
 
     # Wrap in Monitor for episode tracking
@@ -388,6 +390,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", type=str, default="weights/checkpoints/", help="Checkpoint directory")
     parser.add_argument("--tau", type=float, default=None, help="Soft update coefficient (override config)")
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")
+    parser.add_argument("--smoothness-coef", type=float, default=None, help="Anti-churn smoothness penalty coefficient")
 
     args = parser.parse_args()
 
@@ -401,5 +404,7 @@ if __name__ == "__main__":
         config.tau = args.tau
     if args.downside_coef is not None:
         config.downside_coef = args.downside_coef
+    if args.smoothness_coef is not None:
+        config.smoothness_coef = args.smoothness_coef
 
     train(config)
