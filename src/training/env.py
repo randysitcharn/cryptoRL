@@ -64,6 +64,7 @@ class CryptoTradingEnv(gym.Env):
         episode_length: Optional[int] = None,
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
+        downside_coef: float = 50.0,  # Sortino downside penalty coefficient
     ):
         """
         Initialize the trading environment.
@@ -80,8 +81,12 @@ class CryptoTradingEnv(gym.Env):
             episode_length: Max steps per episode (None = full dataset).
             start_idx: Start index for data slice (for train/val split).
             end_idx: End index for data slice (for train/val split).
+            downside_coef: Sortino downside penalty coefficient (default: 50.0).
         """
         super().__init__()
+
+        # Reward parameters
+        self.downside_coef = downside_coef
 
         # Load data
         df = pd.read_parquet(parquet_path)
@@ -212,11 +217,11 @@ class CryptoTradingEnv(gym.Env):
         # 3. Pénalité Sortino (downside)
         downside_penalty = 0.0
         if step_return < 0:
-            downside_penalty = -(step_return ** 2) * 50.0
+            downside_penalty = -(step_return ** 2) * self.downside_coef
 
-        # 4. Anti-Churn (smoothness)
+        # 4. Anti-Churn (smoothness) - 0.005 pour pénalité max ~-0.02
         action_diff = abs(self._current_action - self._prev_action)
-        smoothness_penalty = -(action_diff ** 2) * 0.1
+        smoothness_penalty = -(action_diff ** 2) * 0.005
 
         # 5. Total + Clip
         total_reward = reward_log_return + downside_penalty + smoothness_penalty
