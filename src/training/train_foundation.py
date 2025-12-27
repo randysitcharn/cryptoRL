@@ -361,7 +361,7 @@ def train(
             start_epoch = loaded_epoch + 1
             end_epoch = loaded_epoch + extra_epochs
             print(f"\n[Resume] Loaded checkpoint from epoch {loaded_epoch} (val_loss: {loaded_val_loss:.4f})")
-            print(f"[Resume] Training for {extra_epochs} additional epochs ({start_epoch} → {end_epoch})")
+            print(f"[Resume] Training for {extra_epochs} additional epochs ({start_epoch} -> {end_epoch})")
         else:
             # Mode: continuer jusqu'à config.epochs
             start_epoch = loaded_epoch + 1
@@ -371,7 +371,7 @@ def train(
                 print("[Resume] Nothing to do. Use --extra-epochs or increase --epochs.")
                 return model, best_val_loss
             print(f"\n[Resume] Loaded checkpoint from epoch {loaded_epoch} (val_loss: {loaded_val_loss:.4f})")
-            print(f"[Resume] Continuing to epoch {end_epoch} ({start_epoch} → {end_epoch})")
+            print(f"[Resume] Continuing to epoch {end_epoch} ({start_epoch} -> {end_epoch})")
     else:
         # Entraînement depuis zéro
         end_epoch = config.epochs
@@ -383,7 +383,7 @@ def train(
     start_time = time.time()
 
     print(f"\n[Training] Configuration:")
-    print(f"  Epochs: {start_epoch} → {end_epoch}")
+    print(f"  Epochs: {start_epoch} -> {end_epoch}")
     print(f"  Batch size: {config.batch_size}")
     print(f"  Learning rate: {config.lr}")
     print(f"  Mask ratio: {config.mask_ratio}")
