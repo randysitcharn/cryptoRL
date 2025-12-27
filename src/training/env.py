@@ -59,13 +59,14 @@ class CryptoTradingEnv(gym.Env):
         commission: float = 0.0006,  # 0.06% per trade
         slippage: float = 0.0001,    # 0.01% slippage
         window_size: int = 64,
-        reward_scaling: float = 1.0,  # Unused, kept for compatibility
+        reward_scaling: float = 30.0,  # Amplify signal for tanh (optimal range)
         random_start: bool = True,
         episode_length: Optional[int] = None,
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
-        downside_coef: float = 50.0,  # Sortino downside penalty coefficient
-        smoothness_coef: float = 0.005,  # Anti-churn smoothness penalty coefficient
+        downside_coef: float = 10.0,  # Sortino downside penalty coefficient
+        upside_coef: float = 0.0,  # Symmetric upside bonus coefficient
+        smoothness_coef: float = 0.001,  # Anti-churn smoothness penalty coefficient
     ):
         """
         Initialize the trading environment.
@@ -77,18 +78,21 @@ class CryptoTradingEnv(gym.Env):
             commission: Transaction fee (0.0006 = 0.06%).
             slippage: Slippage cost (0.0001 = 0.01%).
             window_size: Lookback window size for observations.
-            reward_scaling: Unused, kept for API compatibility.
+            reward_scaling: Multiplier for tanh scaling (default: 100.0).
             random_start: If True, start episodes at random positions.
             episode_length: Max steps per episode (None = full dataset).
             start_idx: Start index for data slice (for train/val split).
             end_idx: End index for data slice (for train/val split).
-            downside_coef: Sortino downside penalty coefficient (default: 50.0).
-            smoothness_coef: Anti-churn smoothness penalty coefficient (default: 0.005).
+            downside_coef: Sortino downside penalty coefficient (default: 10.0).
+            upside_coef: Symmetric upside bonus coefficient (default: 0.0).
+            smoothness_coef: Anti-churn smoothness penalty coefficient (default: 0.001).
         """
         super().__init__()
 
         # Reward parameters
+        self.reward_scaling = reward_scaling
         self.downside_coef = downside_coef
+        self.upside_coef = upside_coef
         self.smoothness_coef = smoothness_coef
 
         # Load data
@@ -187,6 +191,15 @@ class CryptoTradingEnv(gym.Env):
         self.total_commission = 0.0
         self.returns_history: List[float] = []
 
+        # Reward metrics for observability
+        self.reward_metrics = {
+            "rewards/log_return": 0.0,
+            "rewards/penalty_vol": 0.0,
+            "rewards/bonus_upside": 0.0,
+            "rewards/penalty_churn": 0.0,
+            "rewards/total_raw": 0.0,
+        }
+
     def _get_price(self, step: Optional[int] = None) -> float:
         """Get price at given step (default: current step)."""
         idx = step if step is not None else self.current_step
@@ -204,7 +217,8 @@ class CryptoTradingEnv(gym.Env):
         Combines:
         1. Log return for optimal growth (Kelly criterion alignment)
         2. Sortino-style downside penalty (asymmetric risk)
-        3. Anti-churn smoothness penalty (reduce trading costs)
+        3. Symmetric upside bonus (reward positive returns)
+        4. Anti-churn smoothness penalty (reduce trading costs)
 
         Returns:
             Reward value in [-1.0, +1.0] (clipped).
@@ -222,13 +236,28 @@ class CryptoTradingEnv(gym.Env):
         if step_return < 0:
             downside_penalty = -(step_return ** 2) * self.downside_coef
 
-        # 4. Anti-Churn (smoothness)
+        # 4. Bonus symétrique (upside)
+        upside_bonus = 0.0
+        if step_return > 0:
+            upside_bonus = (step_return ** 2) * self.upside_coef
+
+        # 5. Anti-Churn (smoothness)
         action_diff = abs(self._current_action - self._prev_action)
         smoothness_penalty = -(action_diff ** 2) * self.smoothness_coef
 
-        # 5. Total + Clip
-        total_reward = reward_log_return + downside_penalty + smoothness_penalty
-        return float(np.clip(total_reward, -1.0, 1.0))
+        # 6. Total + Tanh scaling
+        total_reward = reward_log_return + downside_penalty + upside_bonus + smoothness_penalty
+
+        # Store metrics for observability
+        self.reward_metrics = {
+            "rewards/log_return": float(reward_log_return),
+            "rewards/penalty_vol": float(downside_penalty),
+            "rewards/bonus_upside": float(upside_bonus),
+            "rewards/penalty_churn": float(smoothness_penalty),
+            "rewards/total_raw": float(total_reward),
+        }
+
+        return float(np.tanh(total_reward * self.reward_scaling))
 
     def reset(
         self,
@@ -347,7 +376,7 @@ class CryptoTradingEnv(gym.Env):
         if nav is None:
             nav = self._get_nav()
 
-        return {
+        info = {
             'step': self.current_step,
             'nav': nav,
             'cash': self.cash,
@@ -359,6 +388,9 @@ class CryptoTradingEnv(gym.Env):
             'total_trades': self.total_trades,
             'total_commission': self.total_commission,
         }
+        # Add reward metrics for observability
+        info.update(self.reward_metrics)
+        return info
 
     def render(self) -> None:
         """Render current state."""
