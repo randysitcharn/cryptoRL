@@ -77,10 +77,9 @@ class StepLoggingCallback(BaseCallback):
                 if "position" in self.last_episode_info:
                     self.logger.record("custom/position", self.last_episode_info["position"])
 
-            # Log mean trades per episode (last 10 episodes)
+            # Log trades of last completed episode
             if self.episode_trades:
-                mean_trades = np.mean(self.episode_trades[-10:])
-                self.logger.record("custom/mean_trades_10ep", mean_trades)
+                self.logger.record("custom/trades_per_episode", self.episode_trades[-1])
 
             # Force dump to TensorBoard
             self.logger.dump(self.num_timesteps)
