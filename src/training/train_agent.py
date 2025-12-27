@@ -150,7 +150,7 @@ class TrainingConfig:
     reward_scaling: float = 30.0  # Amplify signal for tanh (optimal range)
     downside_coef: float = 10.0  # Sortino downside penalty coefficient
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
-    smoothness_coef: float = 0.001  # Anti-churn smoothness penalty coefficient
+    action_discretization: float = 0.1  # Discretize actions (0.1 = 21 positions)
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -252,7 +252,7 @@ def create_environments(config: TrainingConfig):
         reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
-        smoothness_coef=config.smoothness_coef,
+        action_discretization=config.action_discretization,
     )
 
     # Wrap in Monitor for episode tracking
@@ -433,7 +433,7 @@ if __name__ == "__main__":
     parser.add_argument("--tau", type=float, default=None, help="Soft update coefficient (override config)")
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")
     parser.add_argument("--upside-coef", type=float, default=None, help="Symmetric upside bonus coefficient")
-    parser.add_argument("--smoothness-coef", type=float, default=None, help="Anti-churn smoothness penalty coefficient")
+    parser.add_argument("--action-disc", type=float, default=None, help="Action discretization (0.1 = 21 positions, 0 = disabled)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
 
     args = parser.parse_args()
@@ -450,8 +450,8 @@ if __name__ == "__main__":
         config.downside_coef = args.downside_coef
     if args.upside_coef is not None:
         config.upside_coef = args.upside_coef
-    if args.smoothness_coef is not None:
-        config.smoothness_coef = args.smoothness_coef
+    if args.action_disc is not None:
+        config.action_discretization = args.action_disc
     if args.name is not None:
         config.name = args.name
 
