@@ -31,6 +31,7 @@ class StepLoggingCallback(BaseCallback):
         self.log_freq = log_freq
         self.episode_rewards = []
         self.episode_lengths = []
+        self.episode_trades = []  # Track trades per episode
         self.last_episode_info = {}
 
     def _on_step(self) -> bool:
@@ -42,18 +43,19 @@ class StepLoggingCallback(BaseCallback):
                     ep_length = info["episode"]["l"]
                     self.episode_rewards.append(ep_reward)
                     self.episode_lengths.append(ep_length)
+                    # Capture final trades at episode end
+                    if "total_trades" in info:
+                        self.episode_trades.append(info["total_trades"])
                     self.last_episode_info = {
                         "reward": ep_reward,
                         "length": ep_length,
                     }
 
-                # Collecter les infos de trading (NAV, position, etc.)
+                # Collecter les infos de trading (NAV, position - updated every step)
                 if "nav" in info:
                     self.last_episode_info["nav"] = info["nav"]
                 if "position_pct" in info:
                     self.last_episode_info["position"] = info["position_pct"]
-                if "total_trades" in info:
-                    self.last_episode_info["trades"] = info["total_trades"]
 
         # Logger tous les log_freq steps
         if self.num_timesteps % self.log_freq == 0:
@@ -74,8 +76,11 @@ class StepLoggingCallback(BaseCallback):
                     self.logger.record("custom/nav", self.last_episode_info["nav"])
                 if "position" in self.last_episode_info:
                     self.logger.record("custom/position", self.last_episode_info["position"])
-                if "trades" in self.last_episode_info:
-                    self.logger.record("custom/total_trades", self.last_episode_info["trades"])
+
+            # Log mean trades per episode (last 10 episodes)
+            if self.episode_trades:
+                mean_trades = np.mean(self.episode_trades[-10:])
+                self.logger.record("custom/mean_trades_10ep", mean_trades)
 
             # Force dump to TensorBoard
             self.logger.dump(self.num_timesteps)
