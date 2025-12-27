@@ -94,6 +94,32 @@ class StepLoggingCallback(BaseCallback):
         return True
 
 
+class DetailTensorboardCallback(BaseCallback):
+    """
+    Callback pour logger les composantes du reward dans TensorBoard.
+    Permet de visualiser: log_return, penalty_vol, penalty_churn, total_raw.
+    """
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Récupérer les infos depuis l'environnement
+        if self.locals.get("infos"):
+            info = self.locals["infos"][0]
+
+            # Log reward components
+            if "rewards/log_return" in info:
+                self.logger.record("rewards/log_return", info["rewards/log_return"])
+            if "rewards/penalty_vol" in info:
+                self.logger.record("rewards/penalty_vol", info["rewards/penalty_vol"])
+            if "rewards/penalty_churn" in info:
+                self.logger.record("rewards/penalty_churn", info["rewards/penalty_churn"])
+            if "rewards/total_raw" in info:
+                self.logger.record("rewards/total_raw", info["rewards/total_raw"])
+
+        return True
+
+
 from src.config import DEVICE, SEED
 from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.env import CryptoTradingEnv
@@ -113,13 +139,18 @@ class TrainingConfig:
     tensorboard_log: str = "logs/tensorboard_tqc/"
     checkpoint_dir: str = "weights/checkpoints/"
 
+    # Run name (for TensorBoard)
+    name: str = None  # If set, appears in TensorBoard
+
     # Environment
     window_size: int = 64
     commission: float = 0.0006  # 0.06%
     train_ratio: float = 0.8
     episode_length: int = 2048  # Épisodes plus courts pour tracking des rewards
-    downside_coef: float = 50.0  # Sortino downside penalty coefficient
-    smoothness_coef: float = 0.005  # Anti-churn smoothness penalty coefficient
+    reward_scaling: float = 30.0  # Amplify signal for tanh (optimal range)
+    downside_coef: float = 10.0  # Sortino downside penalty coefficient
+    upside_coef: float = 0.0  # Symmetric upside bonus coefficient
+    smoothness_coef: float = 0.001  # Anti-churn smoothness penalty coefficient
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -218,7 +249,9 @@ def create_environments(config: TrainingConfig):
         window_size=config.window_size,
         commission=config.commission,
         episode_length=config.episode_length,
+        reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
+        upside_coef=config.upside_coef,
         smoothness_coef=config.smoothness_coef,
     )
 
@@ -273,6 +306,10 @@ def create_callbacks(config: TrainingConfig, eval_env) -> list:
     )
     callbacks.append(checkpoint_callback)
 
+    # Detail Tensorboard callback for reward components
+    detail_callback = DetailTensorboardCallback(verbose=0)
+    callbacks.append(detail_callback)
+
     return callbacks
 
 
@@ -319,6 +356,10 @@ def train(config: TrainingConfig = None) -> TQC:
 
     # ==================== Model Creation ====================
     print("\n[3/4] Creating TQC model...")
+
+    # Use custom name for TensorBoard if provided
+    tb_log_name = config.name if config.name else "TQC"
+
     model = TQC(
         policy="MlpPolicy",
         env=train_env,
@@ -356,6 +397,7 @@ def train(config: TrainingConfig = None) -> TQC:
     model.learn(
         total_timesteps=config.total_timesteps,
         callback=callbacks,
+        tb_log_name=tb_log_name,
         progress_bar=True,
     )
 
@@ -390,7 +432,9 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", type=str, default="weights/checkpoints/", help="Checkpoint directory")
     parser.add_argument("--tau", type=float, default=None, help="Soft update coefficient (override config)")
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")
+    parser.add_argument("--upside-coef", type=float, default=None, help="Symmetric upside bonus coefficient")
     parser.add_argument("--smoothness-coef", type=float, default=None, help="Anti-churn smoothness penalty coefficient")
+    parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
 
     args = parser.parse_args()
 
@@ -404,7 +448,11 @@ if __name__ == "__main__":
         config.tau = args.tau
     if args.downside_coef is not None:
         config.downside_coef = args.downside_coef
+    if args.upside_coef is not None:
+        config.upside_coef = args.upside_coef
     if args.smoothness_coef is not None:
         config.smoothness_coef = args.smoothness_coef
+    if args.name is not None:
+        config.name = args.name
 
     train(config)
