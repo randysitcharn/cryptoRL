@@ -3,7 +3,7 @@
 env.py - Trading Environment for RL with Foundation Model.
 
 Gymnasium environment optimized for TQC training with pre-trained encoder.
-Uses Hybrid Log-Sortino reward for stability and anti-churn.
+Uses Hybrid Log-Sortino reward with action discretization to reduce churn.
 """
 
 import gymnasium as gym
@@ -33,9 +33,9 @@ class CryptoTradingEnv(gym.Env):
     Crypto Trading Environment for RL with Foundation Model.
 
     Features:
-    - Continuous action space [-1, 1] for position sizing
-    - Hybrid Log-Sortino reward (log return + downside penalty + anti-churn)
-    - Realistic transaction costs (0.06% commission)
+    - Continuous action space [-1, 1] for position sizing (discretized to 21 levels)
+    - Hybrid Log-Sortino reward (log return + downside penalty + upside bonus)
+    - Realistic transaction costs (0.06% commission + 0.01% slippage)
     - Random or sequential episode starts
     - Compatible with FoundationFeatureExtractor
 
@@ -66,7 +66,7 @@ class CryptoTradingEnv(gym.Env):
         end_idx: Optional[int] = None,
         downside_coef: float = 10.0,  # Sortino downside penalty coefficient
         upside_coef: float = 0.0,  # Symmetric upside bonus coefficient
-        smoothness_coef: float = 0.001,  # Anti-churn smoothness penalty coefficient
+        action_discretization: float = 0.1,  # Discretize actions (0.1 = 21 positions)
     ):
         """
         Initialize the trading environment.
@@ -85,7 +85,7 @@ class CryptoTradingEnv(gym.Env):
             end_idx: End index for data slice (for train/val split).
             downside_coef: Sortino downside penalty coefficient (default: 10.0).
             upside_coef: Symmetric upside bonus coefficient (default: 0.0).
-            smoothness_coef: Anti-churn smoothness penalty coefficient (default: 0.001).
+            action_discretization: Discretize actions to reduce churn (0.1 = 21 positions, 0 = disabled).
         """
         super().__init__()
 
@@ -93,7 +93,7 @@ class CryptoTradingEnv(gym.Env):
         self.reward_scaling = reward_scaling
         self.downside_coef = downside_coef
         self.upside_coef = upside_coef
-        self.smoothness_coef = smoothness_coef
+        self.action_discretization = action_discretization
 
         # Load data
         df = pd.read_parquet(parquet_path)
@@ -181,9 +181,7 @@ class CryptoTradingEnv(gym.Env):
         self.position = 0.0  # Number of units held
         self.current_position_pct = 0.0  # Current position as % [-1, 1]
 
-        # Hybrid Log-Sortino state
-        self._prev_action = 0.0
-        self._current_action = 0.0
+        # Reward state
         self._prev_valuation = self.initial_balance
 
         # Tracking
@@ -196,7 +194,6 @@ class CryptoTradingEnv(gym.Env):
             "rewards/log_return": 0.0,
             "rewards/penalty_vol": 0.0,
             "rewards/bonus_upside": 0.0,
-            "rewards/penalty_churn": 0.0,
             "rewards/total_raw": 0.0,
         }
 
@@ -218,10 +215,9 @@ class CryptoTradingEnv(gym.Env):
         1. Log return for optimal growth (Kelly criterion alignment)
         2. Sortino-style downside penalty (asymmetric risk)
         3. Symmetric upside bonus (reward positive returns)
-        4. Anti-churn smoothness penalty (reduce trading costs)
 
         Returns:
-            Reward value in [-1.0, +1.0] (clipped).
+            Reward value in [-1.0, +1.0] (tanh scaled).
         """
         # 1. PnL proportionnel
         current_value = self._get_nav()
@@ -241,19 +237,14 @@ class CryptoTradingEnv(gym.Env):
         if step_return > 0:
             upside_bonus = (step_return ** 2) * self.upside_coef
 
-        # 5. Anti-Churn (smoothness)
-        action_diff = abs(self._current_action - self._prev_action)
-        smoothness_penalty = -(action_diff ** 2) * self.smoothness_coef
-
-        # 6. Total + Tanh scaling
-        total_reward = reward_log_return + downside_penalty + upside_bonus + smoothness_penalty
+        # 5. Total + Tanh scaling
+        total_reward = reward_log_return + downside_penalty + upside_bonus
 
         # Store metrics for observability
         self.reward_metrics = {
             "rewards/log_return": float(reward_log_return),
             "rewards/penalty_vol": float(downside_penalty),
             "rewards/bonus_upside": float(upside_bonus),
-            "rewards/penalty_churn": float(smoothness_penalty),
             "rewards/total_raw": float(total_reward),
         }
 
@@ -292,9 +283,13 @@ class CryptoTradingEnv(gym.Env):
         Returns:
             Tuple of (observation, reward, terminated, truncated, info).
         """
-        # 1. Parse action and store for anti-churn calculation
+        # 1. Parse and discretize action
         target_position_pct = float(np.clip(action[0], -1.0, 1.0))
-        self._current_action = target_position_pct
+
+        # Discretize action to reduce micro-churn (e.g., 0.1 = 21 positions)
+        if self.action_discretization > 0:
+            target_position_pct = round(target_position_pct / self.action_discretization) * self.action_discretization
+            target_position_pct = float(np.clip(target_position_pct, -1.0, 1.0))  # Ensure bounds
 
         # 2. Get current state
         old_nav = self._get_nav()
@@ -330,8 +325,7 @@ class CryptoTradingEnv(gym.Env):
         # 7. Calculate reward (Hybrid Log-Sortino)
         reward = self._calculate_reward()
 
-        # 8. Update action tracking (for anti-churn)
-        self._prev_action = self._current_action
+        # 8. Update valuation for next reward calculation
         self._prev_valuation = new_nav
 
         # Track log return for analysis
