@@ -434,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")
     parser.add_argument("--upside-coef", type=float, default=None, help="Symmetric upside bonus coefficient")
     parser.add_argument("--action-disc", type=float, default=None, help="Action discretization (0.1 = 21 positions, 0 = disabled)")
+    parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
 
     args = parser.parse_args()
@@ -452,6 +453,8 @@ if __name__ == "__main__":
         config.upside_coef = args.upside_coef
     if args.action_disc is not None:
         config.action_discretization = args.action_disc
+    if args.ent_coef is not None:
+        config.ent_coef = args.ent_coef
     if args.name is not None:
         config.name = args.name
 
