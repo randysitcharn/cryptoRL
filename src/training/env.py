@@ -301,11 +301,13 @@ class CryptoTradingEnv(gym.Env):
         target_position_value = old_nav * target_exposure
         target_position_units = target_position_value / old_price
 
-        # 4. Execute trade
-        position_delta = target_position_units - self.position
-        trade_value = abs(position_delta * old_price)
+        # 4. Execute trade only if discretized position changed
+        position_changed = (target_position_pct != self.current_position_pct)
 
-        if trade_value > 0.01:  # Minimum trade threshold
+        if position_changed:
+            position_delta = target_position_units - self.position
+            trade_value = abs(position_delta * old_price)
+
             # Calculate costs
             trade_cost = trade_value * (self.commission + self.slippage)
             self.total_commission += trade_cost
