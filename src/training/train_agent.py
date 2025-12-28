@@ -157,6 +157,7 @@ class TrainingConfig:
     commission: float = 0.0006  # 0.06%
     train_ratio: float = 0.8
     episode_length: int = 2048  # Épisodes plus courts pour tracking des rewards
+    eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
     reward_scaling: float = 30.0  # Amplify signal for tanh (optimal range)
     downside_coef: float = 10.0  # Sortino downside penalty coefficient
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
@@ -265,12 +266,12 @@ def create_environments(config: TrainingConfig):
         random_start=True,
     )
 
-    # Create eval environment (separate eval dataset)
+    # Create eval environment (separate eval dataset, 1 month)
     val_env = CryptoTradingEnv(
         parquet_path=config.eval_data_path,
         window_size=config.window_size,
         commission=config.commission,
-        episode_length=None,  # Full episode for evaluation
+        episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
         reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
