@@ -19,6 +19,9 @@ from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, Check
 import torch
 import numpy as np
 
+# CUDA Optimization: Auto-tune convolutions for repeated input sizes
+torch.backends.cudnn.benchmark = True
+
 from src.training.clipped_optimizer import ClippedAdamW
 
 
@@ -455,6 +458,7 @@ if __name__ == "__main__":
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 256)")
 
     args = parser.parse_args()
 
@@ -478,5 +482,7 @@ if __name__ == "__main__":
         config.name = args.name
     if args.gradient_steps is not None:
         config.gradient_steps = args.gradient_steps
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
 
     train(config)
