@@ -48,7 +48,7 @@ class RegimeDetector:
 
     def __init__(
         self,
-        n_components: int = 3,
+        n_components: int = 4,
         n_mix: int = 2,
         n_iter: int = 200,
         random_state: int = 42
@@ -57,7 +57,7 @@ class RegimeDetector:
         Initialise le détecteur de régimes.
 
         Args:
-            n_components: Nombre d'états cachés (3: Bull, Bear, Range).
+            n_components: Nombre d'états cachés (4: Crash, Downtrend, Range, Uptrend).
             n_mix: Nombre de composantes du mélange gaussien.
             n_iter: Nombre d'itérations pour l'algorithme EM.
             random_state: Graine pour reproductibilité.
@@ -199,8 +199,8 @@ class RegimeDetector:
         1. Calcul des features HMM dédiées (168h smoothing)
         2. K-Means warm start
         3. Fit HMM
-        4. Smart Sorting: trier les états par mean_return (Bear < Range < Bull)
-        5. Création des colonnes Prob_Bear, Prob_Range, Prob_Bull
+        4. Smart Sorting: trier les états par mean_return (du pire au meilleur)
+        5. Création des colonnes Prob_0, Prob_1, Prob_2, Prob_3
 
         Args:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
@@ -208,7 +208,7 @@ class RegimeDetector:
         Returns:
             DataFrame avec colonnes HMM et Prob_* ajoutées.
         """
-        print("\n[RegimeDetector] Fitting GMM-HMM (3 states) with K-Means warm start...")
+        print(f"\n[RegimeDetector] Fitting GMM-HMM ({self.n_components} states) with K-Means warm start...")
 
         # 1. Calculer les features HMM dédiées
         df_result = self._compute_hmm_features(df)
@@ -257,26 +257,27 @@ class RegimeDetector:
                 mean_ret = 0.0
             state_returns.append((state, mean_ret))
 
-        # Trier: Bear (plus bas return) < Range (milieu) < Bull (plus haut)
+        # Trier par mean_return (du pire au meilleur)
+        # Prob_0 = Crash, Prob_1 = Downtrend, Prob_2 = Range, Prob_3 = Uptrend
         state_returns.sort(key=lambda x: x[1])
         self.sorted_indices = np.array([s[0] for s in state_returns])
 
-        # Mapping: position dans sorted -> nom sémantique
-        regime_names = ['Bear', 'Range', 'Bull']
-        print("  Smart Sorting (by mean_return):")
+        print("  Smart Sorting (by mean_return, worst to best):")
+        regime_labels = ['Crash', 'Downtrend', 'Range', 'Uptrend'][:self.n_components]
         for i, (state, mean_ret) in enumerate(state_returns):
-            print(f"    {regime_names[i]}: State {state} (mean_ret={mean_ret:.6f})")
+            label = regime_labels[i] if i < len(regime_labels) else f"State{i}"
+            print(f"    Prob_{i} ({label}): HMM_State {state} (mean_ret={mean_ret:.6f})")
 
-        # 9. Créer les colonnes avec noms sémantiques stables
-        col_names = ['Prob_Bear', 'Prob_Range', 'Prob_Bull']
+        # 9. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées)
+        col_names = [f'Prob_{i}' for i in range(self.n_components)]
 
         for col in col_names:
             df_result[col] = np.nan
 
         valid_indices = df_result.index[valid_mask]
-        for i, regime in enumerate(regime_names):
+        for i in range(self.n_components):
             original_state = self.sorted_indices[i]
-            df_result.loc[valid_indices, f'Prob_{regime}'] = proba[:, original_state]
+            df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, original_state]
 
         print(f"  Added columns: {', '.join(col_names)}")
 
@@ -293,7 +294,7 @@ class RegimeDetector:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
 
         Returns:
-            DataFrame avec colonnes Prob_Bear, Prob_Range, Prob_Bull ajoutées.
+            DataFrame avec colonnes Prob_0, Prob_1, ..., Prob_N ajoutées.
         """
         if not self._is_fitted:
             raise RuntimeError("HMM not fitted. Call fit_predict() first or load() a saved model.")
@@ -319,17 +320,16 @@ class RegimeDetector:
         # 4. Prédire les probabilités brutes
         proba = self.hmm.predict_proba(features_scaled)
 
-        # 5. Créer les colonnes avec noms sémantiques (Smart Sorting)
-        regime_names = ['Bear', 'Range', 'Bull']
-        col_names = [f'Prob_{r}' for r in regime_names]
+        # 5. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées par Smart Sorting)
+        col_names = [f'Prob_{i}' for i in range(self.n_components)]
 
         for col in col_names:
             df_result[col] = np.nan
 
         valid_indices = df_result.index[valid_mask]
-        for i, regime in enumerate(regime_names):
+        for i in range(self.n_components):
             original_state = self.sorted_indices[i]
-            df_result.loc[valid_indices, f'Prob_{regime}'] = proba[:, original_state]
+            df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, original_state]
 
         print(f"  Added columns: {', '.join(col_names)}")
 
@@ -394,21 +394,17 @@ class RegimeDetector:
         Retourne le régime dominant (argmax des probabilités).
 
         Args:
-            df: DataFrame avec colonnes Prob_Bear, Prob_Range, Prob_Bull.
+            df: DataFrame avec colonnes Prob_0, Prob_1, ..., Prob_N.
 
         Returns:
-            Series avec le nom du régime dominant.
+            Series avec l'index du régime dominant (0=Crash, 1=Downtrend, ...).
         """
-        regime_names = ['Bear', 'Range', 'Bull']
-        prob_cols = [f'Prob_{r}' for r in regime_names]
+        prob_cols = [f'Prob_{i}' for i in range(self.n_components)]
         probs = df[prob_cols].values
 
         # Argmax sur les colonnes
         dominant_idx = np.argmax(probs, axis=1)
-        dominant_regimes = pd.Series(
-            [regime_names[i] for i in dominant_idx],
-            index=df.index
-        )
+        dominant_regimes = pd.Series(dominant_idx, index=df.index)
 
         return dominant_regimes
 
@@ -470,8 +466,8 @@ class DataManager:
             'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
             # Log-returns (déjà clippés à +/- 20%, pas besoin de scaler)
             'BTC_LogRet', 'ETH_LogRet', 'SPX_LogRet', 'DXY_LogRet', 'NASDAQ_LogRet',
-            # Probabilités HMM (déjà dans [0, 1], noms sémantiques stables)
-            'Prob_Bear', 'Prob_Range', 'Prob_Bull',
+            # Probabilités HMM (déjà dans [0, 1], triées par Smart Sorting)
+            'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
         ]
 
     def pipeline(
@@ -588,10 +584,12 @@ class DataManager:
         # Afficher les statistiques de régimes
         print("\n--- Regime Statistics ---")
         dominant = self.regime_detector.get_dominant_regime(df)
-        for regime in ['Bear', 'Range', 'Bull']:
-            count = (dominant == regime).sum()
+        regime_labels = ['Crash', 'Downtrend', 'Range', 'Uptrend']
+        for i in range(self.regime_detector.n_components):
+            count = (dominant == i).sum()
             pct = 100 * count / len(dominant)
-            print(f"  {regime}: {count} ({pct:.1f}%)")
+            label = regime_labels[i] if i < len(regime_labels) else f"State{i}"
+            print(f"  Prob_{i} ({label}): {count} ({pct:.1f}%)")
 
         print("=" * 60)
 
