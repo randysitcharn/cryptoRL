@@ -43,12 +43,15 @@ def main():
     print(f"  Shape: {df_train.shape}")
     print(f"  Columns: {len(df_train.columns)}")
 
-    # Vérifier que les colonnes HMM ne sont pas déjà présentes
-    if 'Prob_0' in df_train.columns:
-        print("  WARNING: Prob_0 already exists, will be overwritten")
+    # Supprimer les anciennes colonnes HMM si présentes
+    old_hmm_cols = [c for c in df_train.columns if c.startswith('Prob_') or c.startswith('HMM_')]
+    if old_hmm_cols:
+        print(f"  Removing old HMM columns: {old_hmm_cols}")
+        df_train = df_train.drop(columns=old_hmm_cols)
+        print(f"  New shape: {df_train.shape}")
 
-    print("\n[2/4] Training HMM on training set...")
-    detector = RegimeDetector(n_components=3, n_mix=2, n_iter=200)
+    print("\n[2/4] Training HMM on training set (4 states)...")
+    detector = RegimeDetector(n_components=4, n_mix=2, n_iter=200)
     df_train = detector.fit_predict(df_train)
 
     # Sauvegarder le HMM
@@ -74,6 +77,13 @@ def main():
     else:
         df_test = pd.read_parquet(test_path)
         print(f"  Shape: {df_test.shape}")
+
+        # Supprimer les anciennes colonnes HMM si présentes
+        old_hmm_cols = [c for c in df_test.columns if c.startswith('Prob_') or c.startswith('HMM_')]
+        if old_hmm_cols:
+            print(f"  Removing old HMM columns: {old_hmm_cols}")
+            df_test = df_test.drop(columns=old_hmm_cols)
+            print(f"  New shape: {df_test.shape}")
 
         print("\n[4/4] Applying HMM to test set (predict only, no refit)...")
         df_test = detector.predict(df_test)
