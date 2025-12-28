@@ -98,7 +98,7 @@ def main():
 
     # Recharger et vérifier
     df_check = pd.read_parquet(train_path)
-    prob_cols = ['Prob_0', 'Prob_1', 'Prob_2']
+    prob_cols = ['Prob_Bear', 'Prob_Range', 'Prob_Bull']
 
     print("\nTraining set:")
     print(f"  Shape: {df_check.shape}")
