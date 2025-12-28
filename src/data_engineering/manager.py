@@ -76,12 +76,11 @@ class RegimeDetector:
         # Scaler pour normaliser les features avant HMM
         self.scaler = StandardScaler()
 
-        # Mapping des états HMM vers noms de régimes
-        self.state_mapping: Dict[int, str] = {}
-        self.regime_names = ['Bear', 'Range', 'Bull']
-
-        # Statistiques par état (pour le mapping)
+        # Statistiques par état (pour debug)
         self.state_stats: Dict[int, Dict] = {}
+
+        # Flag pour savoir si le modèle est entraîné
+        self._is_fitted = False
 
     def _compute_hmm_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -173,33 +172,13 @@ class RegimeDetector:
 
         print(f"  HMM initialized with K-Means centers")
 
-    def _map_states_to_regimes(self) -> Dict[int, str]:
+    def _compute_state_stats(self) -> None:
         """
-        Mappe les états HMM vers des régimes basé sur means_[Trend].
-
-        Logique force brute:
-        - BULL: état avec HMM_Trend (colonne 0) la plus élevée
-        - BEAR: état avec HMM_Trend la plus faible
-        - RANGE: état intermédiaire
-
-        Returns:
-            Dict mapping état -> nom de régime.
+        Calcule les statistiques par état pour debug/analyse.
         """
         # means_ shape: (n_components, n_mix, n_features)
-        # HMM_Trend est la colonne 0
-        # Moyenne sur les mixtures pour chaque état
         trend_means = self.hmm.means_[:, :, 0].mean(axis=1)
 
-        # Trier les états par Trend (du plus bas au plus haut)
-        sorted_states = np.argsort(trend_means)
-
-        mapping = {
-            int(sorted_states[0]): 'Bear',   # Trend la plus faible
-            int(sorted_states[1]): 'Range',  # Trend intermédiaire
-            int(sorted_states[2]): 'Bull'    # Trend la plus élevée
-        }
-
-        # Calculer les statistiques pour l'affichage
         self.state_stats = {}
         for state in range(self.n_components):
             self.state_stats[state] = {
@@ -207,8 +186,6 @@ class RegimeDetector:
                 'vol_mean': self.hmm.means_[state, :, 1].mean(),
                 'momentum_mean': self.hmm.means_[state, :, 2].mean()
             }
-
-        return mapping
 
     def fit_predict(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -218,8 +195,7 @@ class RegimeDetector:
         1. Calcul des features HMM dédiées (168h smoothing)
         2. K-Means warm start
         3. Fit HMM
-        4. Mapping force brute basé sur means_
-        5. Création des colonnes Prob_Bear, Prob_Range, Prob_Bull
+        4. Création des colonnes Prob_0, Prob_1, Prob_2
 
         Args:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
@@ -253,15 +229,14 @@ class RegimeDetector:
             warnings.simplefilter("ignore")
             self.hmm.fit(features_scaled)
 
+        self._is_fitted = True
         print(f"  HMM converged: {self.hmm.monitor_.converged}")
 
-        # 6. Mapping force brute basé sur means_
-        self.state_mapping = self._map_states_to_regimes()
-
-        print("  State mapping (based on HMM means_):")
-        for state, name in sorted(self.state_mapping.items()):
-            stats = self.state_stats[state]
-            print(f"    State {state} -> {name}: "
+        # 6. Compute stats for debug
+        self._compute_state_stats()
+        print("  State statistics:")
+        for state, stats in self.state_stats.items():
+            print(f"    State {state}: "
                   f"trend={stats['trend_mean']:.6f}, "
                   f"vol={stats['vol_mean']:.6f}, "
                   f"momentum={stats['momentum_mean']:.3f}")
@@ -269,44 +244,134 @@ class RegimeDetector:
         # 7. Prédire les probabilités
         proba = self.hmm.predict_proba(features_scaled)
 
-        # 8. Créer les colonnes de probabilités avec noms sémantiques
-        col_names = ['Prob_Bear', 'Prob_Range', 'Prob_Bull']
+        # 8. Créer les colonnes de probabilités brutes (Prob_0, Prob_1, Prob_2)
+        col_names = [f'Prob_{i}' for i in range(self.n_components)]
 
         # Initialiser les colonnes avec NaN
         for col in col_names:
             df_result[col] = np.nan
 
-        # Mapper les probabilités brutes vers les noms sémantiques
+        # Assigner les probabilités
         valid_indices = df_result.index[valid_mask]
-        for state, regime_name in self.state_mapping.items():
-            col_name = f'Prob_{regime_name}'
-            if col_name in col_names:
-                df_result.loc[valid_indices, col_name] = proba[:, state]
+        for state in range(self.n_components):
+            df_result.loc[valid_indices, f'Prob_{state}'] = proba[:, state]
 
         print(f"  Added columns: {', '.join(col_names)}")
 
         return df_result
+
+    def predict(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prédit les probabilités de régime avec un HMM déjà entraîné.
+
+        Utilisé pour le test set (évite data leakage).
+
+        Args:
+            df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
+
+        Returns:
+            DataFrame avec colonnes Prob_0, Prob_1, Prob_2 ajoutées.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("HMM not fitted. Call fit_predict() first or load() a saved model.")
+
+        print("\n[RegimeDetector] Predicting with fitted HMM...")
+
+        # 1. Calculer les features HMM dédiées
+        df_result = self._compute_hmm_features(df)
+
+        # 2. Extraire les features et identifier les lignes valides
+        features_raw = df_result[self.HMM_FEATURES].values
+        valid_mask = ~np.isnan(features_raw).any(axis=1)
+        features_valid = features_raw[valid_mask]
+
+        print(f"  Valid samples: {len(features_valid)}")
+
+        # 3. Scaler les features (utilise le scaler déjà fitté)
+        features_scaled = self.scaler.transform(features_valid)
+
+        # 4. Prédire les probabilités
+        proba = self.hmm.predict_proba(features_scaled)
+
+        # 5. Créer les colonnes de probabilités
+        col_names = [f'Prob_{i}' for i in range(self.n_components)]
+
+        for col in col_names:
+            df_result[col] = np.nan
+
+        valid_indices = df_result.index[valid_mask]
+        for state in range(self.n_components):
+            df_result.loc[valid_indices, f'Prob_{state}'] = proba[:, state]
+
+        print(f"  Added columns: {', '.join(col_names)}")
+
+        return df_result
+
+    def save(self, path: str) -> None:
+        """
+        Sauvegarde le HMM entraîné.
+
+        Args:
+            path: Chemin du fichier pickle.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("HMM not fitted. Nothing to save.")
+
+        data = {
+            'hmm': self.hmm,
+            'scaler': self.scaler,
+            'kmeans': self.kmeans,
+            'n_components': self.n_components,
+            'n_mix': self.n_mix,
+            'state_stats': self.state_stats,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"[RegimeDetector] Saved to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'RegimeDetector':
+        """
+        Charge un HMM sauvegardé.
+
+        Args:
+            path: Chemin du fichier pickle.
+
+        Returns:
+            Instance de RegimeDetector avec HMM chargé.
+        """
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+
+        detector = cls(
+            n_components=data['n_components'],
+            n_mix=data['n_mix']
+        )
+        detector.hmm = data['hmm']
+        detector.scaler = data['scaler']
+        detector.kmeans = data['kmeans']
+        detector.state_stats = data['state_stats']
+        detector._is_fitted = True
+
+        print(f"[RegimeDetector] Loaded from {path}")
+        return detector
 
     def get_dominant_regime(self, df: pd.DataFrame) -> pd.Series:
         """
         Retourne le régime dominant (argmax des probabilités).
 
         Args:
-            df: DataFrame avec colonnes Prob_Bear, Prob_Range, Prob_Bull.
+            df: DataFrame avec colonnes Prob_0, Prob_1, Prob_2.
 
         Returns:
-            Series avec le nom du régime dominant.
+            Series avec l'index du régime dominant.
         """
-        prob_cols = ['Prob_Bear', 'Prob_Range', 'Prob_Bull']
+        prob_cols = [f'Prob_{i}' for i in range(self.n_components)]
         probs = df[prob_cols].values
 
-        # Argmax sur les colonnes ordonnées: 0=Bear, 1=Range, 2=Bull
+        # Argmax sur les colonnes
         dominant_idx = np.argmax(probs, axis=1)
-        regime_map = {0: 'Bear', 1: 'Range', 2: 'Bull'}
-        dominant_regimes = pd.Series(
-            [regime_map[idx] for idx in dominant_idx],
-            index=df.index
-        )
+        dominant_regimes = pd.Series(dominant_idx, index=df.index)
 
         return dominant_regimes
 
@@ -368,6 +433,8 @@ class DataManager:
             'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
             # Log-returns (déjà clippés à +/- 20%, pas besoin de scaler)
             'BTC_LogRet', 'ETH_LogRet', 'SPX_LogRet', 'DXY_LogRet', 'NASDAQ_LogRet',
+            # Probabilités HMM (déjà dans [0, 1])
+            'Prob_0', 'Prob_1', 'Prob_2',
         ]
 
     def pipeline(
@@ -484,10 +551,10 @@ class DataManager:
         # Afficher les statistiques de régimes
         print("\n--- Regime Statistics ---")
         dominant = self.regime_detector.get_dominant_regime(df)
-        for regime in ['Bear', 'Range', 'Bull']:
-            count = (dominant == regime).sum()
+        for regime_idx in range(self.regime_detector.n_components):
+            count = (dominant == regime_idx).sum()
             pct = 100 * count / len(dominant)
-            print(f"  {regime}: {count} ({pct:.1f}%)")
+            print(f"  State {regime_idx}: {count} ({pct:.1f}%)")
 
         print("=" * 60)
 
