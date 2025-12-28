@@ -97,6 +97,13 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         if freeze_encoder:
             self._freeze_encoder()
 
+        # Convert frozen encoder to float16 for faster inference (CUDA optimization)
+        self._use_amp = freeze_encoder and torch.cuda.is_available()
+        if self._use_amp:
+            self.mae.embedding = self.mae.embedding.half()
+            self.mae.encoder = self.mae.encoder.half()
+            print("[FoundationFeatureExtractor] Encoder converted to float16 for faster inference")
+
         # Output projection: flatten + optional linear if features_dim differs
         if features_dim == computed_features_dim:
             # Simple flatten, no projection needed
@@ -221,7 +228,13 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         """
         # 1. Encode observations using pretrained MAE encoder
         # Output: (batch, seq_len, d_model)
-        encoded = self.mae.encode(observations)
+        if self._use_amp:
+            # Use autocast for mixed precision inference
+            with torch.amp.autocast('cuda'):
+                encoded = self.mae.encode(observations.half())
+            encoded = encoded.float()  # Convert back to float32 for output projection
+        else:
+            encoded = self.mae.encode(observations)
 
         # 2. Output projection: flatten (+ optional linear)
         # Output: (batch, features_dim)
