@@ -39,6 +39,8 @@ class CryptoDataset(Dataset):
         'NASDAQ_Open', 'NASDAQ_High', 'NASDAQ_Low',
         # Volumes bruts (utiliser VolRel à la place)
         'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
+        # HMM intermediate features (only use Prob_0/1/2 outputs)
+        'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
     ]
 
     def __init__(
