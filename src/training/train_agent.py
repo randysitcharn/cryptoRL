@@ -138,6 +138,7 @@ class TrainingConfig:
 
     # Paths
     data_path: str = "data/processed_data.parquet"
+    eval_data_path: str = "data/processed_data_eval.parquet"  # Separate eval dataset
     encoder_path: str = "weights/pretrained_encoder.pth"
     save_path: str = "weights/tqc_agent_final.zip"
     tensorboard_log: str = "logs/tensorboard_tqc/"
@@ -246,10 +247,9 @@ def create_environments(config: TrainingConfig):
     Returns:
         Tuple of (train_vec_env, eval_vec_env).
     """
-    # Create train/val environments
-    train_env, val_env = CryptoTradingEnv.create_train_val_envs(
+    # Create training environment (full training dataset)
+    train_env = CryptoTradingEnv(
         parquet_path=config.data_path,
-        train_ratio=config.train_ratio,
         window_size=config.window_size,
         commission=config.commission,
         episode_length=config.episode_length,
@@ -257,6 +257,20 @@ def create_environments(config: TrainingConfig):
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
+        random_start=True,
+    )
+
+    # Create eval environment (separate eval dataset)
+    val_env = CryptoTradingEnv(
+        parquet_path=config.eval_data_path,
+        window_size=config.window_size,
+        commission=config.commission,
+        episode_length=None,  # Full episode for evaluation
+        reward_scaling=config.reward_scaling,
+        downside_coef=config.downside_coef,
+        upside_coef=config.upside_coef,
+        action_discretization=config.action_discretization,
+        random_start=False,  # Sequential for evaluation
     )
 
     # Wrap in Monitor for episode tracking
@@ -440,6 +454,7 @@ if __name__ == "__main__":
     parser.add_argument("--action-disc", type=float, default=None, help="Action discretization (0.1 = 21 positions, 0 = disabled)")
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
+    parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
 
     args = parser.parse_args()
 
@@ -461,5 +476,7 @@ if __name__ == "__main__":
         config.ent_coef = args.ent_coef
     if args.name is not None:
         config.name = args.name
+    if args.gradient_steps is not None:
+        config.gradient_steps = args.gradient_steps
 
     train(config)
