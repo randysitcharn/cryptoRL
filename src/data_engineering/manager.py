@@ -245,14 +245,18 @@ class RegimeDetector:
 
         # 8. Smart Sorting: calculer mean_return par état et trier
         #    Évite le Label Switching entre réentraînements
-        log_returns = df_result.loc[df_result.index[valid_mask], 'BTC_LogRet'].values
+        #    Utilise les vrais log returns depuis BTC_Close (non scalés)
+        btc_close = df_result.loc[df_result.index[valid_mask], 'BTC_Close'].values
+        real_log_returns = np.zeros(len(btc_close))
+        real_log_returns[1:] = np.log(btc_close[1:] / btc_close[:-1])
+
         state_returns = []
         for state in range(self.n_components):
             # État dominant pour chaque sample
             dominant = proba.argmax(axis=1)
             state_mask = dominant == state
             if state_mask.sum() > 0:
-                mean_ret = log_returns[state_mask].mean()
+                mean_ret = real_log_returns[state_mask].mean()
             else:
                 mean_ret = 0.0
             state_returns.append((state, mean_ret))
@@ -262,11 +266,12 @@ class RegimeDetector:
         state_returns.sort(key=lambda x: x[1])
         self.sorted_indices = np.array([s[0] for s in state_returns])
 
-        print("  Smart Sorting (by mean_return, worst to best):")
+        print("  Smart Sorting (by real BTC log return, worst to best):")
         regime_labels = ['Crash', 'Downtrend', 'Range', 'Uptrend'][:self.n_components]
         for i, (state, mean_ret) in enumerate(state_returns):
             label = regime_labels[i] if i < len(regime_labels) else f"State{i}"
-            print(f"    Prob_{i} ({label}): HMM_State {state} (mean_ret={mean_ret:.6f})")
+            annual_ret = mean_ret * 24 * 365 * 100  # Annualized %
+            print(f"    Prob_{i} ({label}): HMM_State {state} (mean_ret={mean_ret*100:.4f}%/h, {annual_ret:+.1f}%/yr)")
 
         # 9. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées)
         col_names = [f'Prob_{i}' for i in range(self.n_components)]
