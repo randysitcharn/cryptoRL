@@ -98,14 +98,15 @@ def main():
 
     # Recharger et vérifier
     df_check = pd.read_parquet(train_path)
-    prob_cols = ['Prob_Bear', 'Prob_Range', 'Prob_Bull']
+    prob_cols = ['Prob_0', 'Prob_1', 'Prob_2', 'Prob_3']
+    regime_labels = ['Crash', 'Downtrend', 'Range', 'Uptrend']
 
     print("\nTraining set:")
     print(f"  Shape: {df_check.shape}")
     print(f"  Prob columns present: {all(c in df_check.columns for c in prob_cols)}")
-    for col in prob_cols:
+    for i, col in enumerate(prob_cols):
         if col in df_check.columns:
-            print(f"    {col}: min={df_check[col].min():.4f}, max={df_check[col].max():.4f}")
+            print(f"    {col} ({regime_labels[i]}): min={df_check[col].min():.4f}, max={df_check[col].max():.4f}")
 
     if os.path.exists(test_path):
         df_check_test = pd.read_parquet(test_path)
