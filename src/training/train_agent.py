@@ -123,6 +123,8 @@ class DetailTensorboardCallback(BaseCallback):
                 self.logger.record("rewards/penalty_churn", info["rewards/penalty_churn"])
             if "rewards/total_raw" in info:
                 self.logger.record("rewards/total_raw", info["rewards/total_raw"])
+            if "rewards/scaled" in info:
+                self.logger.record("rewards/scaled", info["rewards/scaled"])
 
         return True
 

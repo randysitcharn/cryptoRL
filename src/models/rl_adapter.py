@@ -45,7 +45,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         dim_feedforward: Optional[int] = None,
         dropout: float = 0.1,
         freeze_encoder: bool = True,
-        features_dim: Optional[int] = None
+        features_dim: int = 512  # Safety Projector: reduce from 8192 to stabilize Q-values
     ):
         """
         Initialize the Foundation Feature Extractor.
@@ -59,7 +59,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             dim_feedforward: FFN dimension (default: 4 * d_model).
             dropout: Dropout rate.
             freeze_encoder: If True, freeze encoder weights.
-            features_dim: Output dimension. If None, uses seq_len * d_model.
+            features_dim: Output dimension (default: 512 for Q-value stability).
         """
         # Extract dimensions from observation space
         # Shape: (window_size, n_features)
@@ -67,10 +67,8 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.n_features = observation_space.shape[1]
         self.d_model = d_model
 
-        # Compute features_dim dynamically if not specified
-        computed_features_dim = self.window_size * d_model
-        if features_dim is None:
-            features_dim = computed_features_dim
+        # Flatten dimension from encoder output
+        self.flatten_dim = self.window_size * d_model  # 64 * 128 = 8192
 
         # Initialize parent class with features_dim
         super().__init__(observation_space, features_dim)
@@ -104,22 +102,16 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             self.mae.encoder = self.mae.encoder.half()
             print("[FoundationFeatureExtractor] Encoder converted to float16 for faster inference")
 
-        # Output projection: flatten + optional linear if features_dim differs
-        if features_dim == computed_features_dim:
-            # Simple flatten, no projection needed
-            self.output_projection = nn.Sequential(
-                nn.Flatten(),
-                nn.LayerNorm(features_dim)
-            )
-        else:
-            # Flatten + linear projection to target features_dim
-            self.output_projection = nn.Sequential(
-                nn.Flatten(),
-                nn.LayerNorm(computed_features_dim),
-                nn.Linear(computed_features_dim, features_dim),
-                nn.ReLU(),
-                nn.LayerNorm(features_dim)
-            )
+        # Safety Projector: compress + stabilize + bound output for Q-value stability
+        # Architecture: Flatten(8192) → LayerNorm → Linear(512) → LayerNorm → Tanh
+        self.output_projection = nn.Sequential(
+            nn.Flatten(),                                    # (B, 64, 128) → (B, 8192)
+            nn.LayerNorm(self.flatten_dim),                  # Stabilize input variance
+            nn.Linear(self.flatten_dim, features_dim),       # 8192 → 512 (16x compression)
+            nn.LayerNorm(features_dim),                      # Stabilize after projection
+            nn.Tanh()                                        # Bound output to [-1, 1]
+        )
+        print(f"[FoundationFeatureExtractor] Safety Projector: {self.flatten_dim} → {features_dim} (Tanh bounded)")
 
     def _load_pretrained_weights(self, encoder_path: str) -> None:
         """
@@ -277,7 +269,7 @@ if __name__ == "__main__":
     print(f"features_dim: {extractor.features_dim}")
     print(f"Encoder frozen: {extractor.is_frozen}")
 
-    # Verify output dimension
-    expected_dim = seq_len * 128  # 64 * 128 = 8192
+    # Verify output dimension (Safety Projector default: 512)
+    expected_dim = 512
     assert features.shape == (batch_size, expected_dim), f"Shape mismatch! Expected {(batch_size, expected_dim)}"
     print("\n[OK] FoundationFeatureExtractor test passed!")

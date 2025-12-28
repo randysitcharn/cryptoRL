@@ -242,15 +242,19 @@ class CryptoTradingEnv(gym.Env):
         # 5. Total + Tanh scaling
         total_reward = reward_log_return + downside_penalty + upside_bonus
 
+        # Compute final scaled reward
+        scaled_reward = float(np.tanh(total_reward * self.reward_scaling))
+
         # Store metrics for observability
         self.reward_metrics = {
             "rewards/log_return": float(reward_log_return),
             "rewards/penalty_vol": float(downside_penalty),
             "rewards/bonus_upside": float(upside_bonus),
             "rewards/total_raw": float(total_reward),
+            "rewards/scaled": scaled_reward,
         }
 
-        return float(np.tanh(total_reward * self.reward_scaling))
+        return scaled_reward
 
     def reset(
         self,
