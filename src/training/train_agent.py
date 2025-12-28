@@ -462,6 +462,7 @@ if __name__ == "__main__":
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 256)")
+    parser.add_argument("--gamma", type=float, default=None, help="Discount factor (default: 0.99)")
 
     args = parser.parse_args()
 
@@ -487,5 +488,7 @@ if __name__ == "__main__":
         config.gradient_steps = args.gradient_steps
     if args.batch_size is not None:
         config.batch_size = args.batch_size
+    if args.gamma is not None:
+        config.gamma = args.gamma
 
     train(config)
