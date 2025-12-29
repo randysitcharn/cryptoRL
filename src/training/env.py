@@ -69,6 +69,7 @@ class CryptoTradingEnv(gym.Env):
         downside_coef: float = 10.0,  # Sortino downside penalty coefficient
         upside_coef: float = 0.0,  # Symmetric upside bonus coefficient
         action_discretization: float = 0.1,  # Discretize actions (0.1 = 21 positions)
+        churn_coef: float = 0.0,  # Cognitive tax: amplify trading cost perception (0.1 = 10x)
     ):
         """
         Initialize the trading environment.
@@ -96,6 +97,7 @@ class CryptoTradingEnv(gym.Env):
         self.downside_coef = downside_coef
         self.upside_coef = upside_coef
         self.action_discretization = action_discretization
+        self.churn_coef = churn_coef
 
         # Load data
         df = pd.read_parquet(parquet_path)
@@ -182,6 +184,7 @@ class CryptoTradingEnv(gym.Env):
         self.cash = self.initial_balance
         self.position = 0.0  # Number of units held
         self.current_position_pct = 0.0  # Current position as % [-1, 1]
+        self._prev_position_pct = 0.0  # For churn penalty calculation
 
         # Reward state
         self._prev_valuation = self.initial_balance
@@ -239,8 +242,17 @@ class CryptoTradingEnv(gym.Env):
         if step_return > 0:
             upside_bonus = (step_return ** 2) * self.upside_coef
 
-        # 5. Total + Tanh scaling
-        total_reward = reward_log_return + downside_penalty + upside_bonus
+        # 5. Pénalité de churn (Taxe Cognitive)
+        churn_penalty = 0.0
+        if self.churn_coef > 0 and hasattr(self, '_prev_position_pct'):
+            position_delta = abs(self.current_position_pct - self._prev_position_pct)
+            if position_delta > 0:
+                # Coût estimé * Multiplicateur d'amplification
+                cost_rate = self.commission + self.slippage  # 0.07%
+                churn_penalty = -position_delta * cost_rate * self.churn_coef
+
+        # 6. Total + Tanh scaling
+        total_reward = reward_log_return + downside_penalty + upside_bonus + churn_penalty
 
         # Compute final scaled reward
         scaled_reward = float(np.tanh(total_reward * self.reward_scaling))
@@ -250,6 +262,7 @@ class CryptoTradingEnv(gym.Env):
             "rewards/log_return": float(reward_log_return),
             "rewards/penalty_vol": float(downside_penalty),
             "rewards/bonus_upside": float(upside_bonus),
+            "rewards/churn_penalty": float(churn_penalty),
             "rewards/total_raw": float(total_reward),
             "rewards/scaled": scaled_reward,
         }
@@ -330,11 +343,12 @@ class CryptoTradingEnv(gym.Env):
         # 6. Calculate new NAV
         new_nav = self._get_nav()
 
-        # 7. Calculate reward (Hybrid Log-Sortino)
+        # 7. Calculate reward (Hybrid Log-Sortino + Churn Penalty)
         reward = self._calculate_reward()
 
-        # 8. Update valuation for next reward calculation
+        # 8. Update state for next step
         self._prev_valuation = new_nav
+        self._prev_position_pct = self.current_position_pct
 
         # Track log return for analysis
         if old_nav > 0 and new_nav > 0:
