@@ -162,6 +162,7 @@ class TrainingConfig:
     downside_coef: float = 10.0  # Sortino downside penalty coefficient
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
     action_discretization: float = 0.1  # Discretize actions (0.1 = 21 positions)
+    churn_coef: float = 0.0  # Cognitive tax: amplify trading cost perception (0.1 = 10x)
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -263,6 +264,7 @@ def create_environments(config: TrainingConfig):
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
+        churn_coef=config.churn_coef,
         random_start=True,
     )
 
@@ -276,6 +278,7 @@ def create_environments(config: TrainingConfig):
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
+        churn_coef=config.churn_coef,
         random_start=False,  # Sequential for evaluation
     )
 
@@ -458,6 +461,7 @@ if __name__ == "__main__":
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")
     parser.add_argument("--upside-coef", type=float, default=None, help="Symmetric upside bonus coefficient")
     parser.add_argument("--action-disc", type=float, default=None, help="Action discretization (0.1 = 21 positions, 0 = disabled)")
+    parser.add_argument("--churn-coef", type=float, default=None, help="Churn penalty coefficient (0.1 = 10x amplified trading cost)")
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
@@ -480,6 +484,8 @@ if __name__ == "__main__":
         config.upside_coef = args.upside_coef
     if args.action_disc is not None:
         config.action_discretization = args.action_disc
+    if args.churn_coef is not None:
+        config.churn_coef = args.churn_coef
     if args.ent_coef is not None:
         config.ent_coef = args.ent_coef
     if args.name is not None:
