@@ -244,9 +244,10 @@ class CryptoTradingEnv(gym.Env):
 
         # 5. Pénalité de churn (Taxe Cognitive)
         churn_penalty = 0.0
-        if self.churn_coef > 0 and hasattr(self, '_prev_position_pct'):
+        position_delta = 0.0
+        if hasattr(self, '_prev_position_pct'):
             position_delta = abs(self.current_position_pct - self._prev_position_pct)
-            if position_delta > 0:
+            if position_delta > 0 and self.churn_coef > 0:
                 # Coût estimé * Multiplicateur d'amplification
                 cost_rate = self.commission + self.slippage  # 0.07%
                 churn_penalty = -position_delta * cost_rate * self.churn_coef
@@ -263,6 +264,7 @@ class CryptoTradingEnv(gym.Env):
             "rewards/penalty_vol": float(downside_penalty),
             "rewards/bonus_upside": float(upside_bonus),
             "rewards/churn_penalty": float(churn_penalty),
+            "rewards/position_delta": float(position_delta),
             "rewards/total_raw": float(total_reward),
             "rewards/scaled": scaled_reward,
         }
