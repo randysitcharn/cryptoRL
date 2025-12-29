@@ -104,27 +104,58 @@ class StepLoggingCallback(BaseCallback):
 class DetailTensorboardCallback(BaseCallback):
     """
     Callback pour logger les composantes du reward dans TensorBoard.
-    Permet de visualiser: log_return, penalty_vol, penalty_churn, total_raw.
+    Permet de visualiser: log_return, penalty_vol, churn_penalty, total_raw.
+    Inclut des stats épisode pour analyse du coefficient de churn optimal.
     """
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
+        # Accumulateurs pour stats épisode
+        self.episode_churn_penalties = []
+        self.episode_log_returns = []
+        self.episode_position_deltas = []
 
     def _on_step(self) -> bool:
         # Récupérer les infos depuis l'environnement
         if self.locals.get("infos"):
             info = self.locals["infos"][0]
 
-            # Log reward components
+            # Log reward components (every step)
             if "rewards/log_return" in info:
                 self.logger.record("rewards/log_return", info["rewards/log_return"])
+                self.episode_log_returns.append(info["rewards/log_return"])
             if "rewards/penalty_vol" in info:
                 self.logger.record("rewards/penalty_vol", info["rewards/penalty_vol"])
-            if "rewards/penalty_churn" in info:
-                self.logger.record("rewards/penalty_churn", info["rewards/penalty_churn"])
+            if "rewards/churn_penalty" in info:
+                self.logger.record("rewards/churn_penalty", info["rewards/churn_penalty"])
+                self.episode_churn_penalties.append(info["rewards/churn_penalty"])
+            if "rewards/position_delta" in info:
+                self.logger.record("rewards/position_delta", info["rewards/position_delta"])
+                self.episode_position_deltas.append(info["rewards/position_delta"])
             if "rewards/total_raw" in info:
                 self.logger.record("rewards/total_raw", info["rewards/total_raw"])
             if "rewards/scaled" in info:
                 self.logger.record("rewards/scaled", info["rewards/scaled"])
+
+            # À la fin d'un épisode, log les stats agrégées
+            if "episode" in info:
+                if self.episode_churn_penalties:
+                    total_churn = sum(self.episode_churn_penalties)
+                    total_log_ret = sum(self.episode_log_returns)
+                    total_delta = sum(self.episode_position_deltas)
+
+                    self.logger.record("churn/episode_total_penalty", total_churn)
+                    self.logger.record("churn/episode_total_log_return", total_log_ret)
+                    self.logger.record("churn/episode_total_position_delta", total_delta)
+
+                    # Ratio churn/return (pour calibrer le coefficient)
+                    if abs(total_log_ret) > 1e-8:
+                        ratio = abs(total_churn / total_log_ret)
+                        self.logger.record("churn/penalty_to_return_ratio", ratio)
+
+                # Reset accumulateurs
+                self.episode_churn_penalties = []
+                self.episode_log_returns = []
+                self.episode_position_deltas = []
 
         return True
 
