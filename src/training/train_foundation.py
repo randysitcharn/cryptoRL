@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import Optional
 
 # Ajouter le chemin racine pour les imports
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,6 +24,7 @@ sys.path.insert(0, ROOT_DIR)
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.data.dataset import CryptoDataset
@@ -59,6 +61,8 @@ class TrainingConfig:
     weights_dir: str = "weights"
     checkpoint_path: str = "weights/best_foundation_full.pth"
     encoder_path: str = "weights/pretrained_encoder.pth"
+    tensorboard_log: Optional[str] = "logs/tensorboard_mae/"
+    run_name: Optional[str] = None  # Custom run name for TensorBoard
 
 
 # =============================================================================
@@ -391,6 +395,18 @@ def train(
     print()
 
     # ==========================================================================
+    # TensorBoard Setup
+    # ==========================================================================
+
+    writer = None
+    if config.tensorboard_log:
+        run_name = config.run_name or f"MAE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_dir = os.path.join(ROOT_DIR, config.tensorboard_log, run_name)
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"[TensorBoard] Logging to: {log_dir}")
+
+    # ==========================================================================
     # Epoch Loop
     # ==========================================================================
 
@@ -410,6 +426,13 @@ def train(
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
               f"Time: {epoch_time:.1f}s")
+
+        # TensorBoard Logging
+        if writer:
+            writer.add_scalar("loss/train", train_loss, epoch)
+            writer.add_scalar("loss/val", val_loss, epoch)
+            writer.add_scalar("loss/best_val", best_val_loss, epoch)
+            writer.add_scalar("time/epoch_seconds", epoch_time, epoch)
 
         # Early Stopping Check
         if val_loss < best_val_loss:
@@ -431,6 +454,14 @@ def train(
     # ==========================================================================
 
     total_time = time.time() - start_time
+
+    # Close TensorBoard writer
+    if writer:
+        writer.add_hparams(
+            {"lr": config.lr, "batch_size": config.batch_size, "mask_ratio": config.mask_ratio},
+            {"hparam/best_val_loss": best_val_loss, "hparam/epochs": end_epoch}
+        )
+        writer.close()
 
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")

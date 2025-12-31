@@ -18,6 +18,12 @@ from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.cluster import KMeans
 from hmmlearn.hmm import GMMHMM
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    HAS_TENSORBOARD = True
+except ImportError:
+    HAS_TENSORBOARD = False
+
 from src.data_engineering.loader import MultiAssetDownloader
 from src.data_engineering.features import FeatureEngineer
 
@@ -94,7 +100,7 @@ class RegimeDetector:
         de fond et ignorer le bruit horaire.
 
         Args:
-            df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
+            df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Fracdiff.
 
         Returns:
             DataFrame avec colonnes HMM_Trend, HMM_Vol, HMM_Momentum ajoutées.
@@ -113,17 +119,19 @@ class RegimeDetector:
             min_periods=self.SMOOTHING_WINDOW
         ).mean()
 
-        # 3. Momentum_Feature: RSI 14 normalisé [0, 1]
-        delta = df['BTC_Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=14, min_periods=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=14).mean()
+        # 3. Momentum_Feature: RSI 14 sur BTC_Fracdiff (stationnaire)
+        # BTC_Fracdiff est DÉJÀ différencié (d ≈ 0.4), donc PAS de .diff()
+        # Sinon on obtient d ≈ 1.4 (sur-différencié = bruit pur)
+        fracdiff = df['BTC_Fracdiff']
+        gain = fracdiff.where(fracdiff > 0, 0).rolling(window=14, min_periods=14).mean()
+        loss = (-fracdiff.where(fracdiff < 0, 0)).rolling(window=14, min_periods=14).mean()
 
-        # Éviter division par zéro
+        # RSI borne naturellement [0, 100] → idéal pour Gaussian HMM
         rs = gain / loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
         df_result['HMM_Momentum'] = rsi / 100  # Normaliser [0, 1]
 
-        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h)")
+        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, using BTC_Fracdiff)")
 
         return df_result
 
@@ -191,7 +199,12 @@ class RegimeDetector:
                 'momentum_mean': self.hmm.means_[state, :, 2].mean()
             }
 
-    def fit_predict(self, df: pd.DataFrame) -> pd.DataFrame:
+    def fit_predict(
+        self,
+        df: pd.DataFrame,
+        tensorboard_log: Optional[str] = None,
+        run_name: Optional[str] = None
+    ) -> pd.DataFrame:
         """
         Entraîne le HMM et prédit les probabilités de régime.
 
@@ -203,12 +216,24 @@ class RegimeDetector:
         5. Création des colonnes Prob_0, Prob_1, Prob_2, Prob_3
 
         Args:
-            df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
+            df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Fracdiff.
+            tensorboard_log: Chemin pour logs TensorBoard (optional).
+            run_name: Nom du run TensorBoard (optional).
 
         Returns:
             DataFrame avec colonnes HMM et Prob_* ajoutées.
         """
         print(f"\n[RegimeDetector] Fitting GMM-HMM ({self.n_components} states) with K-Means warm start...")
+
+        # TensorBoard setup
+        writer = None
+        if tensorboard_log and HAS_TENSORBOARD:
+            from datetime import datetime
+            run_name = run_name or f"HMM_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            log_dir = os.path.join(tensorboard_log, run_name)
+            os.makedirs(log_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir=log_dir)
+            print(f"  [TensorBoard] Logging to: {log_dir}")
 
         # 1. Calculer les features HMM dédiées
         df_result = self._compute_hmm_features(df)
@@ -236,6 +261,15 @@ class RegimeDetector:
 
         self._is_fitted = True
         print(f"  HMM converged: {self.hmm.monitor_.converged}")
+
+        # Log HMM convergence to TensorBoard
+        if writer:
+            # Log convergence history
+            for i, score in enumerate(self.hmm.monitor_.history):
+                writer.add_scalar("hmm/log_likelihood", score, i)
+            writer.add_scalar("hmm/converged", float(self.hmm.monitor_.converged), 0)
+            writer.add_scalar("hmm/n_iter", len(self.hmm.monitor_.history), 0)
+            writer.add_scalar("hmm/kmeans_inertia", self.kmeans.inertia_, 0)
 
         # 6. Compute stats for debug
         self._compute_state_stats()
@@ -285,6 +319,21 @@ class RegimeDetector:
             df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, original_state]
 
         print(f"  Added columns: {', '.join(col_names)}")
+
+        # Log final state distributions to TensorBoard
+        if writer:
+            # State distribution
+            dominant = proba.argmax(axis=1)
+            for i in range(self.n_components):
+                state_pct = (dominant == self.sorted_indices[i]).sum() / len(dominant) * 100
+                writer.add_scalar(f"hmm/state_{i}_pct", state_pct, 0)
+
+            # State mean returns (annualized)
+            for i, (state, mean_ret) in enumerate(state_returns):
+                annual_ret = mean_ret * 24 * 365 * 100
+                writer.add_scalar(f"hmm/state_{i}_annual_ret", annual_ret, 0)
+
+            writer.close()
 
         return df_result
 
