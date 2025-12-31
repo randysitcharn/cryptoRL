@@ -160,9 +160,40 @@ class DetailTensorboardCallback(BaseCallback):
         return True
 
 
+import re
+import glob
+
 from src.config import DEVICE, SEED
 from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.env import CryptoTradingEnv
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> str:
+    """
+    Find the latest checkpoint in the checkpoint directory.
+
+    Looks for files matching pattern: tqc_foundation_XXXXXX_steps.zip
+    Returns the one with the highest step number.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+
+    Returns:
+        Path to the latest checkpoint, or None if not found
+    """
+    pattern = os.path.join(checkpoint_dir, "tqc_foundation_*_steps.zip")
+    checkpoints = glob.glob(pattern)
+
+    if not checkpoints:
+        return None
+
+    # Extract step numbers and sort
+    def extract_steps(path):
+        match = re.search(r"_(\d+)_steps\.zip$", path)
+        return int(match.group(1)) if match else 0
+
+    checkpoints.sort(key=extract_steps, reverse=True)
+    return checkpoints[0]
 
 
 # ============================================================================
@@ -227,6 +258,11 @@ class TrainingConfig:
     eval_freq: int = 5_000  # Same as tuning - catches peak performance
     checkpoint_freq: int = 50_000
     log_freq: int = 100  # Log every N steps
+
+    # Resume training (Lightweight mode - no buffer save/load)
+    load_model_path: str = None  # Path to .zip model to resume from
+    load_latest: bool = False  # Auto-select latest checkpoint from checkpoint_dir
+    resume_learning_starts: int = 10_000  # Warmup steps to refill buffer before training
 
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -413,32 +449,72 @@ def train(config: TrainingConfig = None) -> TQC:
     print(f"      gSDE: {config.use_sde} (sample_freq={config.sde_sample_freq})")
 
     # ==================== Model Creation ====================
-    print("\n[3/4] Creating TQC model...")
-
     # Use custom name for TensorBoard if provided
     tb_log_name = config.name if config.name else "TQC"
 
-    model = TQC(
-        policy="MlpPolicy",
-        env=train_env,
-        learning_rate=linear_schedule(config.learning_rate),
-        buffer_size=config.buffer_size,
-        batch_size=config.batch_size,
-        gamma=config.gamma,
-        tau=config.tau,
-        ent_coef=config.ent_coef,
-        train_freq=config.train_freq,
-        gradient_steps=config.gradient_steps,
-        top_quantiles_to_drop_per_net=config.top_quantiles_to_drop,
-        use_sde=config.use_sde,
-        sde_sample_freq=config.sde_sample_freq,
-        use_sde_at_warmup=config.use_sde_at_warmup,
-        policy_kwargs=policy_kwargs,
-        tensorboard_log=config.tensorboard_log,
-        verbose=1,
-        seed=SEED,
-        device=DEVICE,
-    )
+    if config.load_model_path:
+        # ========== LIGHTWEIGHT RESUME MODE ==========
+        print(f"\n[3/4] Loading model from {config.load_model_path}...")
+        print("      Mode: Lightweight Resume (no buffer)")
+
+        model = TQC.load(
+            config.load_model_path,
+            env=train_env,
+            device=DEVICE,
+            tensorboard_log=config.tensorboard_log,
+        )
+
+        # CRITICAL: Cold Start Warmup - fill buffer before training
+        model.learning_starts = config.resume_learning_starts
+        print(f"      learning_starts set to {config.resume_learning_starts} (Cold Start Warmup)")
+
+        # Reapply learning rate schedule
+        model.learning_rate = linear_schedule(config.learning_rate)
+        model.lr_schedule = linear_schedule(config.learning_rate)
+
+        # Reapply entropy coefficient (can be overwritten by load)
+        if config.ent_coef != "auto":
+            model.ent_coef = config.ent_coef
+            print(f"      ent_coef set to {config.ent_coef}")
+        else:
+            print("      ent_coef: auto (using loaded value)")
+
+        print(f"      Flow: Load -> Empty Buffer -> Play {config.resume_learning_starts} steps -> Resume Training")
+
+        # TensorBoard continuity warning
+        if config.name is None:
+            # List existing TensorBoard runs
+            tb_runs = glob.glob(os.path.join(config.tensorboard_log, "*"))
+            tb_names = [os.path.basename(r).rsplit("_", 1)[0] for r in tb_runs if os.path.isdir(r)]
+            tb_names = list(set(tb_names))  # Deduplicate
+            if tb_names:
+                print(f"\n      [WARNING] No --name provided. TensorBoard will create a new curve.")
+                print(f"      To continue an existing curve, use one of: {tb_names}")
+    else:
+        # ========== NEW TRAINING MODE ==========
+        print("\n[3/4] Creating TQC model...")
+
+        model = TQC(
+            policy="MlpPolicy",
+            env=train_env,
+            learning_rate=linear_schedule(config.learning_rate),
+            buffer_size=config.buffer_size,
+            batch_size=config.batch_size,
+            gamma=config.gamma,
+            tau=config.tau,
+            ent_coef=config.ent_coef,
+            train_freq=config.train_freq,
+            gradient_steps=config.gradient_steps,
+            top_quantiles_to_drop_per_net=config.top_quantiles_to_drop,
+            use_sde=config.use_sde,
+            sde_sample_freq=config.sde_sample_freq,
+            use_sde_at_warmup=config.use_sde_at_warmup,
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=config.tensorboard_log,
+            verbose=1,
+            seed=SEED,
+            device=DEVICE,
+        )
 
     print(f"      Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
     print(f"      Trainable parameters: {sum(p.numel() for p in model.policy.parameters() if p.requires_grad):,}")
@@ -452,11 +528,14 @@ def train(config: TrainingConfig = None) -> TQC:
 
     callbacks = create_callbacks(config, eval_env)
 
+    # reset_num_timesteps=False continues TensorBoard from previous run
+    is_resume = config.load_model_path is not None
     model.learn(
         total_timesteps=config.total_timesteps,
         callback=callbacks,
         tb_log_name=tb_log_name,
         progress_bar=True,
+        reset_num_timesteps=not is_resume,  # False for resume, True for fresh
     )
 
     # ==================== Save Final Model ====================
@@ -498,6 +577,10 @@ if __name__ == "__main__":
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 256)")
     parser.add_argument("--gamma", type=float, default=None, help="Discount factor (default: 0.99)")
+    parser.add_argument("--load-model", type=str, default=None,
+                        help="Path to .zip model to resume training from (Lightweight mode: no buffer)")
+    parser.add_argument("--load-latest", action="store_true",
+                        help="Auto-select latest checkpoint from checkpoint_dir")
 
     args = parser.parse_args()
 
@@ -527,5 +610,18 @@ if __name__ == "__main__":
         config.batch_size = args.batch_size
     if args.gamma is not None:
         config.gamma = args.gamma
+    if args.load_model is not None:
+        config.load_model_path = args.load_model
+    if args.load_latest:
+        config.load_latest = True
+
+    # Resolve --load-latest to actual checkpoint path
+    if config.load_latest:
+        latest = find_latest_checkpoint(config.checkpoint_dir)
+        if latest:
+            config.load_model_path = latest
+            print(f"[Auto] Latest checkpoint found: {latest}")
+        else:
+            print(f"[Warning] No checkpoints found in {config.checkpoint_dir}")
 
     train(config)
