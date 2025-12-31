@@ -119,6 +119,64 @@ Calcule la probabilité de sur-apprentissage.
 
 ---
 
+## Phase 4.5 : Live Trading Safeguards (Production)
+
+### Technologies Clés
+- **Min Order Filter** : Ignore les ordres < seuil minimum (Binance: 5$)
+- **Rate Limiting** : Protection contre dépassement API (1000 req/min)
+- **Anti-Churn** : Pénalité cognitive dans le reward
+
+### Objectif & Justification
+**Protection API & Réduction des Frais**
+L'agent optimisé en backtest peut générer trop de micro-ordres en live. Ces safeguards évitent les rejets API et économisent les frais de transaction.
+
+### Spécifications Techniques
+
+#### 1. Filtre Montant Minimum
+```python
+MIN_ORDER_VALUE = 5.5  # Marge de sécurité vs 5$ Binance
+
+def should_execute_order(symbol: str, quantity: float) -> bool:
+    price = get_price(symbol)
+    notional_value = price * quantity
+
+    if notional_value < MIN_ORDER_VALUE:
+        logger.info(f"Ordre ignoré: {notional_value:.2f}$ < {MIN_ORDER_VALUE}$")
+        return False
+    return True
+```
+
+#### 2. Rate Limiter
+```python
+MAX_REQUESTS_PER_MIN = 1000
+SAFETY_MARGIN = 0.8  # Utiliser max 80% du quota
+
+class RateLimiter:
+    def can_execute(self) -> bool:
+        if self.request_count > MAX_REQUESTS_PER_MIN * SAFETY_MARGIN:
+            logger.warning("Rate limit proche, ordre différé")
+            return False
+        return True
+```
+
+#### 3. Anti-Churn (Training)
+```python
+# Dans env.py - Taxe Cognitive
+PAIN_MULTIPLIER = 10.0  # Amplifie la douleur des frais x10
+
+churn_penalty = -position_delta * (commission + slippage) * PAIN_MULTIPLIER
+```
+
+### Tâches
+- [x] Implémenter `churn_coef` dans reward function
+- [ ] Créer module `src/trading/safeguards.py`
+- [ ] Implémenter filtre montant minimum
+- [ ] Implémenter rate limiter avec backoff
+- [ ] Tests unitaires des safeguards
+- [ ] Intégration avec execution engine
+
+---
+
 ## Phase 5 : Ensemble Strategy v2 (Future Version)
 
 ### Technologies Clés
