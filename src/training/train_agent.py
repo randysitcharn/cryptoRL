@@ -232,8 +232,8 @@ class TrainingConfig:
     n_layers: int = 2
 
     # TQC Hyperparameters (Ultra Safe Baseline)
-    total_timesteps: int = 500_000
-    learning_rate: float = 5e-6  # Ultra Safe: priorité stabilité
+    total_timesteps: int = 300_000
+    learning_rate: float = 6e-5  # With floor at 10% (6e-6 minimum)
     buffer_size: int = 200_000
     batch_size: int = 256
     gamma: float = 0.99
@@ -265,18 +265,23 @@ class TrainingConfig:
     resume_learning_starts: int = 10_000  # Warmup steps to refill buffer before training
 
 
-def linear_schedule(initial_value: float) -> Callable[[float], float]:
+def linear_schedule(initial_value: float, floor_ratio: float = 0.1) -> Callable[[float], float]:
     """
-    Linear learning rate schedule.
+    Linear learning rate schedule with floor.
+
+    Decays linearly from initial_value to floor (10% of initial by default).
+    Prevents learning collapse at end of training.
 
     Args:
         initial_value: Initial learning rate.
+        floor_ratio: Minimum LR as ratio of initial (default: 0.1 = 10%).
 
     Returns:
         Callable that maps progress (1.0 -> 0.0) to learning rate.
     """
+    floor = initial_value * floor_ratio
     def func(progress_remaining: float) -> float:
-        return progress_remaining * initial_value
+        return max(floor, progress_remaining * initial_value)
     return func
 
 
@@ -565,7 +570,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=500_000, help="Total timesteps")
     parser.add_argument("--log-freq", type=int, default=100, help="Log frequency (steps)")
     parser.add_argument("--eval-freq", type=int, default=5_000, help="Eval frequency (steps)")
-    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate (Ultra Safe)")
+    parser.add_argument("--lr", type=float, default=6e-5, help="Learning rate (with 10% floor)")
     parser.add_argument("--checkpoint-dir", type=str, default="weights/checkpoints/", help="Checkpoint directory")
     parser.add_argument("--tau", type=float, default=None, help="Soft update coefficient (override config)")
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")

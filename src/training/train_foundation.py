@@ -51,10 +51,10 @@ class TrainingConfig:
     mask_ratio: float = 0.15
 
     # Training
-    epochs: int = 50
+    epochs: int = 70
     lr: float = 1e-4
     weight_decay: float = 1e-5
-    patience: int = 5  # Early stopping
+    patience: int = 7  # Early stopping
 
     # Paths
     data_path: str = "data/processed_data.parquet"
@@ -484,10 +484,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train CryptoMAE Foundation Model")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=70, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
+    parser.add_argument("--patience", type=int, default=7, help="Early stopping patience")
     parser.add_argument("--from-scratch", action="store_true",
                         help="Force training from scratch, ignoring checkpoints")
     parser.add_argument("--extra-epochs", type=int, default=None,

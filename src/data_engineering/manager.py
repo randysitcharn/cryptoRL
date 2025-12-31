@@ -264,12 +264,29 @@ class RegimeDetector:
 
         # Log HMM convergence to TensorBoard
         if writer:
-            # Log convergence history
-            for i, score in enumerate(self.hmm.monitor_.history):
+            history = self.hmm.monitor_.history
+            print(f"  EM iterations: {len(history)}")
+
+            # 1. Log likelihood par itération EM
+            for i, score in enumerate(history):
                 writer.add_scalar("hmm/log_likelihood", score, i)
-            writer.add_scalar("hmm/converged", float(self.hmm.monitor_.converged), 0)
-            writer.add_scalar("hmm/n_iter", len(self.hmm.monitor_.history), 0)
-            writer.add_scalar("hmm/kmeans_inertia", self.kmeans.inertia_, 0)
+
+            # 2. Amélioration par itération (delta)
+            if len(history) > 1:
+                for i in range(1, len(history)):
+                    delta = history[i] - history[i-1]
+                    writer.add_scalar("hmm/log_likelihood_delta", delta, i)
+
+            # 3. Métriques finales groupées
+            writer.add_scalar("hmm/final/converged", float(self.hmm.monitor_.converged), 0)
+            writer.add_scalar("hmm/final/n_iterations", len(history), 0)
+            writer.add_scalar("hmm/final/kmeans_inertia", self.kmeans.inertia_, 0)
+            writer.add_scalar("hmm/final/log_likelihood", history[-1] if history else 0, 0)
+
+            # 4. Transition matrix entropy (régularité des transitions)
+            transmat = self.hmm.transmat_
+            entropy = -np.sum(transmat * np.log(transmat + 1e-10)) / self.n_components
+            writer.add_scalar("hmm/final/transmat_entropy", entropy, 0)
 
         # 6. Compute stats for debug
         self._compute_state_stats()
@@ -322,16 +339,12 @@ class RegimeDetector:
 
         # Log final state distributions to TensorBoard
         if writer:
-            # State distribution
             dominant = proba.argmax(axis=1)
-            for i in range(self.n_components):
-                state_pct = (dominant == self.sorted_indices[i]).sum() / len(dominant) * 100
-                writer.add_scalar(f"hmm/state_{i}_pct", state_pct, 0)
-
-            # State mean returns (annualized)
             for i, (state, mean_ret) in enumerate(state_returns):
                 annual_ret = mean_ret * 24 * 365 * 100
-                writer.add_scalar(f"hmm/state_{i}_annual_ret", annual_ret, 0)
+                state_pct = (dominant == self.sorted_indices[i]).sum() / len(dominant) * 100
+                writer.add_scalar(f"hmm/state_{i}/annual_return_pct", annual_ret, 0)
+                writer.add_scalar(f"hmm/state_{i}/distribution_pct", state_pct, 0)
 
             writer.close()
 
