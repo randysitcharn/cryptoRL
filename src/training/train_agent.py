@@ -214,9 +214,9 @@ class TrainingConfig:
     # Run name (for TensorBoard)
     name: str = None  # If set, appears in TensorBoard
 
-    # Environment
+    # Environment (from churn_analysis.yaml)
     window_size: int = 64
-    commission: float = 0.0006  # 0.06%
+    commission: float = 0.0004  # 0.04% (churn analysis config)
     train_ratio: float = 0.8
     episode_length: int = 2048  # Épisodes plus courts pour tracking des rewards
     eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
@@ -224,19 +224,19 @@ class TrainingConfig:
     downside_coef: float = 10.0  # Sortino downside penalty coefficient
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
     action_discretization: float = 0.1  # Discretize actions (0.1 = 21 positions)
-    churn_coef: float = 0.0  # Cognitive tax: amplify trading cost perception (0.1 = 10x)
+    churn_coef: float = 0.5  # Cognitive tax: anti-churn penalty (churn analysis config)
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
     n_heads: int = 4
     n_layers: int = 2
 
-    # TQC Hyperparameters (Ultra Safe Baseline)
-    total_timesteps: int = 300_000
+    # TQC Hyperparameters (from churn_analysis.yaml)
+    total_timesteps: int = 350_000
     learning_rate: float = 6e-5  # With floor at 10% (6e-6 minimum)
     buffer_size: int = 200_000
     batch_size: int = 256
-    gamma: float = 0.99
+    gamma: float = 0.95  # Churn analysis: favor short-term rewards
     tau: float = 0.005  # Slow soft update to prevent catastrophic forgetting
     ent_coef: Union[str, float] = "auto"  # Auto-tuned entropy
     train_freq: int = 1

@@ -61,12 +61,12 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 70
-    tqc_timesteps: int = 300_000
+    tqc_timesteps: int = 350_000
 
-    # TQC Hyperparameters (from Ultra Safe config)
+    # TQC Hyperparameters (from churn_analysis.yaml)
     learning_rate: float = 6e-5
     batch_size: int = 256
-    gamma: float = 0.99
+    gamma: float = 0.95
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
@@ -427,7 +427,7 @@ class WFOPipeline:
         env = CryptoTradingEnv(
             parquet_path=test_path,
             window_size=64,
-            commission=0.0006,
+            commission=0.0004,  # churn_analysis.yaml
             episode_length=None,  # Full episode
             random_start=False,
         )
