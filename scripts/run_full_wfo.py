@@ -61,11 +61,11 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 70
-    tqc_timesteps: int = 350_000
+    tqc_timesteps: int = 150_000  # Reduced to prevent overfitting
 
-    # TQC Hyperparameters (from churn_analysis.yaml)
+    # TQC Hyperparameters (aggressive regularization)
     learning_rate: float = 6e-5
-    batch_size: int = 256
+    batch_size: int = 1024  # Larger batch for gradient smoothing
     gamma: float = 0.95
 
     # Columns to exclude from scaling

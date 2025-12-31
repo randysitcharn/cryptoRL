@@ -214,9 +214,9 @@ class TrainingConfig:
     # Run name (for TensorBoard)
     name: str = None  # If set, appears in TensorBoard
 
-    # Environment (from churn_analysis.yaml)
+    # Environment (aggressive regularization for anti-overfitting)
     window_size: int = 64
-    commission: float = 0.0004  # 0.04% (churn analysis config)
+    commission: float = 0.0015  # 0.15% - Higher cost during training (3.75x penalty)
     train_ratio: float = 0.8
     episode_length: int = 2048  # Épisodes plus courts pour tracking des rewards
     eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
@@ -224,21 +224,21 @@ class TrainingConfig:
     downside_coef: float = 10.0  # Sortino downside penalty coefficient
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
     action_discretization: float = 0.1  # Discretize actions (0.1 = 21 positions)
-    churn_coef: float = 0.5  # Cognitive tax: anti-churn penalty (churn analysis config)
+    churn_coef: float = 1.0  # Doubled: stronger anti-churn penalty
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
     n_heads: int = 4
     n_layers: int = 2
 
-    # TQC Hyperparameters (from churn_analysis.yaml)
-    total_timesteps: int = 350_000
+    # TQC Hyperparameters (aggressive regularization)
+    total_timesteps: int = 150_000  # Reduced to prevent overfitting
     learning_rate: float = 6e-5  # With floor at 10% (6e-6 minimum)
     buffer_size: int = 200_000
-    batch_size: int = 256
-    gamma: float = 0.95  # Churn analysis: favor short-term rewards
+    batch_size: int = 1024  # Larger batch for gradient smoothing
+    gamma: float = 0.95  # Favor short-term rewards
     tau: float = 0.005  # Slow soft update to prevent catastrophic forgetting
-    ent_coef: Union[str, float] = "auto"  # Auto-tuned entropy
+    ent_coef: Union[str, float] = 0.05  # Fixed high entropy (force exploration)
     train_freq: int = 1
     gradient_steps: int = 1  # Ultra Safe: 1 update per step
     top_quantiles_to_drop: int = 2
