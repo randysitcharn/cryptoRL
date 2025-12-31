@@ -60,11 +60,11 @@ class WFOConfig:
     hours_per_month: int = 720  # 30 days * 24 hours
 
     # Training Parameters
-    mae_epochs: int = 50
+    mae_epochs: int = 70
     tqc_timesteps: int = 300_000
 
     # TQC Hyperparameters (from Ultra Safe config)
-    learning_rate: float = 5e-6
+    learning_rate: float = 6e-5
     batch_size: int = 256
     gamma: float = 0.99
 
@@ -325,7 +325,7 @@ class WFOPipeline:
         config = TrainingConfig()
         config.data_path = train_path
         config.epochs = self.config.mae_epochs
-        config.patience = 5
+        config.patience = 7
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
@@ -643,7 +643,7 @@ def main():
                         help="Run specific segment only")
     parser.add_argument("--timesteps", type=int, default=300_000,
                         help="TQC training timesteps per segment")
-    parser.add_argument("--mae-epochs", type=int, default=50,
+    parser.add_argument("--mae-epochs", type=int, default=70,
                         help="MAE training epochs per segment")
     parser.add_argument("--train-months", type=int, default=12,
                         help="Training window in months")
