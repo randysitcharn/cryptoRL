@@ -263,15 +263,19 @@ class FeatureEngineer:
 
             series = df[close_col].dropna()
 
-            # Trouver le d optimal
-            d_opt, p_value = self.find_min_d(series)
+            # Appliquer log() pour normaliser l'amplitude
+            # FFD sur log(price) donne des valeurs ~[-0.1, +0.1] au lieu de [428, 4584]
+            log_series = np.log(series)
+
+            # Trouver le d optimal sur log(price)
+            d_opt, p_value = self.find_min_d(log_series)
             self.optimal_d[asset] = d_opt
             self.adf_results[asset] = {'d': d_opt, 'p_value': p_value}
 
             print(f"  {asset}: d_optimal = {d_opt:.2f}, ADF p-value = {p_value:.4f}")
 
-            # Appliquer FFD avec le d optimal
-            df[f"{asset}_Fracdiff"] = self._ffd(df[close_col], d_opt)
+            # Appliquer FFD sur log(price)
+            df[f"{asset}_Fracdiff"] = self._ffd(np.log(df[close_col]), d_opt)
 
         return df
 

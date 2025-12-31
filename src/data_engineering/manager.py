@@ -119,19 +119,25 @@ class RegimeDetector:
             min_periods=self.SMOOTHING_WINDOW
         ).mean()
 
-        # 3. Momentum_Feature: RSI 14 sur BTC_Fracdiff (stationnaire)
-        # BTC_Fracdiff est DÉJÀ différencié (d ≈ 0.4), donc PAS de .diff()
-        # Sinon on obtient d ≈ 1.4 (sur-différencié = bruit pur)
-        fracdiff = df['BTC_Fracdiff']
-        gain = fracdiff.where(fracdiff > 0, 0).rolling(window=14, min_periods=14).mean()
-        loss = (-fracdiff.where(fracdiff < 0, 0)).rolling(window=14, min_periods=14).mean()
+        # 3. Momentum_Feature: RSI 14 sur BTC_LogRet (centré autour de 0)
+        # Note: BTC_Fracdiff après log() est toujours positif, donc RSI ne fonctionne pas
+        # On utilise BTC_LogRet qui oscille naturellement autour de 0
+        logret = df['BTC_LogRet']
+        gain = logret.where(logret > 0, 0).rolling(window=14, min_periods=14).mean()
+        loss = (-logret.where(logret < 0, 0)).rolling(window=14, min_periods=14).mean()
 
         # RSI borne naturellement [0, 100] → idéal pour Gaussian HMM
-        rs = gain / loss.replace(0, np.nan)
+        # Ajouter epsilon pour éviter division par zéro
+        rs = gain / (loss + 1e-10)
         rsi = 100 - (100 / (1 + rs))
         df_result['HMM_Momentum'] = rsi / 100  # Normaliser [0, 1]
 
-        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, using BTC_Fracdiff)")
+        # Clip HMM features pour stabilité numérique
+        df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-0.05, 0.05)  # ±5%/h max
+        df_result['HMM_Vol'] = df_result['HMM_Vol'].clip(0, 0.2)  # Vol max 20%/h
+        df_result['HMM_Momentum'] = df_result['HMM_Momentum'].clip(0, 1)  # RSI strict [0,1]
+
+        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, RSI on BTC_LogRet)")
 
         return df_result
 
@@ -240,7 +246,7 @@ class RegimeDetector:
 
         # 2. Extraire les features et identifier les lignes valides
         features_raw = df_result[self.HMM_FEATURES].values
-        valid_mask = ~np.isnan(features_raw).any(axis=1)
+        valid_mask = np.isfinite(features_raw).all(axis=1)  # Attrape NaN ET Inf
         features_valid = features_raw[valid_mask]
 
         if len(features_valid) < 100:
@@ -376,7 +382,7 @@ class RegimeDetector:
 
         # 2. Extraire les features et identifier les lignes valides
         features_raw = df_result[self.HMM_FEATURES].values
-        valid_mask = ~np.isnan(features_raw).any(axis=1)
+        valid_mask = np.isfinite(features_raw).all(axis=1)  # Attrape NaN ET Inf
         features_valid = features_raw[valid_mask]
 
         print(f"  Valid samples: {len(features_valid)}")
