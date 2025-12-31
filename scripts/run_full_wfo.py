@@ -509,6 +509,35 @@ class WFOPipeline:
         print(f"    Max DD: {max_drawdown:.2f}%")
         print(f"    Trades: {total_trades}")
 
+        # TensorBoard logging for evaluation
+        from torch.utils.tensorboard import SummaryWriter
+        eval_log_dir = f"logs/wfo/eval/segment_{segment_id}"
+        os.makedirs(eval_log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=eval_log_dir)
+
+        # Log scalar metrics
+        writer.add_scalar("eval/sharpe", sharpe, segment_id)
+        writer.add_scalar("eval/pnl_pct", pnl_pct, segment_id)
+        writer.add_scalar("eval/max_drawdown", max_drawdown, segment_id)
+        writer.add_scalar("eval/total_trades", total_trades, segment_id)
+        writer.add_scalar("eval/final_nav", navs[-1] if len(navs) > 0 else 10000, segment_id)
+
+        # Log NAV curve as figure
+        if len(navs) > 10:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(navs, color='blue', linewidth=1)
+            ax.axhline(y=10000, color='gray', linestyle='--', alpha=0.5)
+            ax.set_xlabel('Step')
+            ax.set_ylabel('NAV')
+            ax.set_title(f'Segment {segment_id} - NAV Curve (PnL: {pnl_pct:+.2f}%)')
+            ax.grid(True, alpha=0.3)
+            writer.add_figure("eval/nav_curve", fig, segment_id)
+            plt.close(fig)
+
+        writer.close()
+        print(f"  TensorBoard logs: {eval_log_dir}")
+
         # Cleanup
         del model, env
         torch.cuda.empty_cache()
