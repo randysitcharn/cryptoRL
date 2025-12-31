@@ -81,6 +81,9 @@ class WFOConfig:
         'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
         # Log-returns (déjà clippés)
         'BTC_LogRet', 'ETH_LogRet', 'SPX_LogRet', 'DXY_LogRet', 'NASDAQ_LogRet',
+        # Z-Scores (déjà normalisés mean≈0, std≈1)
+        'BTC_ZScore', 'ETH_ZScore', 'SPX_ZScore', 'DXY_ZScore', 'NASDAQ_ZScore',
+        'BTC_Vol_ZScore', 'ETH_Vol_ZScore', 'SPX_Vol_ZScore', 'DXY_Vol_ZScore', 'NASDAQ_Vol_ZScore',
         # Probabilités HMM (déjà dans [0, 1])
         'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
     ])
@@ -234,6 +237,17 @@ class WFOPipeline:
         # Transform both
         train_df[cols_to_scale] = scaler.transform(train_df[cols_to_scale])
         test_df[cols_to_scale] = scaler.transform(test_df[cols_to_scale])
+
+        # Clip scaled features to [-5, 5]
+        train_df[cols_to_scale] = train_df[cols_to_scale].clip(-5, 5)
+        test_df[cols_to_scale] = test_df[cols_to_scale].clip(-5, 5)
+        print(f"  Clipped {len(cols_to_scale)} scaled columns to [-5, 5]")
+
+        # Clip ZScores to [-5, 5] (already normalized, just safety clip)
+        zscore_cols = [c for c in train_df.columns if 'ZScore' in c]
+        train_df[zscore_cols] = train_df[zscore_cols].clip(-5, 5)
+        test_df[zscore_cols] = test_df[zscore_cols].clip(-5, 5)
+        print(f"  Clipped {len(zscore_cols)} ZScore columns to [-5, 5]")
 
         return train_df, test_df, scaler
 
