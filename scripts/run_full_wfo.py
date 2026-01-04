@@ -370,12 +370,12 @@ class WFOPipeline:
         train_path: str,
         encoder_path: str,
         segment_id: int
-    ) -> str:
+    ) -> tuple[str, Dict[str, Any]]:
         """
         Train TQC agent on segment train data.
 
         Returns:
-            Path to saved agent.
+            Tuple of (path to saved agent, training metrics dict).
         """
         print(f"\n[Segment {segment_id}] Training TQC...")
 
@@ -406,8 +406,8 @@ class WFOPipeline:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.tensorboard_log, exist_ok=True)
 
-        # Train
-        model = train(config)
+        # Train - now returns (model, train_metrics)
+        model, train_metrics = train(config)
 
         print(f"  TQC trained. Saved: {config.save_path}")
 
@@ -416,20 +416,28 @@ class WFOPipeline:
         torch.cuda.empty_cache()
         gc.collect()
 
-        return config.save_path
+        return config.save_path, train_metrics
 
     def evaluate_segment(
         self,
         test_path: str,
         encoder_path: str,
         tqc_path: str,
-        segment_id: int
+        segment_id: int,
+        train_metrics: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Evaluate trained agent on test data.
 
+        Args:
+            test_path: Path to test data parquet.
+            encoder_path: Path to encoder weights.
+            tqc_path: Path to TQC agent.
+            segment_id: Segment identifier.
+            train_metrics: Optional training metrics from train_tqc.
+
         Returns:
-            Dict with metrics (sharpe, pnl, drawdown, etc.)
+            Dict with metrics (sharpe, pnl, drawdown, training diagnostics, etc.)
         """
         print(f"\n[Segment {segment_id}] Evaluating...")
 
@@ -502,6 +510,14 @@ class WFOPipeline:
             'final_nav': navs[-1] if len(navs) > 0 else 10000,
             'test_rows': len(rewards),
         }
+
+        # Merge training diagnostics if provided
+        if train_metrics:
+            metrics['train_action_sat'] = train_metrics.get('action_saturation', 0.0)
+            metrics['train_entropy'] = train_metrics.get('avg_entropy', 0.0)
+            metrics['train_critic_loss'] = train_metrics.get('avg_critic_loss', 0.0)
+            metrics['train_actor_loss'] = train_metrics.get('avg_actor_loss', 0.0)
+            metrics['churn_ratio'] = train_metrics.get('avg_churn_ratio', 0.0)
 
         print(f"  Results:")
         print(f"    Sharpe: {sharpe:.2f}")
@@ -580,12 +596,59 @@ class WFOPipeline:
         encoder_path = self.train_mae(train_path, segment_id)
 
         # 5. TQC Training
-        tqc_path = self.train_tqc(train_path, encoder_path, segment_id)
+        tqc_path, train_metrics = self.train_tqc(train_path, encoder_path, segment_id)
 
-        # 6. Evaluation
-        metrics = self.evaluate_segment(test_path, encoder_path, tqc_path, segment_id)
+        # 6. Evaluation (with training diagnostics)
+        metrics = self.evaluate_segment(
+            test_path, encoder_path, tqc_path, segment_id,
+            train_metrics=train_metrics
+        )
+
+        # 7. Teacher Report - Hyperparameter Hints
+        self._print_teacher_report(train_metrics, segment_id)
 
         return metrics
+
+    def _print_teacher_report(self, train_metrics: Dict[str, Any], segment_id: int):
+        """Print hyperparameter diagnostic hints based on training metrics."""
+        print("\n" + "-" * 50)
+        print(f"HYPERPARAMETER HINTS (Segment {segment_id})")
+        print("-" * 50)
+
+        issues_found = False
+
+        # Check entropy (SAC/TQC uses log-entropy, negative values are normal)
+        entropy = train_metrics.get('avg_entropy', 0.0)
+        if entropy < -20:
+            print(f"  [OVERFITTING] Entropy too low ({entropy:.2f})")
+            print(f"    -> Increase ent_coef (current behavior is deterministic)")
+            issues_found = True
+
+        # Check action saturation
+        action_sat = train_metrics.get('action_saturation', 0.0)
+        if action_sat > 0.98:
+            print(f"  [SATURATION] Agent stuck at extremes ({action_sat:.3f})")
+            print(f"    -> Increase downside_coef or reduce reward_scaling")
+            issues_found = True
+
+        # Check churn ratio
+        churn_ratio = train_metrics.get('avg_churn_ratio', 0.0)
+        if churn_ratio > 0.3:
+            print(f"  [HIGH CHURN] Trading eating profits ({churn_ratio:.3f})")
+            print(f"    -> Increase churn_coef to penalize position changes")
+            issues_found = True
+
+        # Check critic loss
+        critic_loss = train_metrics.get('avg_critic_loss', 0.0)
+        if critic_loss > 1.0:
+            print(f"  [INSTABILITY] High critic loss ({critic_loss:.4f})")
+            print(f"    -> Reduce learning_rate or increase batch_size")
+            issues_found = True
+
+        if not issues_found:
+            print("  [HEALTHY] All training metrics within normal range")
+
+        print("-" * 50)
 
     def save_results(self, metrics: Dict[str, Any]):
         """Append metrics to results CSV."""

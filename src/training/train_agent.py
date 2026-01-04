@@ -106,6 +106,7 @@ class DetailTensorboardCallback(BaseCallback):
     Callback pour logger les composantes du reward dans TensorBoard.
     Permet de visualiser: log_return, penalty_vol, churn_penalty, total_raw.
     Inclut des stats épisode pour analyse du coefficient de churn optimal.
+    Capture aussi les métriques de diagnostic pour l'analyse post-training.
     """
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
@@ -114,7 +115,18 @@ class DetailTensorboardCallback(BaseCallback):
         self.episode_log_returns = []
         self.episode_position_deltas = []
 
+        # Métriques de diagnostic (accumulées sur tout le training)
+        self.all_actions = []
+        self.entropy_values = []
+        self.critic_losses = []
+        self.actor_losses = []
+        self.churn_ratios = []
+
     def _on_step(self) -> bool:
+        # Track actions for saturation analysis
+        if self.locals.get("actions") is not None:
+            self.all_actions.extend(np.abs(self.locals["actions"]).flatten())
+
         # Récupérer les infos depuis l'environnement
         if self.locals.get("infos"):
             info = self.locals["infos"][0]
@@ -151,13 +163,37 @@ class DetailTensorboardCallback(BaseCallback):
                     if abs(total_log_ret) > 1e-8:
                         ratio = abs(total_churn / total_log_ret)
                         self.logger.record("churn/penalty_to_return_ratio", ratio)
+                        self.churn_ratios.append(ratio)
 
-                # Reset accumulateurs
+                # Reset accumulateurs épisode
                 self.episode_churn_penalties = []
                 self.episode_log_returns = []
                 self.episode_position_deltas = []
 
+        # Capture training metrics from model logger (safe access)
+        try:
+            if hasattr(self.model, 'logger') and self.model.logger is not None:
+                name_to_value = self.model.logger.name_to_value
+                if "train/ent_coef" in name_to_value:
+                    self.entropy_values.append(name_to_value["train/ent_coef"])
+                if "train/critic_loss" in name_to_value:
+                    self.critic_losses.append(name_to_value["train/critic_loss"])
+                if "train/actor_loss" in name_to_value:
+                    self.actor_losses.append(name_to_value["train/actor_loss"])
+        except (KeyError, AttributeError):
+            pass
+
         return True
+
+    def get_training_metrics(self) -> dict:
+        """Return diagnostic metrics at end of training."""
+        return {
+            "action_saturation": float(np.mean(self.all_actions)) if self.all_actions else 0.0,
+            "avg_entropy": float(np.mean(self.entropy_values)) if self.entropy_values else 0.0,
+            "avg_critic_loss": float(np.mean(self.critic_losses)) if self.critic_losses else 0.0,
+            "avg_actor_loss": float(np.mean(self.actor_losses)) if self.actor_losses else 0.0,
+            "avg_churn_ratio": float(np.mean(self.churn_ratios)) if self.churn_ratios else 0.0,
+        }
 
 
 import re
@@ -365,7 +401,7 @@ def create_environments(config: TrainingConfig):
     return train_vec_env, eval_vec_env
 
 
-def create_callbacks(config: TrainingConfig, eval_env) -> list:
+def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTensorboardCallback]:
     """
     Create training callbacks.
 
@@ -374,7 +410,7 @@ def create_callbacks(config: TrainingConfig, eval_env) -> list:
         eval_env: Evaluation environment.
 
     Returns:
-        List of callbacks.
+        Tuple of (callbacks_list, detail_callback).
     """
     callbacks = []
 
@@ -409,10 +445,10 @@ def create_callbacks(config: TrainingConfig, eval_env) -> list:
     detail_callback = DetailTensorboardCallback(verbose=0)
     callbacks.append(detail_callback)
 
-    return callbacks
+    return callbacks, detail_callback
 
 
-def train(config: TrainingConfig = None) -> TQC:
+def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     """
     Train TQC agent with Foundation Model feature extractor.
 
@@ -420,7 +456,7 @@ def train(config: TrainingConfig = None) -> TQC:
         config: Training configuration (uses default if None).
 
     Returns:
-        Trained TQC model.
+        Tuple of (Trained TQC model, training metrics dict).
     """
     if config is None:
         config = TrainingConfig()
@@ -531,7 +567,7 @@ def train(config: TrainingConfig = None) -> TQC:
     print(f"      Checkpoint frequency: {config.checkpoint_freq:,}")
     print("\n" + "=" * 70)
 
-    callbacks = create_callbacks(config, eval_env)
+    callbacks, detail_callback = create_callbacks(config, eval_env)
 
     # reset_num_timesteps=False continues TensorBoard from previous run
     is_resume = config.load_model_path is not None
@@ -542,6 +578,16 @@ def train(config: TrainingConfig = None) -> TQC:
         progress_bar=True,
         reset_num_timesteps=not is_resume,  # False for resume, True for fresh
     )
+
+    # ==================== Capture Training Metrics ====================
+    training_metrics = detail_callback.get_training_metrics()
+
+    print("\n[Training Diagnostics]")
+    print(f"  Action Saturation: {training_metrics['action_saturation']:.3f}")
+    print(f"  Avg Entropy: {training_metrics['avg_entropy']:.4f}")
+    print(f"  Avg Critic Loss: {training_metrics['avg_critic_loss']:.4f}")
+    print(f"  Avg Actor Loss: {training_metrics['avg_actor_loss']:.4f}")
+    print(f"  Avg Churn Ratio: {training_metrics['avg_churn_ratio']:.3f}")
 
     # ==================== Save Final Model ====================
     print("\n" + "=" * 70)
@@ -560,7 +606,7 @@ def train(config: TrainingConfig = None) -> TQC:
     print("\nTo view training progress:")
     print(f"  tensorboard --logdir={config.tensorboard_log}")
 
-    return model
+    return model, training_metrics
 
 
 if __name__ == "__main__":
