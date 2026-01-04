@@ -425,7 +425,7 @@ class WFOPipeline:
         tqc_path: str,
         segment_id: int,
         train_metrics: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any], np.ndarray]:
         """
         Evaluate trained agent on test data.
 
@@ -437,7 +437,7 @@ class WFOPipeline:
             train_metrics: Optional training metrics from train_tqc.
 
         Returns:
-            Dict with metrics (sharpe, pnl, drawdown, training diagnostics, etc.)
+            Tuple of (metrics dict, navs array for plotting).
         """
         print(f"\n[Segment {segment_id}] Evaluating...")
 
@@ -559,18 +559,18 @@ class WFOPipeline:
         torch.cuda.empty_cache()
         gc.collect()
 
-        return metrics
+        return metrics, navs
 
     def run_segment(
         self,
         df_raw: pd.DataFrame,
         segment: Dict[str, int]
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Run full WFO pipeline for a single segment.
 
         Returns:
-            Metrics dict for this segment.
+            Tuple of (metrics dict, train_metrics dict) for this segment.
         """
         segment_id = segment['id']
         print("\n" + "=" * 70)
@@ -599,7 +599,7 @@ class WFOPipeline:
         tqc_path, train_metrics = self.train_tqc(train_path, encoder_path, segment_id)
 
         # 6. Evaluation (with training diagnostics)
-        metrics = self.evaluate_segment(
+        metrics, navs = self.evaluate_segment(
             test_path, encoder_path, tqc_path, segment_id,
             train_metrics=train_metrics
         )
@@ -607,7 +607,11 @@ class WFOPipeline:
         # 7. Teacher Report - Hyperparameter Hints
         self._print_teacher_report(train_metrics, segment_id)
 
-        return metrics
+        # 8. Generate diagnostic plots (PNG for visual analysis)
+        plot_path = self.generate_segment_plots(segment_id, navs, metrics, train_metrics)
+        metrics['plot_path'] = plot_path
+
+        return metrics, train_metrics
 
     def _print_teacher_report(self, train_metrics: Dict[str, Any], segment_id: int):
         """Print hyperparameter diagnostic hints based on training metrics."""
@@ -649,6 +653,155 @@ class WFOPipeline:
             print("  [HEALTHY] All training metrics within normal range")
 
         print("-" * 50)
+
+    def generate_segment_plots(
+        self,
+        segment_id: int,
+        navs: np.ndarray,
+        metrics: Dict[str, Any],
+        train_metrics: Dict[str, Any]
+    ) -> str:
+        """
+        Generate diagnostic plots for a segment and save as PNG.
+
+        Returns:
+            Path to the generated PNG file.
+        """
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(f"Segment {segment_id} - Diagnostic Report", fontsize=14)
+
+        # 1. NAV Curve
+        ax1 = axes[0, 0]
+        ax1.plot(navs, color='blue', linewidth=1)
+        ax1.axhline(y=10000, color='gray', linestyle='--', alpha=0.5)
+        ax1.set_title(f"NAV Curve (Final: {navs[-1]:.0f}, PnL: {metrics['pnl_pct']:+.2f}%)")
+        ax1.set_xlabel("Step")
+        ax1.set_ylabel("NAV")
+        ax1.grid(True, alpha=0.3)
+
+        # 2. Training Metrics Bar Chart
+        ax2 = axes[0, 1]
+        metric_names = ['action_sat', 'entropy', 'churn_ratio']
+        metric_values = [
+            train_metrics.get('action_saturation', 0),
+            min(abs(train_metrics.get('avg_entropy', 0)) / 20, 1.5),  # Normalized, capped
+            train_metrics.get('avg_churn_ratio', 0),
+        ]
+        thresholds = [0.98, 1.0, 0.3]
+        colors = ['red' if v > t else 'green' for v, t in zip(metric_values, thresholds)]
+        ax2.bar(metric_names, metric_values, color=colors)
+        ax2.axhline(y=0.3, color='orange', linestyle='--', label='Churn threshold')
+        ax2.axhline(y=0.98, color='red', linestyle='--', label='Saturation threshold')
+        ax2.set_title("Training Health Metrics")
+        ax2.set_ylim(0, 1.5)
+        ax2.legend()
+
+        # 3. Key Metrics Text
+        ax3 = axes[1, 0]
+        ax3.axis('off')
+        text = f"""
+    EVALUATION METRICS
+    ==================
+    Sharpe Ratio: {metrics['sharpe']:.2f}
+    PnL: {metrics['pnl_pct']:+.2f}%
+    Max Drawdown: {metrics['max_drawdown']:.2f}%
+    Total Trades: {metrics['total_trades']}
+
+    TRAINING DIAGNOSTICS
+    ====================
+    Action Saturation: {train_metrics.get('action_saturation', 0):.3f}
+    Avg Entropy: {train_metrics.get('avg_entropy', 0):.4f}
+    Avg Critic Loss: {train_metrics.get('avg_critic_loss', 0):.4f}
+    Churn Ratio: {train_metrics.get('avg_churn_ratio', 0):.3f}
+        """
+        ax3.text(0.1, 0.5, text, fontsize=10, family='monospace', va='center')
+
+        # 4. Pass/Fail Summary
+        ax4 = axes[1, 1]
+        ax4.axis('off')
+
+        issues = []
+        if train_metrics.get('avg_entropy', 0) < -20:
+            issues.append("OVERFITTING (entropy < -20)")
+        if train_metrics.get('action_saturation', 0) > 0.98:
+            issues.append("SATURATION (action_sat > 0.98)")
+        if train_metrics.get('avg_churn_ratio', 0) > 0.3:
+            issues.append("HIGH CHURN (ratio > 0.3)")
+        if metrics['sharpe'] < 0:
+            issues.append("NEGATIVE SHARPE")
+        if metrics['pnl_pct'] < -20:
+            issues.append("SEVERE LOSS (> 20%)")
+
+        if issues:
+            status = "FAIL"
+            color = 'red'
+            detail = "\n".join(f"  - {issue}" for issue in issues)
+        else:
+            status = "PASS"
+            color = 'green'
+            detail = "  All metrics within acceptable range"
+
+        ax4.text(0.5, 0.6, status, fontsize=40, ha='center', va='center',
+                 color=color, fontweight='bold')
+        ax4.text(0.5, 0.3, detail, fontsize=10, ha='center', va='center',
+                 family='monospace')
+
+        plt.tight_layout()
+
+        # Save
+        plot_dir = "results/plots"
+        os.makedirs(plot_dir, exist_ok=True)
+        plot_path = os.path.join(plot_dir, f"segment_{segment_id}_report.png")
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+        print(f"  [Plot] Saved: {plot_path}")
+        return plot_path
+
+    def _check_segment0_gate(self, metrics: Dict[str, Any], train_metrics: Dict[str, Any]) -> bool:
+        """
+        Check if segment 0 results are satisfactory to continue WFO.
+
+        Returns:
+            True if we should continue, False to stop.
+        """
+        print("\n" + "=" * 50)
+        print("SEGMENT 0 GATE - Quality Check")
+        print("=" * 50)
+
+        issues = []
+
+        # Training health checks
+        if train_metrics.get('avg_entropy', 0) < -20:
+            issues.append(f"Entropy too low: {train_metrics['avg_entropy']:.2f}")
+        if train_metrics.get('action_saturation', 0) > 0.98:
+            issues.append(f"Action saturation: {train_metrics['action_saturation']:.3f}")
+        if train_metrics.get('avg_churn_ratio', 0) > 0.3:
+            issues.append(f"Churn ratio: {train_metrics['avg_churn_ratio']:.3f}")
+
+        # Performance checks
+        if metrics['sharpe'] < -1:
+            issues.append(f"Sharpe too negative: {metrics['sharpe']:.2f}")
+        if metrics['pnl_pct'] < -30:
+            issues.append(f"Severe loss: {metrics['pnl_pct']:.2f}%")
+
+        if issues:
+            print("RESULT: BLOCKED")
+            print("\nIssues detected:")
+            for issue in issues:
+                print(f"  - {issue}")
+            print("\nWFO stopped. Fix hyperparameters before continuing.")
+            print("=" * 50)
+            return False
+        else:
+            print("RESULT: PASSED")
+            print("Segment 0 metrics are acceptable. Continuing WFO...")
+            print("=" * 50)
+            return True
 
     def save_results(self, metrics: Dict[str, Any]):
         """Append metrics to results CSV."""
@@ -707,9 +860,16 @@ class WFOPipeline:
         all_metrics = []
         for segment in segments:
             try:
-                metrics = self.run_segment(df_raw, segment)
+                metrics, train_metrics = self.run_segment(df_raw, segment)
                 all_metrics.append(metrics)
                 self.save_results(metrics)
+
+                # GATE: Check segment 0 before continuing
+                if segment['id'] == 0:
+                    if not self._check_segment0_gate(metrics, train_metrics):
+                        print("\n[WFO] Stopped at segment 0 gate.")
+                        break
+
             except Exception as e:
                 print(f"\n[ERROR] Segment {segment['id']} failed: {e}")
                 import traceback
