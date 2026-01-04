@@ -163,13 +163,15 @@ class RegimeDetector:
 
         # Créer le HMM avec init_params sans 'm' (means)
         # On va injecter les means manuellement
+        # min_covar ajoute régularisation diagonale pour éviter covariances singulières
         self.hmm = GMMHMM(
             n_components=self.n_components,
             n_mix=self.n_mix,
             covariance_type='full',
             n_iter=self.n_iter,
             random_state=self.random_state,
-            init_params='stc'  # startprob, transmat, covars (pas means)
+            init_params='stc',  # startprob, transmat, covars (pas means)
+            min_covar=1e-3,  # Régularisation pour éviter matrices singulières
         )
 
         # Initialiser le HMM pour créer les attributs
@@ -257,6 +259,9 @@ class RegimeDetector:
         # 3. Scaler les features
         features_scaled = self.scaler.fit_transform(features_valid)
 
+        # Clip scaled features to [-5, 5] for numerical stability
+        features_scaled = np.clip(features_scaled, -5, 5)
+
         # 4. K-Means warm start
         self._initialize_hmm_with_kmeans(features_scaled)
 
@@ -298,7 +303,12 @@ class RegimeDetector:
         self._compute_state_stats()
 
         # 7. Prédire les probabilités brutes
-        proba = self.hmm.predict_proba(features_scaled)
+        try:
+            proba = self.hmm.predict_proba(features_scaled)
+        except ValueError as e:
+            print(f"  [WARNING] HMM predict_proba failed: {e}")
+            print(f"  [FALLBACK] Using uniform probabilities")
+            proba = np.ones((len(features_scaled), self.n_components)) / self.n_components
 
         # 8. Smart Sorting: calculer mean_return par état et trier
         #    Évite le Label Switching entre réentraînements
@@ -390,8 +400,16 @@ class RegimeDetector:
         # 3. Scaler les features (utilise le scaler déjà fitté)
         features_scaled = self.scaler.transform(features_valid)
 
+        # Clip scaled features to [-5, 5] for numerical stability
+        features_scaled = np.clip(features_scaled, -5, 5)
+
         # 4. Prédire les probabilités brutes
-        proba = self.hmm.predict_proba(features_scaled)
+        try:
+            proba = self.hmm.predict_proba(features_scaled)
+        except ValueError as e:
+            print(f"  [WARNING] HMM predict_proba failed: {e}")
+            print(f"  [FALLBACK] Using uniform probabilities")
+            proba = np.ones((len(features_scaled), self.n_components)) / self.n_components
 
         # 5. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées par Smart Sorting)
         col_names = [f'Prob_{i}' for i in range(self.n_components)]
