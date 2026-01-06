@@ -68,6 +68,7 @@ class WFOConfig:
     batch_size: int = 1024  # Larger batch for gradient smoothing
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
+    churn_coef: float = 5.0  # Strong anti-churn penalty (default 1.0 not enough)
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
@@ -393,6 +394,7 @@ class WFOPipeline:
         config.batch_size = self.config.batch_size
         config.gamma = self.config.gamma
         config.ent_coef = self.config.ent_coef
+        config.churn_coef = self.config.churn_coef
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
