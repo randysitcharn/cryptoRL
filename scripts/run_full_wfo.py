@@ -24,7 +24,7 @@ import pickle
 import argparse
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 import numpy as np
 import pandas as pd
@@ -67,6 +67,7 @@ class WFOConfig:
     learning_rate: float = 6e-5
     batch_size: int = 1024  # Larger batch for gradient smoothing
     gamma: float = 0.95
+    ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
@@ -391,6 +392,7 @@ class WFOPipeline:
         config.learning_rate = self.config.learning_rate
         config.batch_size = self.config.batch_size
         config.gamma = self.config.gamma
+        config.ent_coef = self.config.ent_coef
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
