@@ -1000,8 +1000,8 @@ class WFOPipeline:
                 gc.collect()
 
                 # 4. Check if TQC model exists
-                tqc_path = os.path.join(self.config.models_dir, f"segment_{seg_id}", "tqc.zip")
-                encoder_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "encoder.pt")
+                tqc_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "tqc.zip")
+                encoder_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "encoder.pth")
 
                 if not os.path.exists(tqc_path):
                     print(f"  [ERROR] TQC model not found: {tqc_path}")
