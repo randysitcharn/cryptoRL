@@ -279,8 +279,21 @@ class WFOPipeline:
             segment_id=segment_id
         )
 
-        # Predict on test (no retraining)
-        test_with_hmm = detector.predict(test_df)
+        # Predict on test WITH CONTEXT BUFFER (for HMM lookback requirements)
+        # HMM needs 168h window, use 336h to be safe
+        max_lookback = 336
+        context_rows = min(max_lookback, len(train_df))
+
+        # Include last context_rows from train as buffer for test prediction
+        test_with_context = pd.concat([
+            train_df.tail(context_rows),
+            test_df
+        ], ignore_index=True)
+
+        test_with_hmm_full = detector.predict(test_with_context)
+
+        # Remove buffer rows, keep only actual test rows
+        test_with_hmm = test_with_hmm_full.iloc[context_rows:].reset_index(drop=True)
 
         # Save HMM
         hmm_dir = os.path.join(self.config.models_dir, f"segment_{segment_id}")
