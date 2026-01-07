@@ -485,6 +485,7 @@ class WFOPipeline:
         import torch
         from sb3_contrib import TQC
         from src.training.env import CryptoTradingEnv
+        from src.training.wrappers import RiskManagementWrapper
 
         # Create test environment
         env = CryptoTradingEnv(
@@ -495,6 +496,18 @@ class WFOPipeline:
             random_start=False,
         )
 
+        # Wrap with Risk Management (Circuit Breaker)
+        env = RiskManagementWrapper(
+            env,
+            vol_window=24,
+            vol_threshold=3.0,
+            max_drawdown=0.10,  # 10% drawdown trigger
+            cooldown_steps=12,
+            augment_obs=False,
+        )
+        # Calibrate baseline volatility
+        env.calibrate_baseline(n_steps=min(1000, context_rows or 500))
+
         # Load agent
         model = TQC.load(tqc_path)
 
@@ -504,6 +517,7 @@ class WFOPipeline:
         total_reward = 0
         rewards = []
         navs = []
+        circuit_breaker_count = 0
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
@@ -514,6 +528,8 @@ class WFOPipeline:
             rewards.append(reward)
             if 'nav' in info:
                 navs.append(info['nav'])
+            if info.get('circuit_breaker'):
+                circuit_breaker_count += 1
 
         # Calculate metrics - SKIP context_rows (warmup period)
         all_rewards = np.array(rewards)
@@ -554,6 +570,7 @@ class WFOPipeline:
             'pnl_pct': pnl_pct,
             'max_drawdown': max_drawdown,
             'total_trades': total_trades,
+            'circuit_breakers': circuit_breaker_count,
             'final_nav': navs[-1] if len(navs) > 0 else 10000,
             'test_rows': len(rewards),
             'context_rows': context_rows,
@@ -572,6 +589,7 @@ class WFOPipeline:
         print(f"    PnL: {pnl_pct:+.2f}%")
         print(f"    Max DD: {max_drawdown:.2f}%")
         print(f"    Trades: {total_trades}")
+        print(f"    Circuit Breakers: {circuit_breaker_count}")
 
         # TensorBoard logging for evaluation
         from torch.utils.tensorboard import SummaryWriter
@@ -584,6 +602,7 @@ class WFOPipeline:
         writer.add_scalar("eval/pnl_pct", pnl_pct, segment_id)
         writer.add_scalar("eval/max_drawdown", max_drawdown, segment_id)
         writer.add_scalar("eval/total_trades", total_trades, segment_id)
+        writer.add_scalar("eval/circuit_breakers", circuit_breaker_count, segment_id)
         writer.add_scalar("eval/final_nav", navs[-1] if len(navs) > 0 else 10000, segment_id)
 
         # Log NAV curve as figure
