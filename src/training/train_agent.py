@@ -122,6 +122,10 @@ class DetailTensorboardCallback(BaseCallback):
         self.actor_losses = []
         self.churn_ratios = []
 
+        # Gradient norms pour diagnostic de maximum local
+        self.actor_grad_norms = []
+        self.critic_grad_norms = []
+
     def _on_step(self) -> bool:
         # Track actions for saturation analysis
         if self.locals.get("actions") is not None:
@@ -183,7 +187,35 @@ class DetailTensorboardCallback(BaseCallback):
         except (KeyError, AttributeError):
             pass
 
+        # Log gradient norms pour diagnostic de convergence/maximum local
+        try:
+            if hasattr(self.model, 'actor') and self.model.actor is not None:
+                actor_grad_norm = self._compute_grad_norm(self.model.actor)
+                if actor_grad_norm is not None:
+                    self.logger.record("grad/actor_norm", actor_grad_norm)
+                    self.actor_grad_norms.append(actor_grad_norm)
+
+            if hasattr(self.model, 'critic') and self.model.critic is not None:
+                critic_grad_norm = self._compute_grad_norm(self.model.critic)
+                if critic_grad_norm is not None:
+                    self.logger.record("grad/critic_norm", critic_grad_norm)
+                    self.critic_grad_norms.append(critic_grad_norm)
+        except Exception:
+            pass
+
         return True
+
+    def _compute_grad_norm(self, model) -> float:
+        """Compute the L2 norm of gradients for a model."""
+        total_norm = 0.0
+        n_params = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+                n_params += 1
+        if n_params == 0:
+            return None
+        return total_norm ** 0.5
 
     def get_training_metrics(self) -> dict:
         """Return diagnostic metrics at end of training."""
@@ -193,6 +225,8 @@ class DetailTensorboardCallback(BaseCallback):
             "avg_critic_loss": float(np.mean(self.critic_losses)) if self.critic_losses else 0.0,
             "avg_actor_loss": float(np.mean(self.actor_losses)) if self.actor_losses else 0.0,
             "avg_churn_ratio": float(np.mean(self.churn_ratios)) if self.churn_ratios else 0.0,
+            "avg_actor_grad_norm": float(np.mean(self.actor_grad_norms)) if self.actor_grad_norms else 0.0,
+            "avg_critic_grad_norm": float(np.mean(self.critic_grad_norms)) if self.critic_grad_norms else 0.0,
         }
 
 
@@ -588,6 +622,8 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"  Avg Critic Loss: {training_metrics['avg_critic_loss']:.4f}")
     print(f"  Avg Actor Loss: {training_metrics['avg_actor_loss']:.4f}")
     print(f"  Avg Churn Ratio: {training_metrics['avg_churn_ratio']:.3f}")
+    print(f"  Avg Actor Grad Norm: {training_metrics['avg_actor_grad_norm']:.4f}")
+    print(f"  Avg Critic Grad Norm: {training_metrics['avg_critic_grad_norm']:.4f}")
 
     # ==================== Save Final Model ====================
     print("\n" + "=" * 70)
