@@ -298,7 +298,7 @@ class TrainingConfig:
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
     action_discretization: float = 0.1  # Discretize actions (0.1 = 21 positions)
     churn_coef: float = 1.0  # Doubled: stronger anti-churn penalty
-    smooth_coef: float = 1.0  # Quadratic smoothness penalty coefficient
+    smooth_coef: float = 0.1  # Reduced smoothness penalty
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -307,20 +307,20 @@ class TrainingConfig:
 
     # TQC Hyperparameters (aggressive regularization)
     total_timesteps: int = 150_000  # Reduced to prevent overfitting
-    learning_rate: float = 6e-5  # With floor at 10% (6e-6 minimum)
+    learning_rate: float = 9e-5  # With floor at 10% (9e-6 minimum)
     buffer_size: int = 200_000
     batch_size: int = 1024  # Larger batch for gradient smoothing
     gamma: float = 0.95  # Favor short-term rewards
     tau: float = 0.005  # Slow soft update to prevent catastrophic forgetting
-    ent_coef: Union[str, float] = 0.05  # Fixed high entropy (force exploration)
+    ent_coef: Union[str, float] = "auto"  # Auto entropy tuning (standard SAC/TQC)
     train_freq: int = 1
     gradient_steps: int = 1  # Ultra Safe: 1 update per step
     top_quantiles_to_drop: int = 2
     n_critics: int = 2
     n_quantiles: int = 25
 
-    # Policy Network
-    net_arch: list = [256, 256]
+    # Policy Network (Tiny Architecture to reduce overfitting)
+    net_arch: dict = None  # Will default to dict(pi=[64, 64], qf=[64, 64]) in create_policy_kwargs
     freeze_encoder: bool = True
 
     # gSDE (State-Dependent Exploration)
@@ -381,6 +381,9 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
     Returns:
         Dict of policy keyword arguments.
     """
+    # Default to tiny architecture if not specified
+    net_arch = config.net_arch if config.net_arch else dict(pi=[64, 64], qf=[64, 64])
+
     return dict(
         features_extractor_class=FoundationFeatureExtractor,
         features_extractor_kwargs=dict(
@@ -390,13 +393,13 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
             n_layers=config.n_layers,
             freeze_encoder=config.freeze_encoder,
         ),
-        net_arch=config.net_arch,
+        net_arch=net_arch,
         n_critics=config.n_critics,
         n_quantiles=config.n_quantiles,
         optimizer_class=ClippedAdamW,
         optimizer_kwargs=dict(
             max_grad_norm=0.5,  # Gradient clipping intégré
-            weight_decay=1e-4,
+            weight_decay=1e-5,  # Reduced for tiny arch
             eps=1e-5,
         ),
     )
@@ -451,19 +454,11 @@ def create_environments(config: TrainingConfig):
         random_start=False,  # Sequential for evaluation
     )
 
-    # Wrap with Risk Management (Circuit Breaker)
+    # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
+    # Train env: NO CB (agent learns from mistakes)
+    # Eval env: CB active at configured threshold (monitoring only)
     if config.use_risk_management:
-        train_env = RiskManagementWrapper(
-            train_env,
-            vol_window=config.risk_vol_window,
-            vol_threshold=config.risk_vol_threshold,
-            max_drawdown=config.risk_max_drawdown,
-            cooldown_steps=config.risk_cooldown,
-            augment_obs=config.risk_augment_obs,
-        )
-        # Calibrate baseline volatility on train env
-        train_env.calibrate_baseline(n_steps=2000)
-
+        # Only wrap eval env with circuit breaker
         val_env = RiskManagementWrapper(
             val_env,
             vol_window=config.risk_vol_window,
@@ -472,8 +467,8 @@ def create_environments(config: TrainingConfig):
             cooldown_steps=config.risk_cooldown,
             augment_obs=config.risk_augment_obs,
         )
-        # Share calibration from train env
-        val_env.baseline_vol = train_env.baseline_vol
+        # Calibrate baseline volatility
+        val_env.calibrate_baseline(n_steps=2000)
 
     # Wrap in Monitor for episode tracking
     train_env_monitored = Monitor(train_env)

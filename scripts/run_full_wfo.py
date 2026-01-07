@@ -501,7 +501,7 @@ class WFOPipeline:
             env,
             vol_window=24,
             vol_threshold=3.0,
-            max_drawdown=0.05,  # 5% drawdown trigger
+            max_drawdown=0.10,  # 10% drawdown trigger
             cooldown_steps=12,
             augment_obs=False,
         )
