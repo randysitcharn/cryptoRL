@@ -295,6 +295,10 @@ class WFOPipeline:
         # Remove buffer rows, keep only actual test rows
         test_with_hmm = test_with_hmm_full.iloc[context_rows:].reset_index(drop=True)
 
+        # Safety assertion: ensure we have exactly the same number of rows as original test_df
+        assert len(test_with_hmm) == len(test_df), \
+            f"Context buffer slicing error: got {len(test_with_hmm)} rows, expected {len(test_df)}"
+
         # Save HMM
         hmm_dir = os.path.join(self.config.models_dir, f"segment_{segment_id}")
         os.makedirs(hmm_dir, exist_ok=True)
