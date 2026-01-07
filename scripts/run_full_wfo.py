@@ -20,6 +20,7 @@ Usage:
 import os
 import sys
 import gc
+import json
 import pickle
 import argparse
 from datetime import datetime
@@ -259,12 +260,13 @@ class WFOPipeline:
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         segment_id: int
-    ) -> tuple[pd.DataFrame, pd.DataFrame, RegimeDetector]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, RegimeDetector, int]:
         """
         Train HMM on train data and predict on both.
 
         Returns:
-            (train_with_hmm, test_with_hmm, detector)
+            (train_with_hmm, test_with_hmm, detector, context_rows)
+            context_rows: Number of buffer rows prepended to test for env warmup
         """
         print(f"\n[Segment {segment_id}] Training HMM...")
 
@@ -292,12 +294,14 @@ class WFOPipeline:
 
         test_with_hmm_full = detector.predict(test_with_context)
 
-        # Remove buffer rows, keep only actual test rows
-        test_with_hmm = test_with_hmm_full.iloc[context_rows:].reset_index(drop=True)
+        # KEEP buffer rows for env warmup (window_size=64 needs enough rows)
+        # context_rows will be skipped during metrics calculation
+        test_with_hmm = test_with_hmm_full.reset_index(drop=True)
+        actual_test_rows = len(test_df)
 
-        # Safety assertion: ensure we have exactly the same number of rows as original test_df
-        assert len(test_with_hmm) == len(test_df), \
-            f"Context buffer slicing error: got {len(test_with_hmm)} rows, expected {len(test_df)}"
+        # Safety assertion: ensure we have context + actual test rows
+        assert len(test_with_hmm) == context_rows + actual_test_rows, \
+            f"Context buffer error: got {len(test_with_hmm)} rows, expected {context_rows + actual_test_rows}"
 
         # Save HMM
         hmm_dir = os.path.join(self.config.models_dir, f"segment_{segment_id}")
@@ -310,18 +314,19 @@ class WFOPipeline:
         train_final = train_with_hmm.drop(columns=hmm_features, errors='ignore')
         test_final = test_with_hmm.drop(columns=hmm_features, errors='ignore')
 
-        print(f"  Train final: {train_final.shape}, Test final: {test_final.shape}")
+        print(f"  Train final: {train_final.shape}, Test final: {test_final.shape} (context_rows={context_rows})")
 
-        return train_final, test_final, detector
+        return train_final, test_final, detector, context_rows
 
     def save_segment_data(
         self,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         scaler: RobustScaler,
-        segment_id: int
+        segment_id: int,
+        context_rows: int = 0
     ):
-        """Save preprocessed data and scaler for a segment."""
+        """Save preprocessed data, scaler, and metadata for a segment."""
 
         # Data directory
         data_dir = os.path.join(self.config.output_dir, f"segment_{segment_id}")
@@ -333,6 +338,16 @@ class WFOPipeline:
         train_df.to_parquet(train_path, index=False)
         test_df.to_parquet(test_path, index=False)
 
+        # Save metadata (for eval-only mode)
+        metadata = {
+            'context_rows': context_rows,
+            'total_test_rows': len(test_df),
+            'actual_test_rows': len(test_df) - context_rows
+        }
+        metadata_path = os.path.join(data_dir, "metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
         # Save scaler
         models_dir = os.path.join(self.config.models_dir, f"segment_{segment_id}")
         os.makedirs(models_dir, exist_ok=True)
@@ -340,7 +355,7 @@ class WFOPipeline:
         with open(scaler_path, 'wb') as f:
             pickle.dump({'scaler': scaler, 'columns': list(train_df.columns)}, f)
 
-        print(f"  Saved: {train_path}, {test_path}, {scaler_path}")
+        print(f"  Saved: {train_path}, {test_path}, {metadata_path}")
 
         return train_path, test_path
 
@@ -448,6 +463,7 @@ class WFOPipeline:
         encoder_path: str,
         tqc_path: str,
         segment_id: int,
+        context_rows: int = 0,
         train_metrics: Optional[Dict[str, Any]] = None
     ) -> tuple[Dict[str, Any], np.ndarray]:
         """
@@ -458,12 +474,13 @@ class WFOPipeline:
             encoder_path: Path to encoder weights.
             tqc_path: Path to TQC agent.
             segment_id: Segment identifier.
+            context_rows: Number of warmup rows to skip in metrics (env warmup period).
             train_metrics: Optional training metrics from train_tqc.
 
         Returns:
             Tuple of (metrics dict, navs array for plotting).
         """
-        print(f"\n[Segment {segment_id}] Evaluating...")
+        print(f"\n[Segment {segment_id}] Evaluating (skipping {context_rows} warmup rows)...")
 
         import torch
         from sb3_contrib import TQC
@@ -498,9 +515,15 @@ class WFOPipeline:
             if 'nav' in info:
                 navs.append(info['nav'])
 
-        # Calculate metrics
-        rewards = np.array(rewards)
-        navs = np.array(navs) if navs else np.array([10000])
+        # Calculate metrics - SKIP context_rows (warmup period)
+        all_rewards = np.array(rewards)
+        all_navs = np.array(navs) if navs else np.array([10000])
+
+        # Skip warmup rows for metrics calculation
+        rewards = all_rewards[context_rows:] if len(all_rewards) > context_rows else all_rewards
+        navs = all_navs[context_rows:] if len(all_navs) > context_rows else all_navs
+
+        print(f"  Total steps: {len(all_rewards)}, Metrics computed on: {len(rewards)} steps")
 
         # Sharpe ratio (annualized)
         if len(rewards) > 1 and rewards.std() > 0:
@@ -508,11 +531,11 @@ class WFOPipeline:
         else:
             sharpe = 0.0
 
-        # PnL
+        # PnL - compute from actual test period (after warmup)
         pnl = navs[-1] - navs[0] if len(navs) > 1 else 0
         pnl_pct = (pnl / navs[0]) * 100 if navs[0] > 0 else 0
 
-        # Max Drawdown
+        # Max Drawdown - on actual test period only
         if len(navs) > 1:
             peak = np.maximum.accumulate(navs)
             drawdown = (peak - navs) / peak
@@ -520,12 +543,12 @@ class WFOPipeline:
         else:
             max_drawdown = 0.0
 
-        # Number of trades
+        # Number of trades (total from env, not split by warmup)
         total_trades = info.get('total_trades', 0)
 
         metrics = {
             'segment_id': segment_id,
-            'total_reward': total_reward,
+            'total_reward': float(rewards.sum()),  # Sum of actual test period
             'sharpe': sharpe,
             'pnl': pnl,
             'pnl_pct': pnl_pct,
@@ -533,6 +556,7 @@ class WFOPipeline:
             'total_trades': total_trades,
             'final_nav': navs[-1] if len(navs) > 0 else 10000,
             'test_rows': len(rewards),
+            'context_rows': context_rows,
         }
 
         # Merge training diagnostics if provided
@@ -606,11 +630,13 @@ class WFOPipeline:
         # 1. Preprocessing (Feature Engineering + Leak-Free Scaling)
         train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
 
-        # 2. HMM Training
-        train_df, test_df, hmm = self.train_hmm(train_df, test_df, segment_id)
+        # 2. HMM Training (returns context_rows for env warmup)
+        train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, segment_id)
 
-        # 3. Save preprocessed data
-        train_path, test_path = self.save_segment_data(train_df, test_df, scaler, segment_id)
+        # 3. Save preprocessed data (with context buffer metadata)
+        train_path, test_path = self.save_segment_data(
+            train_df, test_df, scaler, segment_id, context_rows
+        )
 
         # Cleanup dataframes
         del train_df, test_df, hmm
@@ -622,9 +648,10 @@ class WFOPipeline:
         # 5. TQC Training
         tqc_path, train_metrics = self.train_tqc(train_path, encoder_path, segment_id)
 
-        # 6. Evaluation (with training diagnostics)
+        # 6. Evaluation (skip context_rows in metrics)
         metrics, navs = self.evaluate_segment(
             test_path, encoder_path, tqc_path, segment_id,
+            context_rows=context_rows,
             train_metrics=train_metrics
         )
 
@@ -918,6 +945,110 @@ class WFOPipeline:
 
         print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+    def run_eval_only(
+        self,
+        segment_ids: List[int]
+    ):
+        """
+        Re-evaluate segments using existing TQC models.
+        Regenerates test data with context buffer and runs evaluation.
+
+        Args:
+            segment_ids: List of segment IDs to re-evaluate.
+        """
+        print("\n" + "=" * 70)
+        print("WALK-FORWARD OPTIMIZATION - Eval-Only Mode")
+        print("=" * 70)
+        print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Segments to evaluate: {segment_ids}")
+
+        # Load raw data
+        print(f"\nLoading raw data: {self.config.raw_data_path}")
+        df_raw = pd.read_parquet(self.config.raw_data_path)
+        print(f"  Shape: {df_raw.shape}")
+
+        # Calculate all segments to get their boundaries
+        all_segments = self.calculate_segments(len(df_raw))
+        segments_by_id = {s['id']: s for s in all_segments}
+
+        all_metrics = []
+        for seg_id in segment_ids:
+            if seg_id not in segments_by_id:
+                print(f"\n[WARNING] Segment {seg_id} not found, skipping...")
+                continue
+
+            segment = segments_by_id[seg_id]
+            print("\n" + "=" * 70)
+            print(f"SEGMENT {seg_id} - Eval Only")
+            print(f"Test: rows {segment['test_start']} - {segment['test_end']}")
+            print("=" * 70)
+
+            try:
+                # 1. Preprocessing
+                train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+
+                # 2. HMM (with context buffer)
+                train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, seg_id)
+
+                # 3. Save data (with metadata)
+                train_path, test_path = self.save_segment_data(
+                    train_df, test_df, scaler, seg_id, context_rows
+                )
+
+                # Cleanup
+                del train_df, test_df, hmm
+                gc.collect()
+
+                # 4. Check if TQC model exists
+                tqc_path = os.path.join(self.config.models_dir, f"segment_{seg_id}", "tqc.zip")
+                encoder_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "encoder.pt")
+
+                if not os.path.exists(tqc_path):
+                    print(f"  [ERROR] TQC model not found: {tqc_path}")
+                    continue
+                if not os.path.exists(encoder_path):
+                    print(f"  [ERROR] Encoder not found: {encoder_path}")
+                    continue
+
+                print(f"  Using existing models: {tqc_path}")
+
+                # 5. Evaluate
+                metrics, navs = self.evaluate_segment(
+                    test_path, encoder_path, tqc_path, seg_id,
+                    context_rows=context_rows,
+                    train_metrics={}  # No training metrics in eval-only mode
+                )
+
+                all_metrics.append(metrics)
+                self.save_results(metrics)
+
+                # Generate plots (with minimal train_metrics)
+                self.generate_segment_plots(seg_id, navs, metrics, {
+                    'action_saturation': 0, 'avg_entropy': 0,
+                    'avg_critic_loss': 0, 'avg_churn_ratio': 0
+                })
+
+            except Exception as e:
+                print(f"\n[ERROR] Segment {seg_id} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+            gc.collect()
+
+        # Summary
+        print("\n" + "=" * 70)
+        print("EVAL-ONLY COMPLETE")
+        print("=" * 70)
+
+        if all_metrics:
+            df_results = pd.DataFrame(all_metrics)
+            print(f"\nSegments evaluated: {len(all_metrics)}")
+            print(f"Average Sharpe: {df_results['sharpe'].mean():.2f}")
+            print(f"Average PnL: {df_results['pnl_pct'].mean():+.2f}%")
+
+        print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
 
 # =============================================================================
 # Entry Point
@@ -941,6 +1072,10 @@ def main():
                         help="Test window in months")
     parser.add_argument("--step-months", type=int, default=1,
                         help="Rolling step in months")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Re-run evaluation only (skip MAE/TQC training)")
+    parser.add_argument("--eval-segments", type=str, default=None,
+                        help="Comma-separated segment IDs to evaluate (e.g., '0,1,2')")
 
     args = parser.parse_args()
 
@@ -956,9 +1091,16 @@ def main():
     # Create pipeline
     pipeline = WFOPipeline(config)
 
-    # Run
-    segment_ids = [args.segment] if args.segment is not None else None
-    pipeline.run(segment_ids=segment_ids, max_segments=args.segments)
+    # Run (normal or eval-only mode)
+    if args.eval_only:
+        if args.eval_segments is None:
+            print("[ERROR] --eval-only requires --eval-segments (e.g., --eval-segments 0,1,2)")
+            sys.exit(1)
+        segment_ids = [int(x.strip()) for x in args.eval_segments.split(',')]
+        pipeline.run_eval_only(segment_ids)
+    else:
+        segment_ids = [args.segment] if args.segment is not None else None
+        pipeline.run(segment_ids=segment_ids, max_segments=args.segments)
 
 
 if __name__ == "__main__":
