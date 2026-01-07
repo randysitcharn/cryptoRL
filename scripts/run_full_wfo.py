@@ -70,7 +70,7 @@ class WFOConfig:
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
-    smooth_coef: float = 1.0  # Quadratic smoothness penalty coefficient
+    smooth_coef: float = 0.1  # Reduced smoothness penalty
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
