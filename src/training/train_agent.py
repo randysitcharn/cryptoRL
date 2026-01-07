@@ -238,6 +238,7 @@ import glob
 from src.config import DEVICE, SEED
 from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.env import CryptoTradingEnv
+from src.training.wrappers import RiskManagementWrapper
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
@@ -341,6 +342,14 @@ class TrainingConfig:
     use_curriculum: bool = True  # Enable curriculum learning for fees/smoothness
     curriculum_warmup_steps: int = 50_000  # Steps to reach target values
 
+    # Risk Management (Circuit Breaker)
+    use_risk_management: bool = True
+    risk_vol_window: int = 24  # Rolling window for volatility (hours)
+    risk_vol_threshold: float = 3.0  # Trigger if vol > 3x baseline
+    risk_max_drawdown: float = 0.10  # Trigger if DD > 10%
+    risk_cooldown: int = 12  # Force HOLD for 12 steps after trigger
+    risk_augment_obs: bool = False  # Don't change obs space by default
+
 
 def linear_schedule(initial_value: float, floor_ratio: float = 0.1) -> Callable[[float], float]:
     """
@@ -441,6 +450,30 @@ def create_environments(config: TrainingConfig):
         smooth_coef=config.smooth_coef,
         random_start=False,  # Sequential for evaluation
     )
+
+    # Wrap with Risk Management (Circuit Breaker)
+    if config.use_risk_management:
+        train_env = RiskManagementWrapper(
+            train_env,
+            vol_window=config.risk_vol_window,
+            vol_threshold=config.risk_vol_threshold,
+            max_drawdown=config.risk_max_drawdown,
+            cooldown_steps=config.risk_cooldown,
+            augment_obs=config.risk_augment_obs,
+        )
+        # Calibrate baseline volatility on train env
+        train_env.calibrate_baseline(n_steps=2000)
+
+        val_env = RiskManagementWrapper(
+            val_env,
+            vol_window=config.risk_vol_window,
+            vol_threshold=config.risk_vol_threshold,
+            max_drawdown=config.risk_max_drawdown,
+            cooldown_steps=config.risk_cooldown,
+            augment_obs=config.risk_augment_obs,
+        )
+        # Share calibration from train env
+        val_env.baseline_vol = train_env.baseline_vol
 
     # Wrap in Monitor for episode tracking
     train_env_monitored = Monitor(train_env)
