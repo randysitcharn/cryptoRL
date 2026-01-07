@@ -55,13 +55,13 @@ class WFOConfig:
 
     # WFO Parameters
     train_months: int = 12
-    test_months: int = 3
-    step_months: int = 3  # Rolling step
+    test_months: int = 1
+    step_months: int = 1  # Rolling step
     hours_per_month: int = 720  # 30 days * 24 hours
 
     # Training Parameters
-    mae_epochs: int = 70
-    tqc_timesteps: int = 150_000  # Reduced to prevent overfitting
+    mae_epochs: int = 90
+    tqc_timesteps: int = 350_000
 
     # TQC Hyperparameters (aggressive regularization)
     learning_rate: float = 6e-5
@@ -69,6 +69,7 @@ class WFOConfig:
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 20.0  # Very strong anti-churn penalty
+    smooth_coef: float = 1.0  # Quadratic smoothness penalty coefficient
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
@@ -396,6 +397,7 @@ class WFOPipeline:
         config.gamma = self.config.gamma
         config.ent_coef = self.config.ent_coef
         config.churn_coef = self.config.churn_coef
+        config.smooth_coef = self.config.smooth_coef
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
