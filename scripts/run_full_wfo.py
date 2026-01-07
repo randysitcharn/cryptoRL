@@ -274,7 +274,8 @@ class WFOPipeline:
         train_with_hmm = detector.fit_predict(
             train_df,
             tensorboard_log="logs/wfo/hmm/",
-            run_name=f"segment_{segment_id}"
+            run_name=f"segment_{segment_id}",
+            segment_id=segment_id
         )
 
         # Predict on test (no retraining)

@@ -211,7 +211,8 @@ class RegimeDetector:
         self,
         df: pd.DataFrame,
         tensorboard_log: Optional[str] = None,
-        run_name: Optional[str] = None
+        run_name: Optional[str] = None,
+        segment_id: int = 0
     ) -> pd.DataFrame:
         """
         Entraîne le HMM et prédit les probabilités de régime.
@@ -227,6 +228,7 @@ class RegimeDetector:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Fracdiff.
             tensorboard_log: Chemin pour logs TensorBoard (optional).
             run_name: Nom du run TensorBoard (optional).
+            segment_id: ID du segment WFO pour TensorBoard step (default 0).
 
         Returns:
             DataFrame avec colonnes HMM et Prob_* ajoutées.
@@ -288,16 +290,16 @@ class RegimeDetector:
                     delta = history[i] - history[i-1]
                     writer.add_scalar("hmm/log_likelihood_delta", delta, i)
 
-            # 3. Métriques finales groupées
-            writer.add_scalar("hmm/final/converged", float(self.hmm.monitor_.converged), 0)
-            writer.add_scalar("hmm/final/n_iterations", len(history), 0)
-            writer.add_scalar("hmm/final/kmeans_inertia", self.kmeans.inertia_, 0)
-            writer.add_scalar("hmm/final/log_likelihood", history[-1] if history else 0, 0)
+            # 3. Métriques finales groupées (use segment_id for WFO curves)
+            writer.add_scalar("hmm/final/converged", float(self.hmm.monitor_.converged), segment_id)
+            writer.add_scalar("hmm/final/n_iterations", len(history), segment_id)
+            writer.add_scalar("hmm/final/kmeans_inertia", self.kmeans.inertia_, segment_id)
+            writer.add_scalar("hmm/final/log_likelihood", history[-1] if history else 0, segment_id)
 
             # 4. Transition matrix entropy (régularité des transitions)
             transmat = self.hmm.transmat_
             entropy = -np.sum(transmat * np.log(transmat + 1e-10)) / self.n_components
-            writer.add_scalar("hmm/final/transmat_entropy", entropy, 0)
+            writer.add_scalar("hmm/final/transmat_entropy", entropy, segment_id)
 
         # 6. Compute stats for debug
         self._compute_state_stats()
@@ -359,8 +361,8 @@ class RegimeDetector:
             for i, (state, mean_ret) in enumerate(state_returns):
                 annual_ret = mean_ret * 24 * 365 * 100
                 state_pct = (dominant == self.sorted_indices[i]).sum() / len(dominant) * 100
-                writer.add_scalar(f"hmm/state_{i}/annual_return_pct", annual_ret, 0)
-                writer.add_scalar(f"hmm/state_{i}/distribution_pct", state_pct, 0)
+                writer.add_scalar(f"hmm/state_{i}/annual_return_pct", annual_ret, segment_id)
+                writer.add_scalar(f"hmm/state_{i}/distribution_pct", state_pct, segment_id)
 
             writer.close()
 

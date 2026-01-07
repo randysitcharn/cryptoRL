@@ -135,22 +135,22 @@ class DetailTensorboardCallback(BaseCallback):
         if self.locals.get("infos"):
             info = self.locals["infos"][0]
 
-            # Log reward components (every step)
+            # Log reward components (every step) - use record_mean for smooth curves
             if "rewards/log_return" in info:
-                self.logger.record("rewards/log_return", info["rewards/log_return"])
+                self.logger.record_mean("rewards/log_return", info["rewards/log_return"])
                 self.episode_log_returns.append(info["rewards/log_return"])
             if "rewards/penalty_vol" in info:
-                self.logger.record("rewards/penalty_vol", info["rewards/penalty_vol"])
+                self.logger.record_mean("rewards/penalty_vol", info["rewards/penalty_vol"])
             if "rewards/churn_penalty" in info:
-                self.logger.record("rewards/churn_penalty", info["rewards/churn_penalty"])
+                self.logger.record_mean("rewards/churn_penalty", info["rewards/churn_penalty"])
                 self.episode_churn_penalties.append(info["rewards/churn_penalty"])
             if "rewards/position_delta" in info:
-                self.logger.record("rewards/position_delta", info["rewards/position_delta"])
+                self.logger.record_mean("rewards/position_delta", info["rewards/position_delta"])
                 self.episode_position_deltas.append(info["rewards/position_delta"])
             if "rewards/total_raw" in info:
-                self.logger.record("rewards/total_raw", info["rewards/total_raw"])
+                self.logger.record_mean("rewards/total_raw", info["rewards/total_raw"])
             if "rewards/scaled" in info:
-                self.logger.record("rewards/scaled", info["rewards/scaled"])
+                self.logger.record_mean("rewards/scaled", info["rewards/scaled"])
 
             # À la fin d'un épisode, log les stats agrégées
             if "episode" in info:
@@ -191,14 +191,14 @@ class DetailTensorboardCallback(BaseCallback):
         try:
             if hasattr(self.model, 'actor') and self.model.actor is not None:
                 actor_grad_norm = self._compute_grad_norm(self.model.actor)
-                if actor_grad_norm is not None:
-                    self.logger.record("grad/actor_norm", actor_grad_norm)
+                if actor_grad_norm is not None and actor_grad_norm > 0:
+                    self.logger.record_mean("grad/actor_norm", actor_grad_norm)
                     self.actor_grad_norms.append(actor_grad_norm)
 
             if hasattr(self.model, 'critic') and self.model.critic is not None:
                 critic_grad_norm = self._compute_grad_norm(self.model.critic)
-                if critic_grad_norm is not None:
-                    self.logger.record("grad/critic_norm", critic_grad_norm)
+                if critic_grad_norm is not None and critic_grad_norm > 0:
+                    self.logger.record_mean("grad/critic_norm", critic_grad_norm)
                     self.critic_grad_norms.append(critic_grad_norm)
         except Exception:
             pass
