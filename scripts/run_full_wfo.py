@@ -65,7 +65,7 @@ class WFOConfig:
 
     # TQC Hyperparameters (aggressive regularization)
     learning_rate: float = 6e-5
-    batch_size: int = 1024  # Larger batch for gradient smoothing
+    batch_size: int = 512  # Balanced batch size
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
