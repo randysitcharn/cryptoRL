@@ -272,6 +272,11 @@ class RegimeDetector:
             warnings.simplefilter("ignore")
             self.hmm.fit(features_scaled)
 
+        # Fix NaN in startprob_ (can happen with numerical instability)
+        if np.any(np.isnan(self.hmm.startprob_)):
+            print("  [FIX] Replacing NaN in startprob_ with uniform distribution")
+            self.hmm.startprob_ = np.ones(self.n_components) / self.n_components
+
         self._is_fitted = True
         print(f"  HMM converged: {self.hmm.monitor_.converged}")
 
