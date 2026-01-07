@@ -914,15 +914,15 @@ def main():
                         help="Max number of segments to run")
     parser.add_argument("--segment", type=int, default=None,
                         help="Run specific segment only")
-    parser.add_argument("--timesteps", type=int, default=300_000,
+    parser.add_argument("--timesteps", type=int, default=350_000,
                         help="TQC training timesteps per segment")
-    parser.add_argument("--mae-epochs", type=int, default=70,
+    parser.add_argument("--mae-epochs", type=int, default=90,
                         help="MAE training epochs per segment")
     parser.add_argument("--train-months", type=int, default=12,
                         help="Training window in months")
-    parser.add_argument("--test-months", type=int, default=3,
+    parser.add_argument("--test-months", type=int, default=1,
                         help="Test window in months")
-    parser.add_argument("--step-months", type=int, default=3,
+    parser.add_argument("--step-months", type=int, default=1,
                         help="Rolling step in months")
 
     args = parser.parse_args()
