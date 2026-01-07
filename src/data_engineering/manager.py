@@ -163,15 +163,15 @@ class RegimeDetector:
 
         # Créer le HMM avec init_params sans 'm' (means)
         # On va injecter les means manuellement
-        # min_covar ajoute régularisation diagonale pour éviter covariances singulières
+        # covariance_type='diag' est plus stable numériquement que 'full'
         self.hmm = GMMHMM(
             n_components=self.n_components,
             n_mix=self.n_mix,
-            covariance_type='full',
+            covariance_type='diag',  # Diagonal = stable, avoids non-symmetric issues
             n_iter=self.n_iter,
             random_state=self.random_state,
             init_params='stc',  # startprob, transmat, covars (pas means)
-            min_covar=1e-3,  # Régularisation pour éviter matrices singulières
+            min_covar=1e-3,  # Régularisation supplémentaire
         )
 
         # Initialiser le HMM pour créer les attributs
