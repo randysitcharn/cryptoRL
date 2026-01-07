@@ -144,6 +144,8 @@ class DetailTensorboardCallback(BaseCallback):
             if "rewards/churn_penalty" in info:
                 self.logger.record_mean("rewards/churn_penalty", info["rewards/churn_penalty"])
                 self.episode_churn_penalties.append(info["rewards/churn_penalty"])
+            if "rewards/smoothness_penalty" in info:
+                self.logger.record_mean("rewards/smoothness_penalty", info["rewards/smoothness_penalty"])
             if "rewards/position_delta" in info:
                 self.logger.record_mean("rewards/position_delta", info["rewards/position_delta"])
                 self.episode_position_deltas.append(info["rewards/position_delta"])
@@ -295,6 +297,7 @@ class TrainingConfig:
     upside_coef: float = 0.0  # Symmetric upside bonus coefficient
     action_discretization: float = 0.1  # Discretize actions (0.1 = 21 positions)
     churn_coef: float = 1.0  # Doubled: stronger anti-churn penalty
+    smooth_coef: float = 1.0  # Quadratic smoothness penalty coefficient
 
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
@@ -333,6 +336,10 @@ class TrainingConfig:
     load_model_path: str = None  # Path to .zip model to resume from
     load_latest: bool = False  # Auto-select latest checkpoint from checkpoint_dir
     resume_learning_starts: int = 10_000  # Warmup steps to refill buffer before training
+
+    # Curriculum Learning
+    use_curriculum: bool = True  # Enable curriculum learning for fees/smoothness
+    curriculum_warmup_steps: int = 50_000  # Steps to reach target values
 
 
 def linear_schedule(initial_value: float, floor_ratio: float = 0.1) -> Callable[[float], float]:
@@ -396,21 +403,31 @@ def create_environments(config: TrainingConfig):
     Returns:
         Tuple of (train_vec_env, eval_vec_env).
     """
+    # Curriculum Learning: start with 0 fees/smoothness if enabled
+    if config.use_curriculum:
+        initial_commission = 0.0
+        initial_smooth = 0.0
+    else:
+        initial_commission = config.commission
+        initial_smooth = config.smooth_coef
+
     # Create training environment (full training dataset)
     train_env = CryptoTradingEnv(
         parquet_path=config.data_path,
         window_size=config.window_size,
-        commission=config.commission,
+        commission=initial_commission,
         episode_length=config.episode_length,
         reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
         churn_coef=config.churn_coef,
+        smooth_coef=initial_smooth,
         random_start=True,
     )
 
     # Create eval environment (separate eval dataset, 1 month)
+    # Note: Eval env uses target values (no curriculum) for consistent evaluation
     val_env = CryptoTradingEnv(
         parquet_path=config.eval_data_path,
         window_size=config.window_size,
@@ -421,6 +438,7 @@ def create_environments(config: TrainingConfig):
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
         churn_coef=config.churn_coef,
+        smooth_coef=config.smooth_coef,
         random_start=False,  # Sequential for evaluation
     )
 
@@ -478,6 +496,17 @@ def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTens
     # Detail Tensorboard callback for reward components
     detail_callback = DetailTensorboardCallback(verbose=0)
     callbacks.append(detail_callback)
+
+    # Curriculum Learning callback
+    if config.use_curriculum:
+        from src.training.curriculum_callback import CurriculumFeesCallback
+        curriculum_callback = CurriculumFeesCallback(
+            target_fee_rate=config.commission,
+            target_smooth_coef=config.smooth_coef,
+            warmup_steps=config.curriculum_warmup_steps,
+            verbose=1
+        )
+        callbacks.append(curriculum_callback)
 
     return callbacks, detail_callback
 
@@ -659,6 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--upside-coef", type=float, default=None, help="Symmetric upside bonus coefficient")
     parser.add_argument("--action-disc", type=float, default=None, help="Action discretization (0.1 = 21 positions, 0 = disabled)")
     parser.add_argument("--churn-coef", type=float, default=None, help="Churn penalty coefficient (0.1 = 10x amplified trading cost)")
+    parser.add_argument("--smooth-coef", type=float, default=None, help="Smoothness penalty coefficient (quadratic penalty on position changes)")
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
@@ -687,6 +717,8 @@ if __name__ == "__main__":
         config.action_discretization = args.action_disc
     if args.churn_coef is not None:
         config.churn_coef = args.churn_coef
+    if args.smooth_coef is not None:
+        config.smooth_coef = args.smooth_coef
     if args.ent_coef is not None:
         config.ent_coef = args.ent_coef
     if args.name is not None:

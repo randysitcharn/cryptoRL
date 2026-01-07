@@ -70,6 +70,7 @@ class CryptoTradingEnv(gym.Env):
         upside_coef: float = 0.0,  # Symmetric upside bonus coefficient
         action_discretization: float = 0.1,  # Discretize actions (0.1 = 21 positions)
         churn_coef: float = 0.0,  # Cognitive tax: amplify trading cost perception (0.1 = 10x)
+        smooth_coef: float = 0.0,  # Smoothness penalty: quadratic penalty on position changes
     ):
         """
         Initialize the trading environment.
@@ -98,6 +99,7 @@ class CryptoTradingEnv(gym.Env):
         self.upside_coef = upside_coef
         self.action_discretization = action_discretization
         self.churn_coef = churn_coef
+        self.smooth_coef = smooth_coef
 
         # Load data
         df = pd.read_parquet(parquet_path)
@@ -242,7 +244,7 @@ class CryptoTradingEnv(gym.Env):
         if step_return > 0:
             upside_bonus = (step_return ** 2) * self.upside_coef
 
-        # 5. Pénalité de churn (Taxe Cognitive)
+        # 5. Pénalité de churn (Taxe Cognitive) - LINÉAIRE
         churn_penalty = 0.0
         position_delta = 0.0
         if hasattr(self, '_prev_position_pct'):
@@ -252,8 +254,13 @@ class CryptoTradingEnv(gym.Env):
                 cost_rate = self.commission + self.slippage  # 0.07%
                 churn_penalty = -position_delta * cost_rate * self.churn_coef
 
-        # 6. Total + Tanh scaling
-        total_reward = reward_log_return + downside_penalty + upside_bonus + churn_penalty
+        # 6. Smoothness penalty - QUADRATIQUE (pénalise les changements brusques)
+        smoothness_penalty = 0.0
+        if hasattr(self, '_prev_position_pct') and self.smooth_coef > 0:
+            smoothness_penalty = -self.smooth_coef * (position_delta ** 2)
+
+        # 7. Total + Tanh scaling
+        total_reward = reward_log_return + downside_penalty + upside_bonus + churn_penalty + smoothness_penalty
 
         # Compute final scaled reward
         scaled_reward = float(np.tanh(total_reward * self.reward_scaling))
@@ -264,6 +271,7 @@ class CryptoTradingEnv(gym.Env):
             "rewards/penalty_vol": float(downside_penalty),
             "rewards/bonus_upside": float(upside_bonus),
             "rewards/churn_penalty": float(churn_penalty),
+            "rewards/smoothness_penalty": float(smoothness_penalty),
             "rewards/position_delta": float(position_delta),
             "rewards/total_raw": float(total_reward),
             "rewards/scaled": scaled_reward,
@@ -420,6 +428,30 @@ class CryptoTradingEnv(gym.Env):
             f"Position: {info['position_pct']:+.2f} | "
             f"Trades: {info['total_trades']}"
         )
+
+    def update_penalties(
+        self,
+        fee_rate: Optional[float] = None,
+        smooth_coef: Optional[float] = None,
+        churn_coef: Optional[float] = None,
+    ) -> None:
+        """
+        Update penalty coefficients for curriculum learning.
+
+        Allows dynamic adjustment of penalty parameters during training
+        to implement curriculum strategies (e.g., start easy, increase penalties).
+
+        Args:
+            fee_rate: New transaction fee rate (commission).
+            smooth_coef: New smoothness penalty coefficient.
+            churn_coef: New churn penalty coefficient.
+        """
+        if fee_rate is not None:
+            self.commission = fee_rate
+        if smooth_coef is not None:
+            self.smooth_coef = smooth_coef
+        if churn_coef is not None:
+            self.churn_coef = churn_coef
 
     @classmethod
     def create_train_val_envs(
