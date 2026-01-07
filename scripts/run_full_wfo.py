@@ -68,7 +68,7 @@ class WFOConfig:
     batch_size: int = 1024  # Larger batch for gradient smoothing
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
-    churn_coef: float = 5.0  # Strong anti-churn penalty (default 1.0 not enough)
+    churn_coef: float = 20.0  # Very strong anti-churn penalty
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
