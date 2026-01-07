@@ -65,7 +65,7 @@ class WFOConfig:
     tqc_timesteps: int = 350_000
 
     # TQC Hyperparameters (aggressive regularization)
-    learning_rate: float = 6e-5
+    learning_rate: float = 3e-4
     batch_size: int = 512  # Balanced batch size
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
