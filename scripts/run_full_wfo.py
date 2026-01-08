@@ -73,7 +73,7 @@ class WFOConfig:
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
-    smooth_coef: float = 0.1  # Reduced smoothness penalty
+    smooth_coef: float = 0.07  # Smoothness penalty
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol
