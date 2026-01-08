@@ -982,11 +982,11 @@ class WFOPipeline:
                 all_metrics.append(metrics)
                 self.save_results(metrics)
 
-                # GATE: Check segment 0 before continuing
-                if segment['id'] == 0:
-                    if not self._check_segment0_gate(metrics, train_metrics):
-                        print("\n[WFO] Stopped at segment 0 gate.")
-                        break
+                # GATE: Disabled - let WFO run all segments regardless of segment 0 performance
+                # if segment['id'] == 0:
+                #     if not self._check_segment0_gate(metrics, train_metrics):
+                #         print("\n[WFO] Stopped at segment 0 gate.")
+                #         break
 
             except Exception as e:
                 print(f"\n[ERROR] Segment {segment['id']} failed: {e}")
