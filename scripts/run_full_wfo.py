@@ -916,28 +916,33 @@ class WFOPipeline:
 
     def _setup_logging(self):
         """Clear old logs and ensure TensorBoard is running on port 8081."""
-        # 1. Clear logs directory
+        import time
+
+        def is_port_in_use(port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                return s.connect_ex(('localhost', port)) == 0
+
+        # 1. Kill existing TensorBoard on 8081 BEFORE clearing logs (avoids race condition)
+        if is_port_in_use(8081):
+            print("  Killing existing TensorBoard on port 8081...")
+            subprocess.run(["pkill", "-f", "tensorboard.*8081"], capture_output=True)
+            time.sleep(1)  # Wait for process to terminate
+
+        # 2. Clear logs directory
         logs_dir = "logs/wfo"
         if os.path.exists(logs_dir):
             shutil.rmtree(logs_dir)
             print(f"  Cleared old logs: {logs_dir}")
         os.makedirs(logs_dir, exist_ok=True)
 
-        # 2. Check if TensorBoard is running on 8081
-        def is_port_in_use(port):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                return s.connect_ex(('localhost', port)) == 0
-
-        if not is_port_in_use(8081):
-            print("  Starting TensorBoard on port 8081...")
-            subprocess.Popen(
-                ["tensorboard", "--logdir", "logs/wfo", "--port", "8081", "--bind_all"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print("  TensorBoard started: http://localhost:8081")
-        else:
-            print("  TensorBoard already running on port 8081")
+        # 3. Start fresh TensorBoard
+        print("  Starting TensorBoard on port 8081...")
+        subprocess.Popen(
+            ["tensorboard", "--logdir", "logs/wfo", "--port", "8081", "--bind_all"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("  TensorBoard started: http://localhost:8081")
 
     def run(
         self,
