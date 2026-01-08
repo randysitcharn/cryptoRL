@@ -22,6 +22,9 @@ import sys
 import gc
 import json
 import pickle
+import shutil
+import socket
+import subprocess
 import argparse
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -911,6 +914,31 @@ class WFOPipeline:
         df.to_csv(self.config.results_path, index=False)
         print(f"\nResults saved to: {self.config.results_path}")
 
+    def _setup_logging(self):
+        """Clear old logs and ensure TensorBoard is running on port 8081."""
+        # 1. Clear logs directory
+        logs_dir = "logs/wfo"
+        if os.path.exists(logs_dir):
+            shutil.rmtree(logs_dir)
+            print(f"  Cleared old logs: {logs_dir}")
+        os.makedirs(logs_dir, exist_ok=True)
+
+        # 2. Check if TensorBoard is running on 8081
+        def is_port_in_use(port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                return s.connect_ex(('localhost', port)) == 0
+
+        if not is_port_in_use(8081):
+            print("  Starting TensorBoard on port 8081...")
+            subprocess.Popen(
+                ["tensorboard", "--logdir", "logs/wfo", "--port", "8081", "--bind_all"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print("  TensorBoard started: http://localhost:8081")
+        else:
+            print("  TensorBoard already running on port 8081")
+
     def run(
         self,
         segment_ids: Optional[List[int]] = None,
@@ -926,7 +954,11 @@ class WFOPipeline:
         print("\n" + "=" * 70)
         print("WALK-FORWARD OPTIMIZATION - Full Retrain Pipeline")
         print("=" * 70)
-        print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Setup logging and TensorBoard
+        self._setup_logging()
+
+        print(f"\nStart time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"\nConfiguration:")
         print(f"  Train: {self.config.train_months} months ({self.config.train_rows} rows)")
         print(f"  Test: {self.config.test_months} months ({self.config.test_rows} rows)")
