@@ -6,6 +6,7 @@ Contains action wrappers to filter and modify agent actions before
 they are passed to the underlying environment.
 """
 
+import warnings
 import gymnasium as gym
 import numpy as np
 from collections import deque
@@ -137,6 +138,8 @@ class RiskManagementWrapper(gym.Wrapper):
         max_drawdown: Trigger if drawdown exceeds this fraction (e.g., 0.10 = 10%).
         cooldown_steps: Number of steps to force HOLD after trigger.
         augment_obs: If True, add panic_mode flag to observation space.
+        baseline_vol: Pre-computed baseline volatility from TRAIN data.
+                      If None, defaults to 0.01 with a warning.
     """
 
     def __init__(
@@ -147,6 +150,7 @@ class RiskManagementWrapper(gym.Wrapper):
         max_drawdown: float = 0.10,
         cooldown_steps: int = 12,
         augment_obs: bool = False,
+        baseline_vol: Optional[float] = None,
     ):
         super().__init__(env)
         self.vol_window = vol_window
@@ -160,9 +164,19 @@ class RiskManagementWrapper(gym.Wrapper):
         self.peak_nav: float = 10000.0
         self.current_drawdown: float = 0.0
         self.rolling_vol: float = 0.0
-        self.baseline_vol: float = 0.01  # Will be calibrated
         self.cooldown_remaining: int = 0
         self.panic_triggered: bool = False
+
+        # Baseline volatility (should be computed from TRAIN data)
+        if baseline_vol is not None:
+            self.baseline_vol = baseline_vol
+        else:
+            self.baseline_vol = 0.01  # Conservative fallback
+            warnings.warn(
+                "[RiskManagementWrapper] baseline_vol not provided. "
+                "Using default 0.01. For accurate thresholds, compute from TRAIN data.",
+                UserWarning
+            )
 
         # Statistics
         self.circuit_breaker_count: int = 0
@@ -263,13 +277,22 @@ class RiskManagementWrapper(gym.Wrapper):
 
     def calibrate_baseline(self, n_steps: int = 1000):
         """
-        Run random actions to estimate baseline volatility.
+        DEPRECATED: This method causes data leakage when used on test environments.
 
-        Should be called once after wrapping the environment.
+        Instead, compute baseline_vol from TRAIN data and pass to __init__:
+            baseline_vol = train_df['BTC_Close'].pct_change().std()
+            env = RiskManagementWrapper(env, baseline_vol=baseline_vol)
 
-        Args:
-            n_steps: Number of steps to run for calibration.
+        This method is kept for backward compatibility but will be removed.
         """
+        warnings.warn(
+            "[RiskManagementWrapper] calibrate_baseline() is DEPRECATED and causes data leakage. "
+            "Compute baseline_vol from TRAIN data and pass to __init__ instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
+        # Legacy behavior (kept for backward compatibility)
         self.env.reset()
         navs = []
 
@@ -286,7 +309,7 @@ class RiskManagementWrapper(gym.Wrapper):
         else:
             self.baseline_vol = 0.01  # Fallback
 
-        print(f"[RiskMgmt] Calibrated baseline_vol: {self.baseline_vol:.6f}")
+        print(f"[RiskMgmt] DEPRECATED calibration. baseline_vol: {self.baseline_vol:.6f}")
 
         # Reset env state after calibration
         self.env.reset()

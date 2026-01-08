@@ -56,13 +56,13 @@ class WFOConfig:
 
     # WFO Parameters
     train_months: int = 12
-    test_months: int = 1
-    step_months: int = 1  # Rolling step
+    test_months: int = 3
+    step_months: int = 3  # Rolling step
     hours_per_month: int = 720  # 30 days * 24 hours
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 350_000
+    tqc_timesteps: int = 250_000
 
     # TQC Hyperparameters (aggressive regularization)
     learning_rate: float = 9e-5
@@ -472,7 +472,8 @@ class WFOPipeline:
         tqc_path: str,
         segment_id: int,
         context_rows: int = 0,
-        train_metrics: Optional[Dict[str, Any]] = None
+        train_metrics: Optional[Dict[str, Any]] = None,
+        train_path: Optional[str] = None
     ) -> tuple[Dict[str, Any], np.ndarray]:
         """
         Evaluate trained agent on test data.
@@ -484,6 +485,7 @@ class WFOPipeline:
             segment_id: Segment identifier.
             context_rows: Number of warmup rows to skip in metrics (env warmup period).
             train_metrics: Optional training metrics from train_tqc.
+            train_path: Path to train data parquet (for baseline_vol calculation).
 
         Returns:
             Tuple of (metrics dict, navs array for plotting).
@@ -494,6 +496,15 @@ class WFOPipeline:
         from sb3_contrib import TQC
         from src.training.env import CryptoTradingEnv
         from src.training.wrappers import RiskManagementWrapper
+
+        # Calculate baseline_vol from TRAIN data (avoids data leakage)
+        if train_path and os.path.exists(train_path):
+            train_df = pd.read_parquet(train_path)
+            baseline_vol = train_df['BTC_Close'].pct_change().std()
+            print(f"  Circuit Breaker calibrated on TRAIN data. Baseline Vol: {baseline_vol:.5f}")
+        else:
+            baseline_vol = 0.01  # Conservative fallback
+            print(f"  [WARNING] train_path not provided. Using default baseline_vol: {baseline_vol:.5f}")
 
         # Create test environment
         env = CryptoTradingEnv(
@@ -508,6 +519,7 @@ class WFOPipeline:
         )
 
         # Wrap with Risk Management (Circuit Breaker)
+        # baseline_vol computed from TRAIN data to avoid data leakage
         env = RiskManagementWrapper(
             env,
             vol_window=24,
@@ -515,9 +527,8 @@ class WFOPipeline:
             max_drawdown=0.10,  # 10% drawdown trigger
             cooldown_steps=12,
             augment_obs=False,
+            baseline_vol=baseline_vol,
         )
-        # Calibrate baseline volatility
-        env.calibrate_baseline(n_steps=min(1000, context_rows or 500))
 
         # Load agent
         model = TQC.load(tqc_path)
@@ -682,7 +693,8 @@ class WFOPipeline:
         metrics, navs = self.evaluate_segment(
             test_path, encoder_path, tqc_path, segment_id,
             context_rows=context_rows,
-            train_metrics=train_metrics
+            train_metrics=train_metrics,
+            train_path=train_path
         )
 
         # 7. Teacher Report - Hyperparameter Hints
@@ -1047,7 +1059,8 @@ class WFOPipeline:
                 metrics, navs = self.evaluate_segment(
                     test_path, encoder_path, tqc_path, seg_id,
                     context_rows=context_rows,
-                    train_metrics={}  # No training metrics in eval-only mode
+                    train_metrics={},  # No training metrics in eval-only mode
+                    train_path=train_path
                 )
 
                 all_metrics.append(metrics)
@@ -1093,15 +1106,15 @@ def main():
                         help="Max number of segments to run")
     parser.add_argument("--segment", type=int, default=None,
                         help="Run specific segment only")
-    parser.add_argument("--timesteps", type=int, default=350_000,
+    parser.add_argument("--timesteps", type=int, default=WFOConfig.tqc_timesteps,
                         help="TQC training timesteps per segment")
-    parser.add_argument("--mae-epochs", type=int, default=90,
+    parser.add_argument("--mae-epochs", type=int, default=WFOConfig.mae_epochs,
                         help="MAE training epochs per segment")
-    parser.add_argument("--train-months", type=int, default=12,
+    parser.add_argument("--train-months", type=int, default=WFOConfig.train_months,
                         help="Training window in months")
-    parser.add_argument("--test-months", type=int, default=1,
+    parser.add_argument("--test-months", type=int, default=WFOConfig.test_months,
                         help="Test window in months")
-    parser.add_argument("--step-months", type=int, default=1,
+    parser.add_argument("--step-months", type=int, default=WFOConfig.step_months,
                         help="Rolling step in months")
     parser.add_argument("--eval-only", action="store_true",
                         help="Re-run evaluation only (skip MAE/TQC training)")
