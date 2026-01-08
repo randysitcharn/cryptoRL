@@ -65,7 +65,7 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 250_000
+    tqc_timesteps: int = 150_000
 
     # TQC Hyperparameters (aggressive regularization)
     learning_rate: float = 9e-5
