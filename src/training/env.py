@@ -71,6 +71,10 @@ class CryptoTradingEnv(gym.Env):
         action_discretization: float = 0.1,  # Discretize actions (0.1 = 21 positions)
         churn_coef: float = 0.0,  # Cognitive tax: amplify trading cost perception (0.1 = 10x)
         smooth_coef: float = 0.0,  # Smoothness penalty: quadratic penalty on position changes
+        # Volatility Scaling (Target Volatility)
+        target_volatility: float = 0.01,  # 1% target vol (reduces position in high vol)
+        vol_window: int = 24,  # Rolling window for vol calculation (24h)
+        max_leverage: float = 5.0,  # Max scaling factor (caps position in low vol)
     ):
         """
         Initialize the trading environment.
@@ -100,6 +104,11 @@ class CryptoTradingEnv(gym.Env):
         self.action_discretization = action_discretization
         self.churn_coef = churn_coef
         self.smooth_coef = smooth_coef
+
+        # Volatility Scaling parameters
+        self.target_volatility = target_volatility
+        self.vol_window = vol_window
+        self.max_leverage = max_leverage
 
         # Load data
         df = pd.read_parquet(parquet_path)
@@ -204,6 +213,11 @@ class CryptoTradingEnv(gym.Env):
             "rewards/total_raw": 0.0,
         }
 
+        # Volatility scaling state
+        self.returns_for_vol: List[float] = []  # Separate buffer for vol calculation
+        self.current_volatility: float = self.target_volatility  # Init to target
+        self.vol_scalar: float = 1.0
+
     def _get_price(self, step: Optional[int] = None) -> float:
         """Get price at given step (default: current step)."""
         idx = step if step is not None else self.current_step
@@ -213,6 +227,18 @@ class CryptoTradingEnv(gym.Env):
         """Calculate Net Asset Value."""
         price = self._get_price()
         return self.cash + self.position * price
+
+    def _calculate_volatility(self) -> float:
+        """Calculate rolling volatility of returns for position scaling."""
+        if len(self.returns_for_vol) < 2:
+            return self.target_volatility  # Default when not enough data
+
+        # Use last vol_window returns
+        recent_returns = self.returns_for_vol[-self.vol_window:]
+        vol = np.std(recent_returns)
+
+        # Safety: avoid division by zero
+        return max(vol, 1e-6)
 
     def _calculate_reward(self) -> float:
         """
@@ -312,25 +338,35 @@ class CryptoTradingEnv(gym.Env):
         Returns:
             Tuple of (observation, reward, terminated, truncated, info).
         """
-        # 1. Parse and discretize action
-        target_position_pct = float(np.clip(action[0], -1.0, 1.0))
+        # 1. Parse raw action
+        raw_action = float(np.clip(action[0], -1.0, 1.0))
 
-        # Discretize action to reduce micro-churn (e.g., 0.1 = 21 positions)
+        # 2. Apply volatility scaling (Target Volatility)
+        self.current_volatility = self._calculate_volatility()
+        self.vol_scalar = self.target_volatility / self.current_volatility
+        self.vol_scalar = float(np.clip(self.vol_scalar, 0.1, self.max_leverage))
+
+        # 3. Scale action: reduce position in high vol, increase in low vol
+        effective_action = raw_action * self.vol_scalar
+        effective_action = float(np.clip(effective_action, -1.0, 1.0))
+
+        # 4. Discretize AFTER scaling to reduce micro-churn
+        target_position_pct = effective_action
         if self.action_discretization > 0:
             target_position_pct = round(target_position_pct / self.action_discretization) * self.action_discretization
             target_position_pct = float(np.clip(target_position_pct, -1.0, 1.0))  # Ensure bounds
 
-        # 2. Get current state
+        # 5. Get current state
         old_nav = self._get_nav()
         old_price = self._get_price()
 
-        # 3. Calculate position change
+        # 6. Calculate position change
         # Map [-1, 1] to position: -1 = 0% long, 0 = 50%, +1 = 100%
         target_exposure = (target_position_pct + 1.0) / 2.0  # [0, 1]
         target_position_value = old_nav * target_exposure
         target_position_units = target_position_value / old_price
 
-        # 4. Execute trade only if discretized position changed
+        # 7. Execute trade only if discretized position changed
         position_changed = (target_position_pct != self.current_position_pct)
 
         if position_changed:
@@ -347,27 +383,30 @@ class CryptoTradingEnv(gym.Env):
             self.position = target_position_units
             self.current_position_pct = target_position_pct
 
-        # 5. Advance time
+        # 8. Advance time
         self.current_step += 1
 
-        # 6. Calculate new NAV
+        # 9. Calculate new NAV
         new_nav = self._get_nav()
 
-        # 7. Calculate reward (Hybrid Log-Sortino + Churn Penalty)
+        # 10. Calculate reward (Hybrid Log-Sortino + Churn Penalty)
         reward = self._calculate_reward()
 
-        # 8. Update state for next step
+        # 11. Update state for next step
         self._prev_valuation = new_nav
         self._prev_position_pct = self.current_position_pct
 
-        # Track log return for analysis
+        # Track returns for analysis and volatility calculation
         if old_nav > 0 and new_nav > 0:
-            step_return = np.log(new_nav / old_nav)
+            step_return = np.log(new_nav / old_nav)  # Log return for analysis
+            simple_return = (new_nav - old_nav) / old_nav  # Simple return for vol calc
         else:
             step_return = 0.0
+            simple_return = 0.0
         self.returns_history.append(step_return)
+        self.returns_for_vol.append(simple_return)
 
-        # 9. Check termination
+        # 12. Check termination
         terminated = False
         truncated = False
 
@@ -380,7 +419,7 @@ class CryptoTradingEnv(gym.Env):
         if self.current_step >= self.episode_end:
             terminated = True
 
-        # 10. Get observation and info
+        # 13. Get observation and info
         observation = self._get_observation()
         info = self._get_info(action[0], step_return, new_nav)
 
@@ -413,6 +452,10 @@ class CryptoTradingEnv(gym.Env):
             'return': step_return,
             'total_trades': self.total_trades,
             'total_commission': self.total_commission,
+            # Volatility scaling metrics
+            'vol/current_volatility': self.current_volatility,
+            'vol/vol_scalar': self.vol_scalar,
+            'vol/target_volatility': self.target_volatility,
         }
         # Add reward metrics for observability
         info.update(self.reward_metrics)

@@ -300,6 +300,11 @@ class TrainingConfig:
     churn_coef: float = 1.0  # Doubled: stronger anti-churn penalty
     smooth_coef: float = 0.1  # Reduced smoothness penalty
 
+    # Volatility Scaling (Target Volatility)
+    target_volatility: float = 0.05  # 5% target vol
+    vol_window: int = 24  # 24h rolling window
+    max_leverage: float = 2.0  # Conservative max scaling
+
     # Foundation Model (must match pretrained encoder)
     d_model: int = 128
     n_heads: int = 4
@@ -436,6 +441,9 @@ def create_environments(config: TrainingConfig):
         churn_coef=config.churn_coef,
         smooth_coef=initial_smooth,
         random_start=True,
+        target_volatility=config.target_volatility,
+        vol_window=config.vol_window,
+        max_leverage=config.max_leverage,
     )
 
     # Create eval environment (separate eval dataset, 1 month)
@@ -452,6 +460,9 @@ def create_environments(config: TrainingConfig):
         churn_coef=config.churn_coef,
         smooth_coef=config.smooth_coef,
         random_start=False,  # Sequential for evaluation
+        target_volatility=config.target_volatility,
+        vol_window=config.vol_window,
+        max_leverage=config.max_leverage,
     )
 
     # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
@@ -569,6 +580,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"      Observation space: {obs_shape}")
     print(f"      Action space: {train_env.action_space.shape}")
     print(f"      Device: {DEVICE}")
+    print(f"      Volatility Scaling Active: Target={config.target_volatility}, Window={config.vol_window}")
 
     # ==================== Policy Setup ====================
     print("\n[2/4] Configuring policy with FoundationFeatureExtractor...")

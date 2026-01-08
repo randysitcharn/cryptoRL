@@ -72,6 +72,11 @@ class WFOConfig:
     churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
     smooth_coef: float = 0.1  # Reduced smoothness penalty
 
+    # Volatility Scaling (Target Volatility)
+    target_volatility: float = 0.05  # 5% target vol
+    vol_window: int = 24  # 24h rolling window
+    max_leverage: float = 2.0  # Conservative max scaling
+
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
         # Prix OHLC bruts
@@ -430,6 +435,9 @@ class WFOPipeline:
         config.ent_coef = self.config.ent_coef
         config.churn_coef = self.config.churn_coef
         config.smooth_coef = self.config.smooth_coef
+        config.target_volatility = self.config.target_volatility
+        config.vol_window = self.config.vol_window
+        config.max_leverage = self.config.max_leverage
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
@@ -494,6 +502,9 @@ class WFOPipeline:
             commission=0.0004,  # churn_analysis.yaml
             episode_length=None,  # Full episode
             random_start=False,
+            target_volatility=self.config.target_volatility,
+            vol_window=self.config.vol_window,
+            max_leverage=self.config.max_leverage,
         )
 
         # Wrap with Risk Management (Circuit Breaker)
@@ -908,6 +919,7 @@ class WFOPipeline:
         print(f"  Train: {self.config.train_months} months ({self.config.train_rows} rows)")
         print(f"  Test: {self.config.test_months} months ({self.config.test_rows} rows)")
         print(f"  Step: {self.config.step_months} months ({self.config.step_rows} rows)")
+        print(f"  Volatility Scaling: Target={self.config.target_volatility}, Window={self.config.vol_window}")
 
         # Load raw data
         print(f"\nLoading raw data: {self.config.raw_data_path}")
