@@ -26,20 +26,47 @@ ssh -p PORT root@HOST
 cd /workspace
 ```
 
-### 3. Clone du repo
+### 3. Configurer SSH pour GitHub
+
+Copier la cle SSH (depuis machine locale):
+```bash
+scp -P PORT ~/.ssh/id_github ~/.ssh/id_github.pub root@HOST:~/.ssh/
+```
+
+Configurer SSH sur le serveur:
+```bash
+ssh -p PORT root@HOST
+chmod 600 ~/.ssh/id_github
+chmod 700 ~/.ssh
+
+cat > ~/.ssh/config << 'EOF'
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_github
+    IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+
+# Test connexion
+ssh -o StrictHostKeyChecking=no git@github.com
+```
+
+### 4. Clone du repo
 
 ```bash
-git clone https://github.com/five-music/cryptoRL.git
+cd /workspace
+git clone git@github.com:randysitcharn/cryptoRL.git
 cd cryptoRL
 ```
 
-### 4. Installer dependances
+### 5. Installer dependances
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 5. Copier les donnees (depuis machine locale)
+### 6. Copier les donnees (depuis machine locale)
 
 ```bash
 # Executer depuis la machine locale:
@@ -50,17 +77,17 @@ Fichiers requis:
 - `data/raw_historical/multi_asset_historical.csv` (principal)
 - Ou fichiers individuels: `BTC_1h.csv`, `ETH_1h.csv`, etc.
 
-### 6. Lancer le training WFO
+### 7. Lancer le training WFO
 
 ```bash
 # Training complet (13 segments)
-python scripts/run_full_wfo.py --segments 13
+python3 scripts/run_full_wfo.py --segments 13
 
 # Ou un seul segment pour test
-python scripts/run_full_wfo.py --segment 0 --timesteps 150000
+python3 scripts/run_full_wfo.py --segment 0 --timesteps 150000
 ```
 
-### 7. Monitoring TensorBoard
+### 8. Monitoring TensorBoard
 
 Sur le serveur:
 ```bash
@@ -73,7 +100,7 @@ ssh -p PORT -L 8081:localhost:8081 root@HOST
 # Ouvrir http://localhost:8081
 ```
 
-### 8. Recuperer les resultats
+### 9. Recuperer les resultats
 
 ```bash
 # Depuis machine locale:
