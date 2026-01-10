@@ -137,6 +137,7 @@ def create_environments(config: TrainingConfig):
         target_volatility=config.target_volatility,
         vol_window=config.vol_window,
         max_leverage=config.max_leverage,
+        price_column='BTC_Close',
     )
 
     # Create eval environment (separate eval dataset, 1 month)
@@ -156,6 +157,7 @@ def create_environments(config: TrainingConfig):
         target_volatility=config.target_volatility,
         vol_window=config.vol_window,
         max_leverage=config.max_leverage,
+        price_column='BTC_Close',
     )
 
     # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
