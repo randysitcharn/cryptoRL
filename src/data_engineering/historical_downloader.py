@@ -15,9 +15,7 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
 
-from src.config import OHLCV_COLS
 
 
 class HistoricalDownloader:

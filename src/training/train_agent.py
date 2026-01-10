@@ -12,14 +12,12 @@ Usage:
 import os
 import re
 import glob
-from typing import Callable, Union
 
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 import torch
-import numpy as np
 
 # CUDA Optimization: Auto-tune convolutions for repeated input sizes
 torch.backends.cudnn.benchmark = True

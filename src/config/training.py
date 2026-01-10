@@ -6,9 +6,8 @@ Centralizes all training-related settings for consistency across the codebase.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Union, List, Dict, Any, Callable
+from typing import Optional, Union, List, Dict, Callable
 
-from src.config.base import PathConfig, EnvConfig, FoundationModelConfig
 
 
 # =============================================================================

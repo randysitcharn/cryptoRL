@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
-from typing import Dict, Tuple
+from typing import Dict
 
 from src.config import OHLCV_COLS, CRYPTO_TICKERS, MACRO_TICKERS, TICKER_MAPPING
 

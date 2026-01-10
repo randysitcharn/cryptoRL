@@ -5,8 +5,7 @@ base.py - Base configuration with shared parameters.
 Provides common settings used across training, tuning, and evaluation.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 import torch
 
 

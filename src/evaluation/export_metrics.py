@@ -238,7 +238,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
     # Ajouter le chemin racine du projet
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     os.chdir(project_root)

@@ -1,0 +1,16 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # Line too long (géré par formatter)
+    "E402",  # Import not at top (nécessaire pour sys.path.insert)
+    "F541",  # f-string without placeholders (faux positifs avec print)
+    "E722",  # Bare except (parfois nécessaire)
+]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Unused imports OK in __init__
+"scripts/*" = ["F401", "F841"]  # Scripts peuvent avoir des imports/vars inutilisés
+"tests/*" = ["F841", "E712"]  # Tests: vars documentaires + comparaisons explicites OK

@@ -6,7 +6,6 @@ Verifie que l'agent SAC peut etre cree et predire une action.
 
 import sys
 import os
-import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))

@@ -10,7 +10,6 @@ Provides comprehensive plotting capabilities for model evaluation:
 - Position timeline
 """
 
-import os
 from typing import Dict, List, Optional
 from pathlib import Path
 

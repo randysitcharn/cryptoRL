@@ -14,13 +14,10 @@ Usage:
     python -m src.optimization.tune --n-trials 50
 """
 
-import os
 import warnings
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
-import pandas as pd
 import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
@@ -99,7 +96,6 @@ class TrialPruningCallback(BaseCallback):
 # Helper Functions
 # ============================================================================
 
-from src.utils.metrics import calculate_sharpe_ratio
 
 
 def create_environments(config: TuningConfig):

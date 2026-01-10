@@ -11,7 +11,6 @@ Classe DataProcessor pour nettoyer les données OHLCV et ajouter :
 import os
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 
 class DataProcessor:

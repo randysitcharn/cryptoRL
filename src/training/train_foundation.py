@@ -15,7 +15,6 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Optional
 
 # Ajouter le chemin racine pour les imports
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,7 +34,7 @@ from src.models.foundation import CryptoMAE
 # Configuration (imported from centralized config module)
 # =============================================================================
 
-from src.config import FoundationTrainingConfig as TrainingConfig, get_device, DEVICE
+from src.config import FoundationTrainingConfig as TrainingConfig, get_device
 
 
 # =============================================================================

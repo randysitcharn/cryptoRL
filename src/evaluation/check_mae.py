@@ -10,7 +10,6 @@ Usage:
     python -m src.evaluation.check_mae
 """
 
-import os
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
