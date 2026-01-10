@@ -1,20 +1,43 @@
+# -*- coding: utf-8 -*-
 """
-training - Module pour l'entraînement des modèles.
+training - Training module for cryptoRL.
 
-Contient:
-- train_foundation: Script d'entraînement MAE (Phase 2)
-- train_agent: Script d'entraînement TQC + Foundation (Phase 3)
-- env: Environnement de trading RL
+Provides:
+- CryptoTradingEnv: Gymnasium environment for trading
+- Callbacks: TensorBoard, logging, curriculum learning
+- Training functions: train_agent, train_foundation
 """
 
-from src.training.train_foundation import train as train_foundation, TrainingConfig
 from src.training.env import CryptoTradingEnv
-from src.training.train_agent import train as train_agent, TrainingConfig as AgentTrainingConfig
+from src.training.train_agent import train as train_agent
+from src.training.train_foundation import train as train_foundation
+from src.training.callbacks import (
+    TensorBoardStepCallback,
+    StepLoggingCallback,
+    DetailTensorboardCallback,
+    CurriculumFeesCallback,
+    get_next_run_dir,
+)
+
+# Re-export configs from centralized config module
+from src.config import (
+    TQCTrainingConfig,
+    FoundationTrainingConfig,
+)
 
 __all__ = [
-    'train_foundation',
-    'train_agent',
-    'TrainingConfig',
-    'AgentTrainingConfig',
-    'CryptoTradingEnv',
+    # Environment
+    "CryptoTradingEnv",
+    # Training functions
+    "train_agent",
+    "train_foundation",
+    # Callbacks
+    "TensorBoardStepCallback",
+    "StepLoggingCallback",
+    "DetailTensorboardCallback",
+    "CurriculumFeesCallback",
+    "get_next_run_dir",
+    # Configs
+    "TQCTrainingConfig",
+    "FoundationTrainingConfig",
 ]

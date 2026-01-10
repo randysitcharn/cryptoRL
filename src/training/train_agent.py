@@ -10,235 +10,30 @@ Usage:
 """
 
 import os
+import re
+import glob
 from typing import Callable, Union
 
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 import torch
 import numpy as np
 
 # CUDA Optimization: Auto-tune convolutions for repeated input sizes
 torch.backends.cudnn.benchmark = True
 
-from src.training.clipped_optimizer import ClippedAdamW
-
-
-class StepLoggingCallback(BaseCallback):
-    """
-    Callback pour logger à chaque N steps (console + TensorBoard).
-    """
-    def __init__(self, log_freq: int = 1000, verbose: int = 1):
-        super().__init__(verbose)
-        self.log_freq = log_freq
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_trades = []  # Track trades per episode
-        self.last_episode_info = {}
-
-    def _on_step(self) -> bool:
-        # Collecter les infos d'épisode si disponibles
-        if self.locals.get("infos"):
-            for info in self.locals["infos"]:
-                if "episode" in info:
-                    ep_reward = info["episode"]["r"]
-                    ep_length = info["episode"]["l"]
-                    self.episode_rewards.append(ep_reward)
-                    self.episode_lengths.append(ep_length)
-                    # Capture final trades at episode end
-                    if "total_trades" in info:
-                        self.episode_trades.append(info["total_trades"])
-                    self.last_episode_info = {
-                        "reward": ep_reward,
-                        "length": ep_length,
-                    }
-
-                # Collecter les infos de trading (NAV, position - updated every step)
-                if "nav" in info:
-                    self.last_episode_info["nav"] = info["nav"]
-                if "position_pct" in info:
-                    self.last_episode_info["position"] = info["position_pct"]
-
-        # Logger tous les log_freq steps
-        if self.num_timesteps % self.log_freq == 0:
-            # Calculer les stats des derniers épisodes
-            if self.episode_rewards:
-                mean_reward = np.mean(self.episode_rewards[-10:])
-                mean_length = np.mean(self.episode_lengths[-10:])
-            else:
-                mean_reward = 0
-                mean_length = 0
-
-            # Log to TensorBoard
-            self.logger.record("custom/mean_reward_10ep", mean_reward)
-            self.logger.record("custom/mean_length_10ep", mean_length)
-
-            if self.last_episode_info:
-                if "nav" in self.last_episode_info:
-                    self.logger.record("custom/nav", self.last_episode_info["nav"])
-                if "position" in self.last_episode_info:
-                    self.logger.record("custom/position", self.last_episode_info["position"])
-
-            # Log trades of last completed episode
-            if self.episode_trades:
-                self.logger.record("custom/trades_per_episode", self.episode_trades[-1])
-
-            # Force dump to TensorBoard
-            self.logger.dump(self.num_timesteps)
-
-            # Console log
-            fps = self.model.logger.name_to_value.get("time/fps", 0)
-            nav = self.last_episode_info.get("nav", 0)
-            pos = self.last_episode_info.get("position", 0)
-
-            print(f"Step {self.num_timesteps:>7} | "
-                  f"Reward: {mean_reward:>8.2f} | "
-                  f"NAV: {nav:>10.2f} | "
-                  f"Pos: {pos:>+5.2f} | "
-                  f"FPS: {fps:>5.0f}")
-
-        return True
-
-
-class DetailTensorboardCallback(BaseCallback):
-    """
-    Callback pour logger les composantes du reward dans TensorBoard.
-    Permet de visualiser: log_return, penalty_vol, churn_penalty, total_raw.
-    Inclut des stats épisode pour analyse du coefficient de churn optimal.
-    Capture aussi les métriques de diagnostic pour l'analyse post-training.
-    """
-    def __init__(self, verbose: int = 0):
-        super().__init__(verbose)
-        # Accumulateurs pour stats épisode
-        self.episode_churn_penalties = []
-        self.episode_log_returns = []
-        self.episode_position_deltas = []
-
-        # Métriques de diagnostic (accumulées sur tout le training)
-        self.all_actions = []
-        self.entropy_values = []
-        self.critic_losses = []
-        self.actor_losses = []
-        self.churn_ratios = []
-
-        # Gradient norms pour diagnostic de maximum local
-        self.actor_grad_norms = []
-        self.critic_grad_norms = []
-
-    def _on_step(self) -> bool:
-        # Track actions for saturation analysis
-        if self.locals.get("actions") is not None:
-            self.all_actions.extend(np.abs(self.locals["actions"]).flatten())
-
-        # Récupérer les infos depuis l'environnement
-        if self.locals.get("infos"):
-            info = self.locals["infos"][0]
-
-            # Log reward components (every step) - use record_mean for smooth curves
-            if "rewards/log_return" in info:
-                self.logger.record_mean("rewards/log_return", info["rewards/log_return"])
-                self.episode_log_returns.append(info["rewards/log_return"])
-            if "rewards/penalty_vol" in info:
-                self.logger.record_mean("rewards/penalty_vol", info["rewards/penalty_vol"])
-            if "rewards/churn_penalty" in info:
-                self.logger.record_mean("rewards/churn_penalty", info["rewards/churn_penalty"])
-                self.episode_churn_penalties.append(info["rewards/churn_penalty"])
-            if "rewards/smoothness_penalty" in info:
-                self.logger.record_mean("rewards/smoothness_penalty", info["rewards/smoothness_penalty"])
-            if "rewards/position_delta" in info:
-                self.logger.record_mean("rewards/position_delta", info["rewards/position_delta"])
-                self.episode_position_deltas.append(info["rewards/position_delta"])
-            if "rewards/total_raw" in info:
-                self.logger.record_mean("rewards/total_raw", info["rewards/total_raw"])
-            if "rewards/scaled" in info:
-                self.logger.record_mean("rewards/scaled", info["rewards/scaled"])
-
-            # À la fin d'un épisode, log les stats agrégées
-            if "episode" in info:
-                if self.episode_churn_penalties:
-                    total_churn = sum(self.episode_churn_penalties)
-                    total_log_ret = sum(self.episode_log_returns)
-                    total_delta = sum(self.episode_position_deltas)
-
-                    self.logger.record("churn/episode_total_penalty", total_churn)
-                    self.logger.record("churn/episode_total_log_return", total_log_ret)
-                    self.logger.record("churn/episode_total_position_delta", total_delta)
-
-                    # Ratio churn/return (pour calibrer le coefficient)
-                    if abs(total_log_ret) > 1e-8:
-                        ratio = abs(total_churn / total_log_ret)
-                        self.logger.record("churn/penalty_to_return_ratio", ratio)
-                        self.churn_ratios.append(ratio)
-
-                # Reset accumulateurs épisode
-                self.episode_churn_penalties = []
-                self.episode_log_returns = []
-                self.episode_position_deltas = []
-
-        # Capture training metrics from model logger (safe access)
-        try:
-            if hasattr(self.model, 'logger') and self.model.logger is not None:
-                name_to_value = self.model.logger.name_to_value
-                if "train/ent_coef" in name_to_value:
-                    self.entropy_values.append(name_to_value["train/ent_coef"])
-                if "train/critic_loss" in name_to_value:
-                    self.critic_losses.append(name_to_value["train/critic_loss"])
-                if "train/actor_loss" in name_to_value:
-                    self.actor_losses.append(name_to_value["train/actor_loss"])
-        except (KeyError, AttributeError):
-            pass
-
-        # Log gradient norms pour diagnostic de convergence/maximum local
-        try:
-            if hasattr(self.model, 'actor') and self.model.actor is not None:
-                actor_grad_norm = self._compute_grad_norm(self.model.actor)
-                if actor_grad_norm is not None and actor_grad_norm > 0:
-                    self.logger.record_mean("grad/actor_norm", actor_grad_norm)
-                    self.actor_grad_norms.append(actor_grad_norm)
-
-            if hasattr(self.model, 'critic') and self.model.critic is not None:
-                critic_grad_norm = self._compute_grad_norm(self.model.critic)
-                if critic_grad_norm is not None and critic_grad_norm > 0:
-                    self.logger.record_mean("grad/critic_norm", critic_grad_norm)
-                    self.critic_grad_norms.append(critic_grad_norm)
-        except Exception:
-            pass
-
-        return True
-
-    def _compute_grad_norm(self, model) -> float:
-        """Compute the L2 norm of gradients for a model."""
-        total_norm = 0.0
-        n_params = 0
-        for p in model.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-                n_params += 1
-        if n_params == 0:
-            return None
-        return total_norm ** 0.5
-
-    def get_training_metrics(self) -> dict:
-        """Return diagnostic metrics at end of training."""
-        return {
-            "action_saturation": float(np.mean(self.all_actions)) if self.all_actions else 0.0,
-            "avg_entropy": float(np.mean(self.entropy_values)) if self.entropy_values else 0.0,
-            "avg_critic_loss": float(np.mean(self.critic_losses)) if self.critic_losses else 0.0,
-            "avg_actor_loss": float(np.mean(self.actor_losses)) if self.actor_losses else 0.0,
-            "avg_churn_ratio": float(np.mean(self.churn_ratios)) if self.churn_ratios else 0.0,
-            "avg_actor_grad_norm": float(np.mean(self.actor_grad_norms)) if self.actor_grad_norms else 0.0,
-            "avg_critic_grad_norm": float(np.mean(self.critic_grad_norms)) if self.critic_grad_norms else 0.0,
-        }
-
-
-import re
-import glob
-
 from src.config import DEVICE, SEED
 from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.env import CryptoTradingEnv
 from src.training.wrappers import RiskManagementWrapper
+from src.training.clipped_optimizer import ClippedAdamW
+from src.training.callbacks import (
+    StepLoggingCallback,
+    DetailTensorboardCallback,
+    CurriculumFeesCallback,
+)
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
@@ -438,7 +233,6 @@ def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTens
 
     # Curriculum Learning callback
     if config.use_curriculum:
-        from src.training.curriculum_callback import CurriculumFeesCallback
         curriculum_callback = CurriculumFeesCallback(
             target_fee_rate=config.commission,
             target_smooth_coef=config.smooth_coef,

@@ -70,7 +70,3 @@ class EvaluationConfig:
             use_time_series_splitter=False,
             plot_types=["portfolio_drawdown", "position_timeline"],
         )
-
-
-# Backward compatibility alias
-BacktestConfig = EvaluationConfig

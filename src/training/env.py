@@ -12,24 +12,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Tuple, List
 
-
-# Columns to exclude from features (raw OHLCV and raw volumes)
-# Must match src/data/dataset.py EXCLUDE_COLS for dimension consistency with encoder
-EXCLUDE_COLS = [
-    # Legacy format (single asset, lowercase)
-    'open', 'high', 'low', 'close',
-    # Multi-asset format: Prix OHLC bruts
-    'BTC_Close', 'ETH_Close', 'SPX_Close', 'DXY_Close', 'NASDAQ_Close',
-    'BTC_Open', 'BTC_High', 'BTC_Low',
-    'ETH_Open', 'ETH_High', 'ETH_Low',
-    'SPX_Open', 'SPX_High', 'SPX_Low',
-    'DXY_Open', 'DXY_High', 'DXY_Low',
-    'NASDAQ_Open', 'NASDAQ_High', 'NASDAQ_Low',
-    # Volumes bruts (utiliser VolRel à la place)
-    'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
-    # HMM intermediate features (only use Prob_0/1/2/3 outputs)
-    'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
-]
+from src.config import EXCLUDE_COLS
 
 
 class CryptoTradingEnv(gym.Env):

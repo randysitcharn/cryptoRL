@@ -15,6 +15,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict, Tuple
 
+from src.config import OHLCV_COLS, CRYPTO_TICKERS, MACRO_TICKERS, TICKER_MAPPING
+
 
 class MultiAssetDownloader:
     """
@@ -26,22 +28,6 @@ class MultiAssetDownloader:
     La synchronisation utilise BTC-USD comme Index Maître. Les actifs Macro
     sont forward-filled pour combler les périodes de fermeture (week-end, nuit).
     """
-
-    # Tickers à télécharger
-    CRYPTO_TICKERS = ['BTC-USD', 'ETH-USD']
-    MACRO_TICKERS = ['^GSPC', 'DX-Y.NYB', '^IXIC']
-
-    # Mapping pour noms de colonnes propres
-    TICKER_MAPPING = {
-        'BTC-USD': 'BTC',
-        'ETH-USD': 'ETH',
-        '^GSPC': 'SPX',
-        'DX-Y.NYB': 'DXY',
-        '^IXIC': 'NASDAQ'
-    }
-
-    # Colonnes OHLCV standard
-    OHLCV_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
 
     def __init__(self, processed_data_dir: str = "data/processed"):
         """
@@ -93,7 +79,7 @@ class MultiAssetDownloader:
         df.columns = [c.title() for c in df.columns]
 
         # Garder uniquement les colonnes OHLCV existantes
-        available_cols = [c for c in self.OHLCV_COLS if c in df.columns]
+        available_cols = [c for c in OHLCV_COLS if c in df.columns]
         df = df[available_cols]
 
         # S'assurer que l'index est DatetimeIndex
@@ -194,7 +180,7 @@ class MultiAssetDownloader:
             if df.empty:
                 continue
 
-            prefix = self.TICKER_MAPPING.get(ticker, ticker.replace('-', '_'))
+            prefix = TICKER_MAPPING.get(ticker, ticker.replace('-', '_'))
 
             # Reindex sur Master Index
             df_synced = df.reindex(master_index)
@@ -213,7 +199,7 @@ class MultiAssetDownloader:
                 print(f"[WARNING] Skipping empty {ticker}")
                 continue
 
-            prefix = self.TICKER_MAPPING.get(ticker, ticker.replace('^', '').replace('-', '_'))
+            prefix = TICKER_MAPPING.get(ticker, ticker.replace('^', '').replace('-', '_'))
 
             # IMPORTANT: Arrondir les timestamps Macro à l'heure (floor)
             # Car SPX/NASDAQ ont des timestamps non-ronds (ex: 18:30)
@@ -260,13 +246,13 @@ class MultiAssetDownloader:
         # 1. Télécharger les actifs Crypto
         print("\n[PHASE 1] Downloading Crypto assets (Master Timeframe)...")
         crypto_dfs = {}
-        for ticker in self.CRYPTO_TICKERS:
+        for ticker in CRYPTO_TICKERS:
             crypto_dfs[ticker] = self._download_asset(ticker)
 
         # 2. Télécharger les actifs Macro
         print("\n[PHASE 2] Downloading Macro assets (Slave Timeframe)...")
         macro_dfs = {}
-        for ticker in self.MACRO_TICKERS:
+        for ticker in MACRO_TICKERS:
             macro_dfs[ticker] = self._download_asset(ticker)
 
         # 3. Synchroniser sur l'Index Maître (BTC-USD)

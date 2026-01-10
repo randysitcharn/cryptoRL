@@ -17,6 +17,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 
+from src.config import OHLCV_COLS
+
 
 class HistoricalDownloader:
     """
@@ -35,8 +37,6 @@ class HistoricalDownloader:
         'BTCUSDT': 'BTC',
         'ETHUSDT': 'ETH',
     }
-
-    OHLCV_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
 
     def __init__(
         self,

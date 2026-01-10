@@ -13,6 +13,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional, List, Tuple
 
+from src.config import EXCLUDE_COLS
+
 
 class CryptoDataset(Dataset):
     """
@@ -27,21 +29,6 @@ class CryptoDataset(Dataset):
         n_features: Nombre de features
         feature_cols: Liste des noms de colonnes utilisées
     """
-
-    # Colonnes à exclure (prix bruts et volumes bruts non-scalés)
-    EXCLUDE_COLS = [
-        # Prix OHLC bruts
-        'BTC_Close', 'ETH_Close', 'SPX_Close', 'DXY_Close', 'NASDAQ_Close',
-        'BTC_Open', 'BTC_High', 'BTC_Low',
-        'ETH_Open', 'ETH_High', 'ETH_Low',
-        'SPX_Open', 'SPX_High', 'SPX_Low',
-        'DXY_Open', 'DXY_High', 'DXY_Low',
-        'NASDAQ_Open', 'NASDAQ_High', 'NASDAQ_Low',
-        # Volumes bruts (utiliser VolRel à la place)
-        'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
-        # HMM intermediate features (only use Prob_0/1/2/3 outputs)
-        'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
-    ]
 
     def __init__(
         self,
@@ -76,7 +63,7 @@ class CryptoDataset(Dataset):
             # Auto-détection: exclure les prix bruts et garder les features scalées
             feature_cols = [
                 col for col in df.columns
-                if col not in self.EXCLUDE_COLS
+                if col not in EXCLUDE_COLS
                 and df[col].dtype in ['float64', 'float32']
             ]
 

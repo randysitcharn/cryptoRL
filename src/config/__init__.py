@@ -19,6 +19,15 @@ from src.config.base import (
     FoundationModelConfig,
 )
 
+# Shared constants
+from src.config.constants import (
+    OHLCV_COLS,
+    EXCLUDE_COLS,
+    CRYPTO_TICKERS,
+    MACRO_TICKERS,
+    TICKER_MAPPING,
+)
+
 # Training configurations
 from src.config.training import (
     TQCTrainingConfig,
@@ -35,6 +44,12 @@ __all__ = [
     "SEED",
     "DEVICE",
     "get_device",
+    # Constants
+    "OHLCV_COLS",
+    "EXCLUDE_COLS",
+    "CRYPTO_TICKERS",
+    "MACRO_TICKERS",
+    "TICKER_MAPPING",
     # Base configs
     "PathConfig",
     "EnvConfig",
