@@ -26,6 +26,7 @@ except ImportError:
 
 from src.data_engineering.loader import MultiAssetDownloader
 from src.data_engineering.features import FeatureEngineer
+from src.data_engineering.historical_downloader import HistoricalDownloader
 
 
 class RegimeDetector:
@@ -524,7 +525,8 @@ class DataManager:
         data_dir: str = "data",
         ffd_window: int = 100,
         vol_window: int = 24,
-        zscore_window: int = 720
+        zscore_window: int = 720,
+        polygon_api_key: Optional[str] = None
     ):
         """
         Initialise le DataManager.
@@ -534,12 +536,15 @@ class DataManager:
             ffd_window: Fenêtre pour FFD.
             vol_window: Fenêtre pour volatilité.
             zscore_window: Fenêtre pour Z-Score.
+            polygon_api_key: Clé API Polygon.io pour téléchargement historique (optionnel).
         """
         self.data_dir = data_dir
+        self.polygon_api_key = polygon_api_key
         os.makedirs(data_dir, exist_ok=True)
 
         # Composants du pipeline
-        self.downloader = MultiAssetDownloader()
+        self.downloader = MultiAssetDownloader()  # Fallback Yahoo Finance
+        self.historical_downloader = None  # Lazy init si besoin
         self.feature_engineer = FeatureEngineer(
             ffd_window=ffd_window,
             vol_window=vol_window,
@@ -577,6 +582,11 @@ class DataManager:
         """
         Exécute le pipeline complet de préparation des données.
 
+        Priorité des sources de données:
+        1. raw_historical/multi_asset_historical.csv (8 ans, Polygon/Binance)
+        2. Téléchargement via HistoricalDownloader si polygon_api_key fourni
+        3. Fallback: processed/multi_asset.csv ou Yahoo Finance (730 jours)
+
         Args:
             save_path: Chemin de sauvegarde du parquet (défaut: data/processed_data.parquet).
             scaler_path: Chemin de sauvegarde du scaler (défaut: data/scaler.pkl).
@@ -598,13 +608,30 @@ class DataManager:
         # =====================================================================
         print("\n[1/6] Loading multi-asset data...")
 
-        csv_path = os.path.join(self.data_dir, "processed/multi_asset.csv")
+        # Priorité: raw_historical (8 ans) > HistoricalDownloader > Yahoo (730j)
+        historical_path = os.path.join(self.data_dir, "raw_historical/multi_asset_historical.csv")
+        legacy_path = os.path.join(self.data_dir, "processed/multi_asset.csv")
 
-        if use_cached_data and os.path.exists(csv_path):
-            print(f"  Using cached data: {csv_path}")
-            df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        if os.path.exists(historical_path):
+            # Données historiques disponibles (8 ans)
+            print(f"  Using historical data: {historical_path}")
+            df = pd.read_csv(historical_path, index_col=0, parse_dates=True)
+        elif self.polygon_api_key:
+            # Télécharger via HistoricalDownloader
+            print("  Downloading historical data (Polygon/Binance)...")
+            if self.historical_downloader is None:
+                self.historical_downloader = HistoricalDownloader(
+                    polygon_api_key=self.polygon_api_key,
+                    output_dir=os.path.join(self.data_dir, "raw_historical")
+                )
+            df = self.historical_downloader.download_all(start_date="2017-08-01")
+        elif use_cached_data and os.path.exists(legacy_path):
+            # Fallback: Yahoo Finance cache (730 jours)
+            print(f"  Using legacy data: {legacy_path}")
+            df = pd.read_csv(legacy_path, index_col=0, parse_dates=True)
         else:
-            print("  Downloading fresh data...")
+            # Télécharger via Yahoo Finance
+            print("  Downloading from Yahoo Finance (730 days)...")
             df = self.downloader.download_multi_asset()
 
         print(f"  Shape: {df.shape}")
