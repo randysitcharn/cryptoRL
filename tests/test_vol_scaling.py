@@ -241,6 +241,7 @@ def test_with_real_env():
 
     try:
         from src.training.env import CryptoTradingEnv
+        import pandas as pd
     except ImportError as e:
         print(f"\n[WARN]  SKIP: Could not import CryptoTradingEnv: {e}")
         return None
@@ -251,9 +252,20 @@ def test_with_real_env():
         print(f"\n[WARN]  SKIP: Data file not found: {data_path}")
         return None
 
+    # Detect price column
+    df = pd.read_parquet(data_path)
+    if 'close' in df.columns:
+        price_col = 'close'
+    elif 'BTC_Close' in df.columns:
+        price_col = 'BTC_Close'
+    else:
+        print(f"\n[WARN]  SKIP: No price column found in data")
+        return None
+
     # Create env with vol scaling
     env = CryptoTradingEnv(
         parquet_path=data_path,
+        price_column=price_col,
         window_size=64,
         random_start=False,
         target_volatility=0.05,

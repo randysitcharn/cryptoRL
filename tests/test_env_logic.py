@@ -43,28 +43,28 @@ def test_buy_max_position():
     print("Test 1: Buy Max Position (action=1)...")
 
     df = create_stable_price_data(price=100.0)
-    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001)
+    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001, window_size=10)
 
     obs, info = env.reset()
-    initial_nav = info['portfolio_value']
+    initial_nav = info['nav']
 
     # Action = 1 (100% in asset)
     action = np.array([1.0], dtype=np.float32)
     obs, reward, terminated, truncated, info = env.step(action)
 
     # Verify holdings > 0
-    assert info['asset_holdings'] > 0, f"Expected holdings > 0, got {info['asset_holdings']}"
+    assert info['position'] > 0, f"Expected holdings > 0, got {info['position']}"
 
     # Verify cash is close to 0 (only fees taken)
     assert info['cash'] < 100, f"Expected cash < 100 (near 0), got {info['cash']}"
 
     # Verify NAV decreased slightly due to fees
-    assert info['portfolio_value'] < initial_nav, \
-        f"Expected NAV < {initial_nav} due to fees, got {info['portfolio_value']}"
+    assert info['nav'] < initial_nav, \
+        f"Expected NAV < {initial_nav} due to fees, got {info['nav']}"
 
-    print(f"  Holdings: {info['asset_holdings']:.6f}")
+    print(f"  Holdings: {info['position']:.6f}")
     print(f"  Cash: ${info['cash']:.2f}")
-    print(f"  NAV: ${info['portfolio_value']:.2f} (initial: ${initial_nav:.2f})")
+    print(f"  NAV: ${info['nav']:.2f} (initial: ${initial_nav:.2f})")
     print("  PASSED!")
 
 
@@ -73,29 +73,29 @@ def test_sell_all_position():
     print("\nTest 2: Sell All Position (action=-1 after buy)...")
 
     df = create_stable_price_data(price=100.0)
-    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001)
+    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001, window_size=10)
 
     obs, info = env.reset()
 
     # First buy (action=1 -> 100% position)
     action_buy = np.array([1.0], dtype=np.float32)
     obs, reward, terminated, truncated, info = env.step(action_buy)
-    nav_after_buy = info['portfolio_value']
+    nav_after_buy = info['nav']
 
     # Then sell all (action=-1 -> 0% position)
     action_sell = np.array([-1.0], dtype=np.float32)
     obs, reward, terminated, truncated, info = env.step(action_sell)
 
     # Verify holdings are back to 0 (or very close)
-    assert abs(info['asset_holdings']) < 0.0001, \
-        f"Expected holdings ~ 0, got {info['asset_holdings']}"
+    assert abs(info['position']) < 0.0001, \
+        f"Expected holdings ~ 0, got {info['position']}"
 
     # Verify cash is positive
     assert info['cash'] > 0, f"Expected cash > 0, got {info['cash']}"
 
-    print(f"  Holdings after sell: {info['asset_holdings']:.6f}")
+    print(f"  Holdings after sell: {info['position']:.6f}")
     print(f"  Cash after sell: ${info['cash']:.2f}")
-    print(f"  NAV after sell: ${info['portfolio_value']:.2f}")
+    print(f"  NAV after sell: ${info['nav']:.2f}")
     print("  PASSED!")
 
 
@@ -104,10 +104,10 @@ def test_fee_impact():
     print("\nTest 3: Fee Impact (buy then sell)...")
 
     df = create_stable_price_data(price=100.0)
-    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001)
+    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001, window_size=10)
 
     obs, info = env.reset()
-    initial_nav = info['portfolio_value']
+    initial_nav = info['nav']
 
     # Buy max (action=1 -> 100%)
     action_buy = np.array([1.0], dtype=np.float32)
@@ -117,7 +117,7 @@ def test_fee_impact():
     action_sell = np.array([-1.0], dtype=np.float32)
     obs, reward, terminated, truncated, info = env.step(action_sell)
 
-    final_nav = info['portfolio_value']
+    final_nav = info['nav']
 
     # NAV should be less than initial due to commission + slippage on both trades
     # Expected loss: ~0.11% per trade * 2 trades = ~0.22% total
@@ -138,11 +138,17 @@ def test_partial_position():
     print("\nTest 4: Partial Position (action=0 -> 50%)...")
 
     df = create_stable_price_data(price=100.0)
-    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001)
+    # Disable action_discretization to get exact 50% position
+    env = CryptoTradingEnv(df, initial_balance=10000.0, commission=0.001, slippage=0.0001, window_size=10, action_discretization=0.0)
 
     obs, info = env.reset()
 
-    # 50% position: action=0 maps to (0+1)/2 = 0.5 = 50%
+    # First go to 100% position (action=1) to establish a different position_pct
+    # Initial position_pct=0 but actual holdings=0, so action=0 won't trigger trade
+    action_full = np.array([1.0], dtype=np.float32)
+    obs, reward, terminated, truncated, info = env.step(action_full)
+
+    # Now 50% position: action=0 maps to (0+1)/2 = 0.5 = 50%
     action = np.array([0.0], dtype=np.float32)
     obs, reward, terminated, truncated, info = env.step(action)
 
@@ -150,12 +156,12 @@ def test_partial_position():
     expected_holdings = 50.0  # Approximately
     expected_cash = 5000.0  # Approximately (minus fees)
 
-    assert 45 < info['asset_holdings'] < 55, \
-        f"Expected holdings ~50, got {info['asset_holdings']}"
+    assert 45 < info['position'] < 55, \
+        f"Expected holdings ~50, got {info['position']}"
     assert 4900 < info['cash'] < 5100, \
         f"Expected cash ~5000, got {info['cash']}"
 
-    print(f"  Holdings: {info['asset_holdings']:.4f} (expected ~50)")
+    print(f"  Holdings: {info['position']:.4f} (expected ~50)")
     print(f"  Cash: ${info['cash']:.2f} (expected ~$5000)")
     print("  PASSED!")
 
@@ -165,7 +171,7 @@ def test_full_cash_position():
     print("\nTest 5: Full Cash Position (action=-1 -> 0%)...")
 
     df = create_stable_price_data(price=100.0)
-    env = CryptoTradingEnv(df, initial_balance=10000.0)
+    env = CryptoTradingEnv(df, initial_balance=10000.0, window_size=10)
 
     obs, info = env.reset()
 
@@ -174,10 +180,10 @@ def test_full_cash_position():
     obs, reward, terminated, truncated, info = env.step(action)
 
     # Should stay in cash (holdings = 0)
-    assert abs(info['asset_holdings']) < 0.0001, \
-        f"Expected holdings = 0, got {info['asset_holdings']}"
+    assert abs(info['position']) < 0.0001, \
+        f"Expected holdings = 0, got {info['position']}"
 
-    print(f"  Holdings: {info['asset_holdings']:.6f}")
+    print(f"  Holdings: {info['position']:.6f}")
     print(f"  Cash: ${info['cash']:.2f}")
     print("  PASSED!")
 
