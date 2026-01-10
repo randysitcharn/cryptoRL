@@ -519,6 +519,7 @@ class WFOPipeline:
             target_volatility=self.config.target_volatility,
             vol_window=self.config.vol_window,
             max_leverage=self.config.max_leverage,
+            price_column='BTC_Close',
         )
 
         # Wrap with Risk Management (Circuit Breaker)
