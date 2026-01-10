@@ -19,7 +19,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.monitor import Monitor
 
-from src.env.trading_env import CryptoTradingEnv
+from src.training.env import CryptoTradingEnv
 from src.models.agent import create_tqc_agent
 from src.models.callbacks import TensorBoardStepCallback
 from src.data_engineering.splitter import TimeSeriesSplitter

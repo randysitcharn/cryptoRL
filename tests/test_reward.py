@@ -12,7 +12,7 @@ import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.env.trading_env import CryptoTradingEnv
+from src.training.env import CryptoTradingEnv
 
 
 def create_price_series(prices: list) -> pd.DataFrame:

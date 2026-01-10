@@ -134,12 +134,7 @@ class TrialPruningCallback(BaseCallback):
 # Helper Functions
 # ============================================================================
 
-def calculate_sharpe_ratio(returns: np.ndarray, periods_per_year: int = 252 * 24) -> float:
-    """Calculate annualized Sharpe Ratio."""
-    if len(returns) < 2 or np.std(returns) == 0:
-        return 0.0
-    sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(periods_per_year))
-    return sharpe if np.isfinite(sharpe) else -100.0
+from src.utils.metrics import calculate_sharpe_ratio
 
 
 def create_environments(config: TuningConfig):

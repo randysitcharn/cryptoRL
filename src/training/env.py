@@ -16,7 +16,9 @@ from typing import Optional, Tuple, List
 # Columns to exclude from features (raw OHLCV and raw volumes)
 # Must match src/data/dataset.py EXCLUDE_COLS for dimension consistency with encoder
 EXCLUDE_COLS = [
-    # Prix OHLC bruts
+    # Legacy format (single asset, lowercase)
+    'open', 'high', 'low', 'close',
+    # Multi-asset format: Prix OHLC bruts
     'BTC_Close', 'ETH_Close', 'SPX_Close', 'DXY_Close', 'NASDAQ_Close',
     'BTC_Open', 'BTC_High', 'BTC_Low',
     'ETH_Open', 'ETH_High', 'ETH_Low',
@@ -55,8 +57,9 @@ class CryptoTradingEnv(gym.Env):
 
     def __init__(
         self,
-        parquet_path: str = "data/processed_data.parquet",
-        price_column: str = "BTC_Close",
+        df: Optional[pd.DataFrame] = None,
+        parquet_path: Optional[str] = None,
+        price_column: str = "close",
         initial_balance: float = 10_000.0,
         commission: float = 0.0006,  # 0.06% per trade
         slippage: float = 0.0001,    # 0.01% slippage
@@ -80,8 +83,10 @@ class CryptoTradingEnv(gym.Env):
         Initialize the trading environment.
 
         Args:
+            df: DataFrame with OHLCV + features (alternative to parquet_path).
             parquet_path: Path to processed_data.parquet file.
             price_column: Column name for price (for P&L calculation).
+                         Use 'close' for legacy CSV data, 'BTC_Close' for parquet.
             initial_balance: Starting capital in USD.
             commission: Transaction fee (0.0006 = 0.06%).
             slippage: Slippage cost (0.0001 = 0.01%).
@@ -110,8 +115,15 @@ class CryptoTradingEnv(gym.Env):
         self.vol_window = vol_window
         self.max_leverage = max_leverage
 
-        # Load data
-        df = pd.read_parquet(parquet_path)
+        # Load data: either from DataFrame or parquet file
+        if df is not None:
+            # Use provided DataFrame directly (legacy compatibility)
+            pass
+        elif parquet_path is not None:
+            df = pd.read_parquet(parquet_path)
+        else:
+            # Default fallback
+            df = pd.read_parquet("data/processed_data.parquet")
 
         # Apply data slice if specified
         if start_idx is not None or end_idx is not None:

@@ -19,14 +19,14 @@ Metriques calculees:
 
 import os
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sb3_contrib import TQC
 
-from src.env.trading_env import CryptoTradingEnv
+from src.training.env import CryptoTradingEnv
 from src.data_engineering.splitter import TimeSeriesSplitter
 
 

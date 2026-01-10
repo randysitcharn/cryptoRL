@@ -13,7 +13,7 @@ import pandas as pd
 # Add the project root to the python path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.env.trading_env import CryptoTradingEnv
+from src.training.env import CryptoTradingEnv
 from stable_baselines3.common.env_checker import check_env
 
 

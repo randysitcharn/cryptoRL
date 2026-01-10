@@ -12,7 +12,7 @@ import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.env.trading_env import CryptoTradingEnv
+from src.training.env import CryptoTradingEnv
 
 
 def create_stable_price_data(n_rows: int = 100, price: float = 100.0) -> pd.DataFrame:

@@ -40,64 +40,15 @@ class BacktestConfig:
 
 
 # ============================================================================
-# KPI Calculations
+# KPI Calculations (imported from shared metrics module)
 # ============================================================================
 
-def calculate_sharpe_ratio(returns: np.ndarray, periods_per_year: int = 252 * 24) -> float:
-    """
-    Calculate annualized Sharpe Ratio.
-
-    Args:
-        returns: Array of log returns.
-        periods_per_year: Number of periods per year (default: hourly data).
-
-    Returns:
-        Annualized Sharpe Ratio.
-    """
-    if len(returns) < 2 or np.std(returns) == 0:
-        return 0.0
-    return float(np.mean(returns) / np.std(returns) * np.sqrt(periods_per_year))
-
-
-def calculate_max_drawdown(nav_series: np.ndarray) -> float:
-    """
-    Calculate maximum drawdown.
-
-    Args:
-        nav_series: Array of NAV values.
-
-    Returns:
-        Maximum drawdown as a positive percentage (e.g., 0.15 = 15%).
-    """
-    peak = np.maximum.accumulate(nav_series)
-    drawdown = (peak - nav_series) / peak
-    return float(np.max(drawdown))
-
-
-def calculate_total_return(nav_series: np.ndarray) -> float:
-    """
-    Calculate total return.
-
-    Args:
-        nav_series: Array of NAV values.
-
-    Returns:
-        Total return as a decimal (e.g., 0.25 = 25%).
-    """
-    return float((nav_series[-1] - nav_series[0]) / nav_series[0])
-
-
-def calculate_buy_hold_return(prices: np.ndarray) -> float:
-    """
-    Calculate Buy & Hold return.
-
-    Args:
-        prices: Array of prices.
-
-    Returns:
-        Buy & Hold return as a decimal.
-    """
-    return float((prices[-1] - prices[0]) / prices[0])
+from src.utils.metrics import (
+    calculate_sharpe_ratio,
+    calculate_max_drawdown,
+    calculate_total_return,
+    calculate_buy_hold_return,
+)
 
 
 # ============================================================================
