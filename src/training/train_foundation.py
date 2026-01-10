@@ -32,45 +32,18 @@ from src.models.foundation import CryptoMAE
 
 
 # =============================================================================
-# Configuration
+# Configuration (imported from centralized config module)
 # =============================================================================
 
-class TrainingConfig:
-    """Configuration d'entraînement."""
-
-    # Data
-    seq_len: int = 64
-    batch_size: int = 64
-    train_ratio: float = 0.8
-
-    # Model
-    d_model: int = 128
-    n_heads: int = 4
-    n_layers: int = 2
-    dropout: float = 0.1
-    mask_ratio: float = 0.15
-
-    # Training
-    epochs: int = 70
-    lr: float = 1e-4
-    weight_decay: float = 1e-5
-    patience: int = 7  # Early stopping
-
-    # Paths
-    data_path: str = "data/processed_data.parquet"
-    weights_dir: str = "weights"
-    checkpoint_path: str = "weights/best_foundation_full.pth"
-    encoder_path: str = "weights/pretrained_encoder.pth"
-    tensorboard_log: Optional[str] = "logs/tensorboard_mae/"
-    run_name: Optional[str] = None  # Custom run name for TensorBoard
+from src.config import FoundationTrainingConfig as TrainingConfig, get_device, DEVICE
 
 
 # =============================================================================
-# Device Detection
+# Device Detection (verbose version for training output)
 # =============================================================================
 
-def get_device() -> torch.device:
-    """Détecte automatiquement le meilleur device disponible."""
+def get_device_verbose() -> torch.device:
+    """Détecte automatiquement le meilleur device disponible avec log."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"[Device] Using CUDA: {torch.cuda.get_device_name(0)}")

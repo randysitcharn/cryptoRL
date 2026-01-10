@@ -40,45 +40,10 @@ from src.training.env import CryptoTradingEnv
 
 
 # ============================================================================
-# Configuration
+# Configuration (imported from centralized config module)
 # ============================================================================
 
-class TuningConfig:
-    """Configuration for hyperparameter tuning."""
-
-    # Paths
-    data_path: str = "data/processed_data.parquet"
-    encoder_path: str = "weights/pretrained_encoder.pth"
-    output_dir: str = "results/"
-    study_db: str = "sqlite:///optuna_study.db"
-
-    # Environment
-    window_size: int = 64
-    commission: float = 0.0006
-    train_ratio: float = 0.8
-    episode_length: int = 2048
-
-    # Foundation Model (must match pretrained encoder)
-    d_model: int = 128
-    n_heads: int = 4
-    n_layers: int = 2
-
-    # Fixed TQC parameters (not tuned)
-    buffer_size: int = 100_000
-    top_quantiles_to_drop: int = 2
-    n_critics: int = 2
-    n_quantiles: int = 25
-    net_arch: list = [256, 256]
-    freeze_encoder: bool = True
-    use_sde: bool = True
-    sde_sample_freq: int = -1
-    use_sde_at_warmup: bool = True
-
-    # Tuning parameters (GENIUS CATCHER MODE)
-    trial_timesteps: int = 60_000  # Longer trials for slow strategies
-    n_trials: int = 50
-    eval_freq: int = 5000         # Eval every 5k steps
-    n_eval_episodes: int = 1      # Fast: 1 episode per eval
+from src.config import TuningConfig
 
 
 # ============================================================================
