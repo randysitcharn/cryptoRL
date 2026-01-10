@@ -709,6 +709,53 @@ class WFOPipeline:
 
         return metrics, train_metrics
 
+    def _cleanup_segment(self, segment_id: int) -> int:
+        """
+        Clean up intermediate files after segment results are saved.
+
+        Removes redundant checkpoints while keeping essential files
+        (tqc.zip, encoder.pth, train.parquet) for evaluation.
+
+        Args:
+            segment_id: ID of the segment to clean up
+
+        Returns:
+            Total bytes freed
+        """
+        import shutil
+
+        freed_bytes = 0
+        segment_weights_dir = self.config.model_dir / f"segment_{segment_id}"
+
+        # 1. Remove checkpoints/ directory (largest, redundant with tqc.zip)
+        checkpoints_dir = segment_weights_dir / "checkpoints"
+        if checkpoints_dir.exists():
+            size = sum(f.stat().st_size for f in checkpoints_dir.rglob('*') if f.is_file())
+            shutil.rmtree(checkpoints_dir)
+            freed_bytes += size
+            print(f"  [CLEANUP] Removed checkpoints/: {size / 1024 / 1024:.1f} MB")
+
+        # 2. Remove best_model.zip (redundant with tqc.zip)
+        best_model = segment_weights_dir / "best_model.zip"
+        if best_model.exists():
+            size = best_model.stat().st_size
+            best_model.unlink()
+            freed_bytes += size
+            print(f"  [CLEANUP] Removed best_model.zip: {size / 1024 / 1024:.1f} MB")
+
+        # 3. Remove mae_full.pth (encoder.pth is sufficient for inference)
+        mae_full = segment_weights_dir / "mae_full.pth"
+        if mae_full.exists():
+            size = mae_full.stat().st_size
+            mae_full.unlink()
+            freed_bytes += size
+            print(f"  [CLEANUP] Removed mae_full.pth: {size / 1024 / 1024:.1f} MB")
+
+        if freed_bytes > 0:
+            print(f"  [CLEANUP] Total freed segment {segment_id}: {freed_bytes / 1024 / 1024:.1f} MB")
+
+        return freed_bytes
+
     def _print_teacher_report(self, train_metrics: Dict[str, Any], segment_id: int):
         """Print hyperparameter diagnostic hints based on training metrics."""
         print("\n" + "-" * 50)
@@ -981,6 +1028,9 @@ class WFOPipeline:
                 metrics, train_metrics = self.run_segment(df_raw, segment)
                 all_metrics.append(metrics)
                 self.save_results(metrics)
+
+                # Cleanup intermediate files to free disk space
+                self._cleanup_segment(segment['id'])
 
                 # GATE: Disabled - let WFO run all segments regardless of segment 0 performance
                 # if segment['id'] == 0:
