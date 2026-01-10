@@ -208,6 +208,63 @@ class RegimeDetector:
                 'momentum_mean': self.hmm.means_[state, :, 2].mean()
             }
 
+    def _validate_hmm_quality(
+        self,
+        proba: np.ndarray,
+        returns: np.ndarray,
+        min_proportion: float = 0.05
+    ) -> Dict:
+        """
+        Valide que les états HMM sont bien distincts et utilisés.
+
+        Args:
+            proba: Probabilités HMM (n_samples, n_components).
+            returns: Log-returns réels pour calculer mean_ret par état.
+            min_proportion: Proportion minimum par état (défaut 5%).
+
+        Returns:
+            Dict avec métriques de qualité:
+            - n_active_states: Nombre d'états avec proportion > min_proportion
+            - state_proportions: Liste des proportions par état
+            - state_mean_returns: Liste des mean_ret par état
+            - is_valid: True si au moins 3 états actifs
+            - separation_score: Écart-type des mean_returns (plus élevé = meilleur)
+        """
+        dominant = proba.argmax(axis=1)
+        n_samples = len(dominant)
+
+        state_proportions = []
+        state_mean_returns = []
+        n_active = 0
+
+        for state in range(self.n_components):
+            mask = dominant == state
+            proportion = mask.sum() / n_samples
+
+            if mask.sum() > 0:
+                mean_ret = returns[mask].mean()
+            else:
+                mean_ret = 0.0
+
+            state_proportions.append(proportion)
+            state_mean_returns.append(mean_ret)
+
+            if proportion >= min_proportion:
+                n_active += 1
+
+        # Score de séparation: écart-type des mean_returns
+        separation = np.std(state_mean_returns) if len(state_mean_returns) > 1 else 0.0
+
+        quality = {
+            'n_active_states': n_active,
+            'state_proportions': state_proportions,
+            'state_mean_returns': state_mean_returns,
+            'is_valid': n_active >= 3,  # Au moins 3 états distincts
+            'separation_score': separation
+        }
+
+        return quality
+
     def fit_predict(
         self,
         df: pd.DataFrame,
@@ -265,18 +322,87 @@ class RegimeDetector:
         # Clip scaled features to [-5, 5] for numerical stability
         features_scaled = np.clip(features_scaled, -5, 5)
 
-        # 4. K-Means warm start
-        self._initialize_hmm_with_kmeans(features_scaled)
+        # Pré-calculer les log-returns pour validation de qualité
+        btc_close = df_result.loc[df_result.index[valid_mask], 'BTC_Close'].values
+        real_log_returns = np.zeros(len(btc_close))
+        real_log_returns[1:] = np.log(btc_close[1:] / btc_close[:-1])
 
-        # 5. Fit HMM (avec warm start)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.hmm.fit(features_scaled)
+        # 4. K-Means warm start + Fit HMM avec retry si qualité insuffisante
+        MAX_RETRIES = 3
+        best_quality = None
+        best_hmm = None
+        best_proba = None
 
-        # Fix NaN in startprob_ (can happen with numerical instability)
-        if np.any(np.isnan(self.hmm.startprob_)):
-            print("  [FIX] Replacing NaN in startprob_ with uniform distribution")
-            self.hmm.startprob_ = np.ones(self.n_components) / self.n_components
+        for attempt in range(MAX_RETRIES):
+            # K-Means avec random_state différent à chaque tentative
+            current_random_state = self.random_state + attempt * 17
+
+            self.kmeans = KMeans(
+                n_clusters=self.n_components,
+                random_state=current_random_state,
+                n_init=10
+            )
+            self.kmeans.fit(features_scaled)
+
+            if attempt == 0:
+                print(f"  K-Means fitted (inertia={self.kmeans.inertia_:.2f})")
+
+            # Créer et initialiser le HMM
+            self.hmm = GMMHMM(
+                n_components=self.n_components,
+                n_mix=self.n_mix,
+                covariance_type='diag',
+                n_iter=self.n_iter,
+                random_state=current_random_state,
+                init_params='stc',
+                min_covar=1e-3,
+            )
+            self.hmm._init(features_scaled, None)
+
+            # Injecter les centres K-Means
+            kmeans_centers = self.kmeans.cluster_centers_
+            np.random.seed(current_random_state)
+            for i in range(self.n_components):
+                for j in range(self.n_mix):
+                    noise = np.random.normal(0, 0.1, size=kmeans_centers.shape[1])
+                    self.hmm.means_[i, j, :] = kmeans_centers[i] + noise
+
+            # Fit HMM
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.hmm.fit(features_scaled)
+
+            # Fix NaN in startprob_
+            if np.any(np.isnan(self.hmm.startprob_)):
+                self.hmm.startprob_ = np.ones(self.n_components) / self.n_components
+
+            # Prédire et valider
+            try:
+                proba = self.hmm.predict_proba(features_scaled)
+            except ValueError:
+                proba = np.ones((len(features_scaled), self.n_components)) / self.n_components
+
+            quality = self._validate_hmm_quality(proba, real_log_returns)
+
+            # Log la qualité
+            if attempt == 0 or quality['n_active_states'] > (best_quality['n_active_states'] if best_quality else 0):
+                best_quality = quality
+                best_hmm = self.hmm
+                best_proba = proba
+
+            print(f"  [Attempt {attempt+1}/{MAX_RETRIES}] n_active_states={quality['n_active_states']}, "
+                  f"separation={quality['separation_score']*100:.4f}%, valid={quality['is_valid']}")
+
+            if quality['is_valid']:
+                break
+
+        # Utiliser le meilleur résultat
+        self.hmm = best_hmm
+        proba = best_proba
+
+        if not best_quality['is_valid']:
+            print(f"  [WARNING] HMM quality insufficient after {MAX_RETRIES} attempts. "
+                  f"Best: {best_quality['n_active_states']} active states.")
 
         self._is_fitted = True
         print(f"  HMM converged: {self.hmm.monitor_.converged}")
@@ -310,21 +436,9 @@ class RegimeDetector:
         # 6. Compute stats for debug
         self._compute_state_stats()
 
-        # 7. Prédire les probabilités brutes
-        try:
-            proba = self.hmm.predict_proba(features_scaled)
-        except ValueError as e:
-            print(f"  [WARNING] HMM predict_proba failed: {e}")
-            print(f"  [FALLBACK] Using uniform probabilities")
-            proba = np.ones((len(features_scaled), self.n_components)) / self.n_components
-
-        # 8. Smart Sorting: calculer mean_return par état et trier
+        # 7. Smart Sorting: calculer mean_return par état et trier
         #    Évite le Label Switching entre réentraînements
-        #    Utilise les vrais log returns depuis BTC_Close (non scalés)
-        btc_close = df_result.loc[df_result.index[valid_mask], 'BTC_Close'].values
-        real_log_returns = np.zeros(len(btc_close))
-        real_log_returns[1:] = np.log(btc_close[1:] / btc_close[:-1])
-
+        #    Note: proba et real_log_returns déjà calculés dans la boucle de retry
         state_returns = []
         for state in range(self.n_components):
             # État dominant pour chaque sample
