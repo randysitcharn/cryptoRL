@@ -101,6 +101,10 @@ class TQCTrainingConfig:
     risk_cooldown: int = 12
     risk_augment_obs: bool = False
 
+    # --- Parallelization (P0 Optimization) ---
+    n_envs: int = 4  # Number of parallel training envs (SubprocVecEnv)
+                     # Set to 1 to disable (use DummyVecEnv)
+
 
 # =============================================================================
 # Hyperparameter Tuning Configuration

@@ -14,10 +14,11 @@ import re
 import glob
 
 from sb3_contrib import TQC
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 import torch
+from functools import partial
 
 # CUDA Optimization: Auto-tune convolutions for repeated input sizes
 torch.backends.cudnn.benchmark = True
@@ -103,44 +104,130 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
     )
 
 
-def create_environments(config: TrainingConfig):
+def _make_train_env(
+    parquet_path: str,
+    window_size: int,
+    commission: float,
+    episode_length: int,
+    reward_scaling: float,
+    downside_coef: float,
+    upside_coef: float,
+    action_discretization: int,
+    churn_coef: float,
+    smooth_coef: float,
+    target_volatility: float,
+    vol_window: int,
+    max_leverage: float,
+    price_column: str,
+    seed: int,
+):
+    """
+    Factory function for creating training environments (SubprocVecEnv compatible).
+
+    Must be at module level (not nested) to be picklable for multiprocessing.
+    Each subprocess will call this to create its own environment instance.
+    """
+    env = CryptoTradingEnv(
+        parquet_path=parquet_path,
+        window_size=window_size,
+        commission=commission,
+        episode_length=episode_length,
+        reward_scaling=reward_scaling,
+        downside_coef=downside_coef,
+        upside_coef=upside_coef,
+        action_discretization=action_discretization,
+        churn_coef=churn_coef,
+        smooth_coef=smooth_coef,
+        random_start=True,  # Always random for training
+        target_volatility=target_volatility,
+        vol_window=vol_window,
+        max_leverage=max_leverage,
+        price_column=price_column,
+    )
+    # Set seed for reproducibility across parallel envs
+    env.reset(seed=seed)
+    return Monitor(env)
+
+
+def create_environments(config: TrainingConfig, n_envs: int = 1):
     """
     Create training and evaluation environments.
 
     Args:
         config: Training configuration.
+        n_envs: Number of parallel training environments (P0 optimization).
+                Use n_envs > 1 for SubprocVecEnv parallelization (2-4x speedup).
+                Note: n_envs > 1 requires use_curriculum=False.
 
     Returns:
         Tuple of (train_vec_env, eval_vec_env).
     """
+    from src.config import SEED
+
     # Curriculum Learning: start with 0 fees/smoothness if enabled
     if config.use_curriculum:
         initial_commission = 0.0
         initial_smooth = 0.0
+        # SubprocVecEnv incompatible with curriculum (can't modify env in subprocess)
+        if n_envs > 1:
+            print("      [WARNING] Curriculum learning incompatible with SubprocVecEnv.")
+            print("      [WARNING] Falling back to n_envs=1 (DummyVecEnv).")
+            n_envs = 1
     else:
         initial_commission = config.commission
         initial_smooth = config.smooth_coef
 
-    # Create training environment (full training dataset)
-    train_env = CryptoTradingEnv(
-        parquet_path=config.data_path,
-        window_size=config.window_size,
-        commission=initial_commission,
-        episode_length=config.episode_length,
-        reward_scaling=config.reward_scaling,
-        downside_coef=config.downside_coef,
-        upside_coef=config.upside_coef,
-        action_discretization=config.action_discretization,
-        churn_coef=config.churn_coef,
-        smooth_coef=initial_smooth,
-        random_start=True,
-        target_volatility=config.target_volatility,
-        vol_window=config.vol_window,
-        max_leverage=config.max_leverage,
-        price_column='BTC_Close',
-    )
+    # ==================== Training Environment(s) ====================
+    if n_envs > 1:
+        # P0 Optimization: SubprocVecEnv for true parallelization
+        # Each subprocess creates its own environment independently
+        print(f"      [P0] Creating {n_envs} parallel training environments (SubprocVecEnv)...")
 
-    # Create eval environment (separate eval dataset, 1 month)
+        env_fns = [
+            partial(
+                _make_train_env,
+                parquet_path=config.data_path,
+                window_size=config.window_size,
+                commission=initial_commission,
+                episode_length=config.episode_length,
+                reward_scaling=config.reward_scaling,
+                downside_coef=config.downside_coef,
+                upside_coef=config.upside_coef,
+                action_discretization=config.action_discretization,
+                churn_coef=config.churn_coef,
+                smooth_coef=initial_smooth,
+                target_volatility=config.target_volatility,
+                vol_window=config.vol_window,
+                max_leverage=config.max_leverage,
+                price_column='BTC_Close',
+                seed=SEED + i,  # Different seed per env for diversity
+            )
+            for i in range(n_envs)
+        ]
+        train_vec_env = SubprocVecEnv(env_fns, start_method='spawn')
+    else:
+        # Single environment (DummyVecEnv) - legacy path
+        train_env = CryptoTradingEnv(
+            parquet_path=config.data_path,
+            window_size=config.window_size,
+            commission=initial_commission,
+            episode_length=config.episode_length,
+            reward_scaling=config.reward_scaling,
+            downside_coef=config.downside_coef,
+            upside_coef=config.upside_coef,
+            action_discretization=config.action_discretization,
+            churn_coef=config.churn_coef,
+            smooth_coef=initial_smooth,
+            random_start=True,
+            target_volatility=config.target_volatility,
+            vol_window=config.vol_window,
+            max_leverage=config.max_leverage,
+            price_column='BTC_Close',
+        )
+        train_env_monitored = Monitor(train_env)
+        train_vec_env = DummyVecEnv([lambda: train_env_monitored])
+
+    # ==================== Eval Environment (always single) ====================
     # Note: Eval env uses target values (no curriculum) for consistent evaluation
     val_env = CryptoTradingEnv(
         parquet_path=config.eval_data_path,
@@ -176,12 +263,7 @@ def create_environments(config: TrainingConfig):
         # Calibrate baseline volatility
         val_env.calibrate_baseline(n_steps=2000)
 
-    # Wrap in Monitor for episode tracking
-    train_env_monitored = Monitor(train_env)
     val_env_monitored = Monitor(val_env)
-
-    # Vectorize for SB3
-    train_vec_env = DummyVecEnv([lambda: train_env_monitored])
     eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
 
     return train_vec_env, eval_vec_env
@@ -268,7 +350,8 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
 
     # ==================== Environment Setup ====================
     print("\n[1/4] Creating environments...")
-    train_env, eval_env = create_environments(config)
+    n_envs = getattr(config, 'n_envs', 1)  # Default to 1 for backward compatibility
+    train_env, eval_env = create_environments(config, n_envs=n_envs)
 
     obs_shape = train_env.observation_space.shape
     print(f"      Observation space: {obs_shape}")

@@ -441,6 +441,10 @@ class WFOPipeline:
         config.vol_window = self.config.vol_window
         config.max_leverage = self.config.max_leverage
 
+        # P0 Optimization: SubprocVecEnv for 2-4x speedup
+        config.use_curriculum = False  # Required for SubprocVecEnv
+        config.n_envs = 4  # Parallel training environments
+
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
         config.save_path = os.path.join(weights_dir, "tqc.zip")
