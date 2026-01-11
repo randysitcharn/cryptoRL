@@ -33,7 +33,7 @@ class RegimeDetector:
     """
     Détecteur de régimes de marché via GMM-HMM avec K-Means Warm Start.
 
-    Approche SOTA avec Leading Indicators:
+    Approche SOTA avec Leading Indicators + Archetype Alignment:
     1. Features dédiées au HMM (6 features):
        - HMM_Trend: Moyenne glissante 168h des Log-Returns
        - HMM_Vol: Volatilité Parkinson rolling 168h
@@ -44,10 +44,12 @@ class RegimeDetector:
 
     2. Initialisation K-Means pour garantir des clusters séparés
 
-    3. Mapping force brute basé sur means_[Trend]:
-       - BULL: état avec Trend la plus élevée
-       - BEAR: état avec Trend la plus faible
-       - RANGE: état intermédiaire
+    3. Archetype Alignment via Hungarian Algorithm:
+       - Prob_0 = Crash (-5%/h, 4% vol) - ABSOLU
+       - Prob_1 = Downtrend (-0.1%/h, 1.5% vol)
+       - Prob_2 = Range (0%, 0.5% vol)
+       - Prob_3 = Uptrend (+0.15%/h, 2% vol)
+       - Résout le problème de "Semantic Drift" entre segments WFO
     """
 
     # Features dédiées au HMM (calculées en interne)
@@ -58,6 +60,16 @@ class RegimeDetector:
         'HMM_RiskOnOff',    # SPX - DXY (risk-on/off signal)
         'HMM_VolRatio',     # Vol court/long (early warning)
     ]
+
+    # Archétypes fixes basés sur connaissance métier BTC (hourly data)
+    # Utilisés pour aligner les états HMM de manière absolue via Hungarian Algorithm
+    # Résout le problème de "Semantic Drift" entre segments WFO
+    STATE_ARCHETYPES = {
+        0: {'name': 'Crash',     'mean_ret': -0.0050, 'mean_vol': 0.040},  # -5%/h, 4% vol
+        1: {'name': 'Downtrend', 'mean_ret': -0.0010, 'mean_vol': 0.015},  # -0.1%/h, 1.5% vol
+        2: {'name': 'Range',     'mean_ret':  0.0000, 'mean_vol': 0.005},  # Plat, 0.5% vol
+        3: {'name': 'Uptrend',   'mean_ret':  0.0015, 'mean_vol': 0.020},  # +0.15%/h, 2% vol
+    }
 
     # Fenêtre de lissage (1 semaine en heures)
     SMOOTHING_WINDOW = 168
@@ -245,6 +257,71 @@ class RegimeDetector:
                 'momentum_mean': self.hmm.means_[state, :, 2].mean()
             }
 
+    def align_to_archetypes(self) -> np.ndarray:
+        """
+        Aligne les états HMM trouvés vers les archétypes fixes via Hungarian Algorithm.
+
+        IMPORTANT: Les HMM means sont en espace scalé (z-scores).
+        On utilise inverse_transform pour revenir en espace brut avant comparaison.
+
+        Résout le problème de "Semantic Drift" entre segments WFO:
+        - Prob_0 signifie TOUJOURS "situation type Crash" (-5%/h, haute vol)
+        - Prob_3 signifie TOUJOURS "situation type Uptrend" (+0.15%/h)
+
+        Returns:
+            np.ndarray: Mapping [archetype_idx -> hmm_state_idx]
+        """
+        from scipy.optimize import linear_sum_assignment
+        from scipy.spatial.distance import cdist
+
+        if not self._is_fitted:
+            raise RuntimeError("HMM not fitted")
+
+        n = self.n_components
+        n_features = len(self.HMM_FEATURES)
+
+        # 1. Extraire les means scalés de chaque état HMM
+        # means_ shape: (n_states, n_mix, n_features)
+        # On prend la moyenne des mixtures
+        scaled_means = np.zeros((n, n_features))
+        for state in range(n):
+            scaled_means[state, :] = self.hmm.means_[state, :, :].mean(axis=0)
+
+        # 2. INVERSE TRANSFORM: convertir de z-scores vers valeurs brutes
+        # Utilise le scaler déjà fitté sur les données d'entraînement
+        raw_means = self.scaler.inverse_transform(scaled_means)
+
+        # 3. Extraire [trend, vol] pour chaque état (features 0 et 1)
+        current_features = raw_means[:, :2]  # [HMM_Trend, HMM_Vol]
+
+        # 4. Construire la matrice des archétypes (valeurs brutes)
+        archetype_features = np.array([
+            [self.STATE_ARCHETYPES[i]['mean_ret'], self.STATE_ARCHETYPES[i]['mean_vol']]
+            for i in range(n)
+        ])
+
+        # 5. Calculer la matrice de distances
+        # Pondérer vol plus fort car c'est plus discriminant
+        weights = np.array([1.0, 2.0])  # [ret_weight, vol_weight]
+        weighted_current = current_features * weights
+        weighted_archetypes = archetype_features * weights
+
+        cost_matrix = cdist(weighted_archetypes, weighted_current, metric='euclidean')
+
+        # 6. Hungarian Algorithm pour appariement optimal
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        # Debug: afficher le mapping trouvé
+        print("  Archetype Alignment (raw space, inverse transformed):")
+        for i in range(n):
+            matched_state = col_ind[i]
+            dist = cost_matrix[i, matched_state]
+            print(f"    {self.STATE_ARCHETYPES[i]['name']:10s} -> State {matched_state} "
+                  f"(dist={dist:.6f}, trend={current_features[matched_state, 0]:.6f}, "
+                  f"vol={current_features[matched_state, 1]:.5f})")
+
+        return col_ind
+
     def _validate_hmm_quality(
         self,
         proba: np.ndarray,
@@ -316,8 +393,8 @@ class RegimeDetector:
         1. Calcul des features HMM dédiées (168h smoothing)
         2. K-Means warm start
         3. Fit HMM
-        4. Smart Sorting: trier les états par mean_return (du pire au meilleur)
-        5. Création des colonnes Prob_0, Prob_1, Prob_2, Prob_3
+        4. Archetype Alignment: aligner états sur archétypes fixes via Hungarian Algorithm
+        5. Création des colonnes Prob_0 (Crash), Prob_1 (Downtrend), Prob_2 (Range), Prob_3 (Uptrend)
 
         Args:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Fracdiff.
@@ -473,31 +550,25 @@ class RegimeDetector:
         # 6. Compute stats for debug
         self._compute_state_stats()
 
-        # 7. Smart Sorting: calculer mean_return par état et trier
-        #    Évite le Label Switching entre réentraînements
-        #    Note: proba et real_log_returns déjà calculés dans la boucle de retry
+        # 7. Archetype-Based Alignment (remplace Smart Sorting)
+        #    Utilise Hungarian Algorithm pour aligner les états sur des archétypes fixes
+        #    Résout le problème de "Semantic Drift" entre segments WFO
+        #    Prob_0 = Crash, Prob_1 = Downtrend, Prob_2 = Range, Prob_3 = Uptrend (ABSOLU)
+        self.sorted_indices = self.align_to_archetypes()
+
+        # Calculer les mean_returns réels pour TensorBoard (info seulement)
         state_returns = []
-        for state in range(self.n_components):
-            # État dominant pour chaque sample
-            dominant = proba.argmax(axis=1)
-            state_mask = dominant == state
+        dominant = proba.argmax(axis=1)
+        for i in range(self.n_components):
+            hmm_state = self.sorted_indices[i]
+            state_mask = dominant == hmm_state
             if state_mask.sum() > 0:
                 mean_ret = real_log_returns[state_mask].mean()
             else:
                 mean_ret = 0.0
-            state_returns.append((state, mean_ret))
+            state_returns.append((hmm_state, mean_ret))
 
-        # Trier par mean_return (du pire au meilleur)
-        # Prob_0 = Crash, Prob_1 = Downtrend, Prob_2 = Range, Prob_3 = Uptrend
-        state_returns.sort(key=lambda x: x[1])
-        self.sorted_indices = np.array([s[0] for s in state_returns])
-
-        print("  Smart Sorting (by real BTC log return, worst to best):")
-        regime_labels = ['Crash', 'Downtrend', 'Range', 'Uptrend'][:self.n_components]
-        for i, (state, mean_ret) in enumerate(state_returns):
-            label = regime_labels[i] if i < len(regime_labels) else f"State{i}"
-            annual_ret = mean_ret * 24 * 365 * 100  # Annualized %
-            print(f"    Prob_{i} ({label}): HMM_State {state} (mean_ret={mean_ret*100:.4f}%/h, {annual_ret:+.1f}%/yr)")
+        print(f"  Final mapping: Prob_i -> HMM_State {self.sorted_indices.tolist()}")
 
         # 9. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées)
         col_names = [f'Prob_{i}' for i in range(self.n_components)]
