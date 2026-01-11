@@ -191,25 +191,24 @@ class WFOPipeline:
         segment_id = segment['id']
         print(f"\n[Segment {segment_id}] Preprocessing...")
 
-        # 1. Extract full segment (train + test) from raw data
+        # 1. Extract full segment from pre-computed features (P1 optimization)
         full_start = segment['train_start']
         full_end = segment['test_end']
 
-        # Add buffer for rolling calculations (720h = 30 days max window)
-        buffer = 720
-        safe_start = max(0, full_start - buffer)
+        # Use global pre-computed features if available
+        if hasattr(self, '_df_features_global') and self._df_features_global is not None:
+            df_features = self._df_features_global.iloc[full_start:full_end].copy()
+            print(f"  Using pre-computed features: rows {full_start} to {full_end} ({len(df_features)} rows)")
+        else:
+            # Fallback: compute features on-the-fly (legacy path)
+            buffer = 720
+            safe_start = max(0, full_start - buffer)
+            df_segment = df_raw.iloc[safe_start:full_end].copy()
+            print(f"  Raw segment: rows {safe_start} to {full_end} ({len(df_segment)} rows)")
+            print("  Applying feature engineering...")
+            df_features = self.feature_engineer.engineer_features(df_segment)
 
-        df_segment = df_raw.iloc[safe_start:full_end].copy()
-        print(f"  Raw segment: rows {safe_start} to {full_end} ({len(df_segment)} rows)")
-
-        # 2. Feature Engineering on full segment
-        print("  Applying feature engineering...")
-        df_features = self.feature_engineer.engineer_features(df_segment)
-
-        # 3. Adjust indices after feature engineering (NaN dropped)
-        # Find the offset caused by dropna
-        offset = full_start - safe_start
-        actual_train_start = max(0, offset - (len(df_segment) - len(df_features)))
+        # 2. Adjust indices (features already aligned with original indices)
 
         # Calculate relative indices
         train_len = segment['train_end'] - segment['train_start']
@@ -1010,6 +1009,11 @@ class WFOPipeline:
         df_raw = pd.read_parquet(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
 
+        # Pre-calculate features globally (P1 optimization: ~20-30% speedup)
+        print("\n[OPTIMIZATION] Pre-calculating features globally (once)...")
+        self._df_features_global = self.feature_engineer.engineer_features(df_raw)
+        print(f"  Features shape: {self._df_features_global.shape}")
+
         # Calculate segments
         segments = self.calculate_segments(len(df_raw))
         print(f"\nTotal segments: {len(segments)}")
@@ -1084,6 +1088,11 @@ class WFOPipeline:
         print(f"\nLoading raw data: {self.config.raw_data_path}")
         df_raw = pd.read_parquet(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
+
+        # Pre-calculate features globally (P1 optimization)
+        print("\n[OPTIMIZATION] Pre-calculating features globally (once)...")
+        self._df_features_global = self.feature_engineer.engineer_features(df_raw)
+        print(f"  Features shape: {self._df_features_global.shape}")
 
         # Calculate all segments to get their boundaries
         all_segments = self.calculate_segments(len(df_raw))

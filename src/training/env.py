@@ -212,6 +212,8 @@ class CryptoTradingEnv(gym.Env):
         self.returns_for_vol: List[float] = []  # Separate buffer for vol calculation
         self.current_volatility: float = self.target_volatility  # Init to target
         self.vol_scalar: float = 1.0
+        # EMA variance for O(1) volatility calculation (instead of O(window) np.std)
+        self._ema_var: float = self.target_volatility ** 2
 
     def _get_price(self, step: Optional[int] = None) -> float:
         """Get price at given step (default: current step)."""
@@ -224,16 +226,26 @@ class CryptoTradingEnv(gym.Env):
         return self.cash + self.position * price
 
     def _calculate_volatility(self) -> float:
-        """Calculate rolling volatility of returns for position scaling."""
+        """
+        Calculate rolling volatility using EMA variance (O(1) per step).
+
+        Much faster than np.std() which is O(vol_window) per step.
+        EMA formula: var_t = alpha * r_t^2 + (1-alpha) * var_{t-1}
+        """
         if len(self.returns_for_vol) < 2:
             return self.target_volatility  # Default when not enough data
 
-        # Use last vol_window returns
-        recent_returns = self.returns_for_vol[-self.vol_window:]
-        vol = np.std(recent_returns)
+        # EMA alpha based on vol_window (equivalent span)
+        alpha = 2.0 / (self.vol_window + 1)
 
-        # Safety: avoid division by zero
-        return max(vol, 1e-6)
+        # Get latest return
+        ret = self.returns_for_vol[-1]
+
+        # Update EMA variance: var_t = alpha * r^2 + (1-alpha) * var_{t-1}
+        self._ema_var = alpha * (ret ** 2) + (1.0 - alpha) * self._ema_var
+
+        # Return standard deviation (sqrt of variance)
+        return max(np.sqrt(self._ema_var), 1e-6)
 
     def _calculate_reward(self) -> float:
         """
@@ -421,10 +433,11 @@ class CryptoTradingEnv(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def _get_observation(self) -> np.ndarray:
-        """Get current observation window."""
+        """Get current observation window (view, no copy for performance)."""
         start_idx = self.current_step - self.window_size + 1
         end_idx = self.current_step + 1
-        return self.data[start_idx:end_idx].copy()
+        # Return view instead of copy - SB3 doesn't modify observations
+        return self.data[start_idx:end_idx]
 
     def _get_info(
         self,
