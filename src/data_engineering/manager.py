@@ -79,7 +79,8 @@ class RegimeDetector:
         n_components: int = 4,
         n_mix: int = 2,
         n_iter: int = 200,
-        random_state: int = 42
+        random_state: int = 42,
+        transition_penalty: float = 0.1
     ):
         """
         Initialise le détecteur de régimes.
@@ -89,11 +90,15 @@ class RegimeDetector:
             n_mix: Nombre de composantes du mélange gaussien.
             n_iter: Nombre d'itérations pour l'algorithme EM.
             random_state: Graine pour reproductibilité.
+            transition_penalty: Pénalité pour transitions (0-1). Plus élevé = plus sticky.
+                               Inspiré des Statistical Jump Models (Shu et al., 2024).
+                               Default 0.1 = +10% probabilité de rester dans le même état.
         """
         self.n_components = n_components
         self.n_mix = n_mix
         self.n_iter = n_iter
         self.random_state = random_state
+        self.transition_penalty = transition_penalty
 
         # Modèle HMM
         self.hmm: Optional[GMMHMM] = None
@@ -256,6 +261,43 @@ class RegimeDetector:
                 'vol_mean': self.hmm.means_[state, :, 1].mean(),
                 'momentum_mean': self.hmm.means_[state, :, 2].mean()
             }
+
+    def _apply_transition_penalty(self) -> None:
+        """
+        Applique une pénalité de transition pour améliorer la persistence des régimes.
+
+        Inspiré des Statistical Jump Models (Shu et al., 2024) qui montrent que
+        la persistence explicite améliore le Sharpe ratio et réduit le drawdown.
+
+        Formule: A_sticky = A * (1 - penalty) + I * penalty
+
+        Effet: Augmente la probabilité de rester dans le même état (diagonale).
+        Avec penalty=0.1: diagonale +10%, off-diagonale -10% proportionnellement.
+        """
+        if self.transition_penalty <= 0:
+            return
+
+        n = self.n_components
+        penalty = min(self.transition_penalty, 0.5)  # Cap à 50% pour éviter HMM dégénéré
+
+        # Récupérer la matrice de transition originale
+        A = self.hmm.transmat_.copy()
+
+        # Appliquer la pénalité: plus de poids sur la diagonale
+        I = np.eye(n)
+        A_sticky = A * (1.0 - penalty) + I * penalty
+
+        # Renormaliser les lignes pour que chaque ligne somme à 1
+        A_sticky = A_sticky / A_sticky.sum(axis=1, keepdims=True)
+
+        # Remplacer dans le HMM
+        self.hmm.transmat_ = A_sticky
+
+        # Log le changement
+        diag_before = np.diag(A).mean()
+        diag_after = np.diag(A_sticky).mean()
+        print(f"  Transition Penalty applied (penalty={penalty:.2f}): "
+              f"diag_avg {diag_before:.3f} -> {diag_after:.3f}")
 
     def align_to_archetypes(self) -> np.ndarray:
         """
@@ -521,6 +563,10 @@ class RegimeDetector:
         self._is_fitted = True
         print(f"  HMM converged: {self.hmm.monitor_.converged}")
 
+        # 5. Apply transition penalty for better regime persistence (Sticky HMM)
+        #    Inspired by Statistical Jump Models (Shu et al., 2024)
+        self._apply_transition_penalty()
+
         # Log HMM convergence to TensorBoard
         if writer:
             history = self.hmm.monitor_.history
@@ -546,6 +592,11 @@ class RegimeDetector:
             transmat = self.hmm.transmat_
             entropy = -np.sum(transmat * np.log(transmat + 1e-10)) / self.n_components
             writer.add_scalar("hmm/final/transmat_entropy", entropy, segment_id)
+
+            # 5. Transition penalty metrics (Sticky HMM)
+            diag_avg = np.diag(transmat).mean()
+            writer.add_scalar("hmm/final/transmat_diag_avg", diag_avg, segment_id)
+            writer.add_scalar("hmm/final/transition_penalty", self.transition_penalty, segment_id)
 
         # 6. Compute stats for debug
         self._compute_state_stats()
@@ -673,7 +724,8 @@ class RegimeDetector:
             'n_components': self.n_components,
             'n_mix': self.n_mix,
             'state_stats': self.state_stats,
-            'sorted_indices': self.sorted_indices,  # Smart Sorting mapping
+            'sorted_indices': self.sorted_indices,  # Archetype Alignment mapping
+            'transition_penalty': self.transition_penalty,  # Sticky HMM param
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
@@ -696,18 +748,20 @@ class RegimeDetector:
 
         detector = cls(
             n_components=data['n_components'],
-            n_mix=data['n_mix']
+            n_mix=data['n_mix'],
+            transition_penalty=data.get('transition_penalty', 0.0)  # Backwards compat
         )
         detector.hmm = data['hmm']
         detector.scaler = data['scaler']
         detector.kmeans = data['kmeans']
         detector.state_stats = data['state_stats']
-        detector.sorted_indices = data.get('sorted_indices')  # Smart Sorting mapping
+        detector.sorted_indices = data.get('sorted_indices')  # Archetype Alignment mapping
         detector._is_fitted = True
 
         print(f"[RegimeDetector] Loaded from {path}")
         if detector.sorted_indices is not None:
-            print(f"  sorted_indices: {detector.sorted_indices} (Bear, Range, Bull)")
+            print(f"  sorted_indices: {detector.sorted_indices} (Crash, Downtrend, Range, Uptrend)")
+        print(f"  transition_penalty: {detector.transition_penalty}")
         return detector
 
     def get_dominant_regime(self, df: pd.DataFrame) -> pd.Series:
