@@ -33,11 +33,14 @@ class RegimeDetector:
     """
     Détecteur de régimes de marché via GMM-HMM avec K-Means Warm Start.
 
-    Approche SOTA:
-    1. Features dédiées au HMM (lissées sur 168h = 1 semaine):
-       - HMM_Trend: Moyenne glissante des Log-Returns
-       - HMM_Vol: Volatilité Parkinson rolling
+    Approche SOTA avec Leading Indicators:
+    1. Features dédiées au HMM (6 features):
+       - HMM_Trend: Moyenne glissante 168h des Log-Returns
+       - HMM_Vol: Volatilité Parkinson rolling 168h
        - HMM_Momentum: RSI 14 normalisé [0, 1]
+       - HMM_Funding: Funding Rate 24h (leading indicator)
+       - HMM_RiskOnOff: SPX - DXY (risk-on/off signal)
+       - HMM_VolRatio: Vol court/long terme (early warning)
 
     2. Initialisation K-Means pour garantir des clusters séparés
 
@@ -48,7 +51,13 @@ class RegimeDetector:
     """
 
     # Features dédiées au HMM (calculées en interne)
-    HMM_FEATURES = ['HMM_Trend', 'HMM_Vol', 'HMM_Momentum']
+    # Quick Wins: +Funding, +RiskOnOff, +VolRatio pour anticipation régimes
+    HMM_FEATURES = [
+        'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
+        'HMM_Funding',      # Leading indicator (monte avant pumps)
+        'HMM_RiskOnOff',    # SPX - DXY (risk-on/off signal)
+        'HMM_VolRatio',     # Vol court/long (early warning)
+    ]
 
     # Fenêtre de lissage (1 semaine en heures)
     SMOOTHING_WINDOW = 168
@@ -133,12 +142,40 @@ class RegimeDetector:
         rsi = 100 - (100 / (1 + rs))
         df_result['HMM_Momentum'] = rsi / 100  # Normaliser [0, 1]
 
+        # 4. Funding Rate (leading indicator - monte avant pumps)
+        # Smooth sur 24h car c'est déjà un indicateur synthétique
+        if 'Funding_Rate' in df.columns:
+            df_result['HMM_Funding'] = df['Funding_Rate'].rolling(
+                window=24, min_periods=24
+            ).mean()
+        else:
+            df_result['HMM_Funding'] = 0.0
+
+        # 5. Risk-On/Off via SPX vs DXY
+        # SPX monte + DXY baisse = Risk-On (bon pour crypto)
+        # SPX baisse + DXY monte = Risk-Off (mauvais pour crypto)
+        spx_ret = df.get('SPX_LogRet', pd.Series(0, index=df.index))
+        dxy_ret = df.get('DXY_LogRet', pd.Series(0, index=df.index))
+        risk_signal = spx_ret - dxy_ret  # Positif = Risk-On
+        df_result['HMM_RiskOnOff'] = risk_signal.rolling(
+            window=self.SMOOTHING_WINDOW, min_periods=self.SMOOTHING_WINDOW
+        ).mean()
+
+        # 6. Vol Ratio (short-term / long-term) - early warning
+        # Ratio > 1 = volatilité en accélération = régime change imminent
+        vol_short = df['BTC_Parkinson'].rolling(window=24, min_periods=24).mean()
+        vol_long = df['BTC_Parkinson'].rolling(window=168, min_periods=168).mean()
+        df_result['HMM_VolRatio'] = vol_short / (vol_long + 1e-10)
+
         # Clip HMM features pour stabilité numérique
         df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-0.05, 0.05)  # ±5%/h max
         df_result['HMM_Vol'] = df_result['HMM_Vol'].clip(0, 0.2)  # Vol max 20%/h
         df_result['HMM_Momentum'] = df_result['HMM_Momentum'].clip(0, 1)  # RSI strict [0,1]
+        df_result['HMM_Funding'] = df_result['HMM_Funding'].clip(-0.005, 0.005)  # ±0.5%
+        df_result['HMM_RiskOnOff'] = df_result['HMM_RiskOnOff'].clip(-0.02, 0.02)  # ±2%
+        df_result['HMM_VolRatio'] = df_result['HMM_VolRatio'].clip(0.2, 5.0)  # Ratio [0.2x, 5x]
 
-        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, RSI on BTC_LogRet)")
+        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, 6 features: Trend/Vol/Mom/Funding/RiskOnOff/VolRatio)")
 
         return df_result
 
