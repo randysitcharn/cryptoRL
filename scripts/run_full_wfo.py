@@ -197,8 +197,9 @@ class WFOPipeline:
 
         # Use global pre-computed features if available
         if hasattr(self, '_df_features_global') and self._df_features_global is not None:
-            df_features = self._df_features_global.iloc[full_start:full_end].copy()
-            print(f"  Using pre-computed features: rows {full_start} to {full_end} ({len(df_features)} rows)")
+            # Use .loc[] to preserve index alignment (indices may have gaps from dropna)
+            df_features = self._df_features_global.loc[full_start:full_end-1].copy()
+            print(f"  Using pre-computed features: indices {full_start} to {full_end-1} ({len(df_features)} rows)")
         else:
             # Fallback: compute features on-the-fly (legacy path)
             buffer = 720
