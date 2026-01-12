@@ -12,7 +12,7 @@ Usage:
 import os
 import re
 import glob
-from multiprocessing import Value
+from multiprocessing import Manager
 from typing import Optional, Tuple
 
 from sb3_contrib import TQC
@@ -184,10 +184,12 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
         initial_commission = 0.0
         initial_smooth = 0.0
         # Create shared memory for SubprocVecEnv curriculum communication
+        # Use Manager().Value() instead of Value() because it's picklable
         if n_envs > 1:
-            shared_fee = Value('d', 0.0)    # 'd' = double (float64)
-            shared_smooth = Value('d', 0.0)
-            print("      [P0+Curriculum] Using shared memory for curriculum with SubprocVecEnv")
+            manager = Manager()
+            shared_fee = manager.Value('d', 0.0)
+            shared_smooth = manager.Value('d', 0.0)
+            print("      [P0+Curriculum] Using Manager shared memory for curriculum with SubprocVecEnv")
     else:
         initial_commission = config.commission
         initial_smooth = config.smooth_coef
