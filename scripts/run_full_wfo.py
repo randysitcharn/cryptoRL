@@ -197,9 +197,12 @@ class WFOPipeline:
 
         # Use global pre-computed features if available
         if hasattr(self, '_df_features_global') and self._df_features_global is not None:
-            # Use .loc[] to preserve index alignment (indices may have gaps from dropna)
-            df_features = self._df_features_global.loc[full_start:full_end-1].copy()
-            print(f"  Using pre-computed features: indices {full_start} to {full_end-1} ({len(df_features)} rows)")
+            # Convert integer positions to datetime using raw data's index
+            # This preserves alignment because features keep the original DatetimeIndex
+            start_time = df_raw.index[full_start]
+            end_time = df_raw.index[full_end - 1]  # -1 because .loc[] is inclusive
+            df_features = self._df_features_global.loc[start_time:end_time].copy()
+            print(f"  Using pre-computed features: {start_time} to {end_time} ({len(df_features)} rows)")
         else:
             # Fallback: compute features on-the-fly (legacy path)
             buffer = 720
