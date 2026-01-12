@@ -442,7 +442,8 @@ class WFOPipeline:
         config.max_leverage = self.config.max_leverage
 
         # P0 Optimization: SubprocVecEnv for 2-4x speedup
-        config.use_curriculum = False  # Required for SubprocVecEnv
+        # Curriculum now works with SubprocVecEnv via shared memory
+        config.use_curriculum = True
         config.n_envs = 4  # Parallel training environments
 
         # Set segment-specific paths
