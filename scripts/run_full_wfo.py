@@ -73,7 +73,7 @@ class WFOConfig:
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
-    smooth_coef: float = 0.07  # Smoothness penalty
+    smooth_coef: float = 0.01  # Smoothness penalty (reduced from 0.07)
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol
@@ -442,7 +442,7 @@ class WFOPipeline:
 
         # P0 Optimization: SubprocVecEnv for 2-4x speedup
         # Curriculum now works with SubprocVecEnv via shared memory
-        config.use_curriculum = True
+        config.use_curriculum = False  # Disabled: prevents churn learning
         config.n_envs = 4  # Parallel training environments
 
         # Set segment-specific paths

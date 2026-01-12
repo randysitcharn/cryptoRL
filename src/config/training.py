@@ -39,7 +39,7 @@ class TQCTrainingConfig:
     eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
 
     # Reward function
-    reward_scaling: float = 30.0
+    reward_scaling: float = 50.0  # Increased from 30 to amplify profit signal
     downside_coef: float = 10.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
