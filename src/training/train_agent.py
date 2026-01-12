@@ -12,6 +12,8 @@ Usage:
 import os
 import re
 import glob
+from multiprocessing import Value
+from typing import Optional, Tuple
 
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
@@ -120,12 +122,18 @@ def _make_train_env(
     max_leverage: float,
     price_column: str,
     seed: int,
+    shared_fee=None,
+    shared_smooth=None,
 ):
     """
     Factory function for creating training environments (SubprocVecEnv compatible).
 
     Must be at module level (not nested) to be picklable for multiprocessing.
     Each subprocess will call this to create its own environment instance.
+
+    Args:
+        shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
+        shared_smooth: Shared memory Value for curriculum smooth_coef (SubprocVecEnv).
     """
     env = CryptoTradingEnv(
         parquet_path=parquet_path,
@@ -143,6 +151,8 @@ def _make_train_env(
         vol_window=vol_window,
         max_leverage=max_leverage,
         price_column=price_column,
+        shared_fee=shared_fee,
+        shared_smooth=shared_smooth,
     )
     # Set seed for reproducibility across parallel envs
     env.reset(seed=seed)
@@ -157,22 +167,27 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
         config: Training configuration.
         n_envs: Number of parallel training environments (P0 optimization).
                 Use n_envs > 1 for SubprocVecEnv parallelization (2-4x speedup).
-                Note: n_envs > 1 requires use_curriculum=False.
+                Now compatible with curriculum learning via shared memory.
 
     Returns:
-        Tuple of (train_vec_env, eval_vec_env).
+        Tuple of (train_vec_env, eval_vec_env, shared_fee, shared_smooth).
+        shared_fee and shared_smooth are None if not using curriculum with SubprocVecEnv.
     """
     from src.config import SEED
+
+    # Shared memory for curriculum learning with SubprocVecEnv
+    shared_fee = None
+    shared_smooth = None
 
     # Curriculum Learning: start with 0 fees/smoothness if enabled
     if config.use_curriculum:
         initial_commission = 0.0
         initial_smooth = 0.0
-        # SubprocVecEnv incompatible with curriculum (can't modify env in subprocess)
+        # Create shared memory for SubprocVecEnv curriculum communication
         if n_envs > 1:
-            print("      [WARNING] Curriculum learning incompatible with SubprocVecEnv.")
-            print("      [WARNING] Falling back to n_envs=1 (DummyVecEnv).")
-            n_envs = 1
+            shared_fee = Value('d', 0.0)    # 'd' = double (float64)
+            shared_smooth = Value('d', 0.0)
+            print("      [P0+Curriculum] Using shared memory for curriculum with SubprocVecEnv")
     else:
         initial_commission = config.commission
         initial_smooth = config.smooth_coef
@@ -201,6 +216,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
                 max_leverage=config.max_leverage,
                 price_column='BTC_Close',
                 seed=SEED + i,  # Different seed per env for diversity
+                shared_fee=shared_fee,
+                shared_smooth=shared_smooth,
             )
             for i in range(n_envs)
         ]
@@ -266,16 +283,23 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
     val_env_monitored = Monitor(val_env)
     eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
 
-    return train_vec_env, eval_vec_env
+    return train_vec_env, eval_vec_env, shared_fee, shared_smooth
 
 
-def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTensorboardCallback]:
+def create_callbacks(
+    config: TrainingConfig,
+    eval_env,
+    shared_fee=None,
+    shared_smooth=None,
+) -> tuple[list, DetailTensorboardCallback]:
     """
     Create training callbacks.
 
     Args:
         config: Training configuration.
         eval_env: Evaluation environment.
+        shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
+        shared_smooth: Shared memory Value for curriculum smooth_coef (SubprocVecEnv).
 
     Returns:
         Tuple of (callbacks_list, detail_callback).
@@ -319,6 +343,8 @@ def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTens
             target_fee_rate=config.commission,
             target_smooth_coef=config.smooth_coef,
             warmup_steps=config.curriculum_warmup_steps,
+            shared_fee=shared_fee,
+            shared_smooth=shared_smooth,
             verbose=1
         )
         callbacks.append(curriculum_callback)
@@ -351,7 +377,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     # ==================== Environment Setup ====================
     print("\n[1/4] Creating environments...")
     n_envs = getattr(config, 'n_envs', 1)  # Default to 1 for backward compatibility
-    train_env, eval_env = create_environments(config, n_envs=n_envs)
+    train_env, eval_env, shared_fee, shared_smooth = create_environments(config, n_envs=n_envs)
 
     obs_shape = train_env.observation_space.shape
     print(f"      Observation space: {obs_shape}")
@@ -447,7 +473,9 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"      Checkpoint frequency: {config.checkpoint_freq:,}")
     print("\n" + "=" * 70)
 
-    callbacks, detail_callback = create_callbacks(config, eval_env)
+    callbacks, detail_callback = create_callbacks(
+        config, eval_env, shared_fee=shared_fee, shared_smooth=shared_smooth
+    )
 
     # reset_num_timesteps=False continues TensorBoard from previous run
     is_resume = config.load_model_path is not None

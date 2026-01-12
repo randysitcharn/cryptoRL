@@ -11,9 +11,13 @@ Provides all training-related callbacks:
 
 import os
 import numpy as np
+from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecEnv
+
+if TYPE_CHECKING:
+    from multiprocessing.sharedctypes import Synchronized
 
 
 # ============================================================================
@@ -357,10 +361,14 @@ class CurriculumFeesCallback(BaseCallback):
     This callback implements a curriculum learning strategy where transaction costs
     and smoothness penalties start at 0 and gradually increase to their target values.
 
+    Supports both DummyVecEnv (direct env access) and SubprocVecEnv (shared memory).
+
     Args:
         target_fee_rate: Target commission fee (e.g., 0.0006 = 0.06%).
         target_smooth_coef: Target smoothness penalty coefficient.
         warmup_steps: Number of steps to reach target values.
+        shared_fee: Shared memory Value for fee (SubprocVecEnv).
+        shared_smooth: Shared memory Value for smooth_coef (SubprocVecEnv).
         verbose: Verbosity level.
 
     Example:
@@ -376,12 +384,18 @@ class CurriculumFeesCallback(BaseCallback):
         target_fee_rate: float = 0.0006,
         target_smooth_coef: float = 1.0,
         warmup_steps: int = 50_000,
+        shared_fee: Optional["Synchronized"] = None,
+        shared_smooth: Optional["Synchronized"] = None,
         verbose: int = 0
     ):
         super().__init__(verbose)
         self.target_fee_rate = target_fee_rate
         self.target_smooth_coef = target_smooth_coef
         self.warmup_steps = warmup_steps
+
+        # Shared memory for SubprocVecEnv compatibility
+        self.shared_fee = shared_fee
+        self.shared_smooth = shared_smooth
 
         self.current_fee = 0.0
         self.current_smooth = 0.0
@@ -393,7 +407,16 @@ class CurriculumFeesCallback(BaseCallback):
         self.current_fee = progress * self.target_fee_rate
         self.current_smooth = progress * self.target_smooth_coef
 
-        self._update_envs()
+        # Update via shared memory (SubprocVecEnv) or direct access (DummyVecEnv)
+        if self.shared_fee is not None:
+            # Write to shared memory - subprocesses read this value
+            self.shared_fee.value = self.current_fee
+        if self.shared_smooth is not None:
+            self.shared_smooth.value = self.current_smooth
+
+        # Fallback for DummyVecEnv (no shared memory)
+        if self.shared_fee is None:
+            self._update_envs()
 
         self.logger.record("curriculum/fee_rate", self.current_fee)
         self.logger.record("curriculum/smooth_coef", self.current_smooth)

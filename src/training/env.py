@@ -10,7 +10,10 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from multiprocessing.sharedctypes import Synchronized
 
 from src.config import EXCLUDE_COLS
 
@@ -61,6 +64,9 @@ class CryptoTradingEnv(gym.Env):
         target_volatility: float = 0.01,  # 1% target vol (reduces position in high vol)
         vol_window: int = 24,  # Rolling window for vol calculation (24h)
         max_leverage: float = 5.0,  # Max scaling factor (caps position in low vol)
+        # Shared memory for curriculum learning (SubprocVecEnv compatible)
+        shared_fee: Optional["Synchronized"] = None,
+        shared_smooth: Optional["Synchronized"] = None,
     ):
         """
         Initialize the trading environment.
@@ -92,6 +98,10 @@ class CryptoTradingEnv(gym.Env):
         self.action_discretization = action_discretization
         self.churn_coef = churn_coef
         self.smooth_coef = smooth_coef
+
+        # Shared memory for curriculum learning (SubprocVecEnv compatible)
+        self.shared_fee = shared_fee
+        self.shared_smooth = shared_smooth
 
         # Volatility Scaling parameters
         self.target_volatility = target_volatility
@@ -225,6 +235,26 @@ class CryptoTradingEnv(gym.Env):
         price = self._get_price()
         return self.cash + self.position * price
 
+    def _get_commission(self) -> float:
+        """Get current commission (from shared memory or local).
+
+        For curriculum learning with SubprocVecEnv, reads from shared memory.
+        Falls back to local value if shared memory is not available.
+        """
+        if self.shared_fee is not None:
+            return self.shared_fee.value
+        return self.commission
+
+    def _get_smooth_coef(self) -> float:
+        """Get current smooth_coef (from shared memory or local).
+
+        For curriculum learning with SubprocVecEnv, reads from shared memory.
+        Falls back to local value if shared memory is not available.
+        """
+        if self.shared_smooth is not None:
+            return self.shared_smooth.value
+        return self.smooth_coef
+
     def _calculate_volatility(self) -> float:
         """
         Calculate rolling volatility using EMA variance (O(1) per step).
@@ -284,13 +314,14 @@ class CryptoTradingEnv(gym.Env):
             position_delta = abs(self.current_position_pct - self._prev_position_pct)
             if position_delta > 0 and self.churn_coef > 0:
                 # Coût estimé * Multiplicateur d'amplification
-                cost_rate = self.commission + self.slippage  # 0.07%
+                cost_rate = self._get_commission() + self.slippage  # 0.07%
                 churn_penalty = -position_delta * cost_rate * self.churn_coef
 
         # 6. Smoothness penalty - QUADRATIQUE (pénalise les changements brusques)
         smoothness_penalty = 0.0
-        if hasattr(self, '_prev_position_pct') and self.smooth_coef > 0:
-            smoothness_penalty = -self.smooth_coef * (position_delta ** 2)
+        current_smooth = self._get_smooth_coef()
+        if hasattr(self, '_prev_position_pct') and current_smooth > 0:
+            smoothness_penalty = -current_smooth * (position_delta ** 2)
 
         # 7. Total + Tanh scaling
         total_reward = reward_log_return + downside_penalty + upside_bonus + churn_penalty + smoothness_penalty
@@ -381,7 +412,7 @@ class CryptoTradingEnv(gym.Env):
             trade_value = abs(position_delta * old_price)
 
             # Calculate costs
-            trade_cost = trade_value * (self.commission + self.slippage)
+            trade_cost = trade_value * (self._get_commission() + self.slippage)
             self.total_commission += trade_cost
             self.total_trades += 1
 
