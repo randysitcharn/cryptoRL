@@ -223,7 +223,8 @@ class CryptoTradingEnv(gym.Env):
         self.current_volatility: float = self.target_volatility  # Init to target
         self.vol_scalar: float = 1.0
         # EMA variance for O(1) volatility calculation (instead of O(window) np.std)
-        self._ema_var: float = self.target_volatility ** 2
+        # Init to None - will be set from first actual return
+        self._ema_var: Optional[float] = None
 
     def _get_price(self, step: Optional[int] = None) -> float:
         """Get price at given step (default: current step)."""
@@ -272,7 +273,10 @@ class CryptoTradingEnv(gym.Env):
         ret = self.returns_for_vol[-1]
 
         # Update EMA variance: var_t = alpha * r^2 + (1-alpha) * var_{t-1}
-        self._ema_var = alpha * (ret ** 2) + (1.0 - alpha) * self._ema_var
+        if self._ema_var is None:
+            self._ema_var = ret ** 2  # Initialize from first return
+        else:
+            self._ema_var = alpha * (ret ** 2) + (1.0 - alpha) * self._ema_var
 
         # Return standard deviation (sqrt of variance)
         return max(np.sqrt(self._ema_var), 1e-6)
@@ -464,11 +468,11 @@ class CryptoTradingEnv(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def _get_observation(self) -> np.ndarray:
-        """Get current observation window (view, no copy for performance)."""
+        """Get current observation window."""
         start_idx = self.current_step - self.window_size + 1
         end_idx = self.current_step + 1
-        # Return view instead of copy - SB3 doesn't modify observations
-        return self.data[start_idx:end_idx]
+        # Must return copy - SB3's replay buffer may modify observations in-place
+        return self.data[start_idx:end_idx].copy()
 
     def _get_info(
         self,
