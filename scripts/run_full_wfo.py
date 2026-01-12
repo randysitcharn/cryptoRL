@@ -212,19 +212,13 @@ class WFOPipeline:
             print("  Applying feature engineering...")
             df_features = self.feature_engineer.engineer_features(df_segment)
 
-        # 2. Split train/test (take from END to get most recent valid data)
-        train_len = segment['train_end'] - segment['train_start']
-        test_len = segment['test_end'] - segment['test_start']
-        total_needed = train_len + test_len
+        # 2. Split by datetime to ensure correct alignment
+        # The features dataframe has DatetimeIndex, so we split using timestamps
+        train_end_time = df_raw.index[segment['train_end'] - 1]  # Last train timestamp
+        test_start_time = df_raw.index[segment['test_start']]    # First test timestamp
 
-        if len(df_features) < total_needed:
-            print(f"  [WARNING] Not enough data: {len(df_features)} < {total_needed}")
-            train_df = df_features.iloc[:train_len].copy()
-            test_df = df_features.iloc[train_len:].copy()
-        else:
-            # CRITICAL: Take from the END to match fallback behavior
-            train_df = df_features.iloc[-total_needed:-test_len].copy()
-            test_df = df_features.iloc[-test_len:].copy()
+        train_df = df_features.loc[:train_end_time].copy()
+        test_df = df_features.loc[test_start_time:].copy()
 
         print(f"  Train: {len(train_df)} rows, Test: {len(test_df)} rows")
 
