@@ -164,13 +164,22 @@ class CryptoTradingEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation space: (window_size, n_features)
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.window_size, self.n_features),
-            dtype=np.float32
-        )
+        # Observation space: Dict with market data and position
+        # This allows the agent to know its current position (critical for learning to hold)
+        self.observation_space = spaces.Dict({
+            "market": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(self.window_size, self.n_features),
+                dtype=np.float32
+            ),
+            "position": spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(1,),
+                dtype=np.float32
+            )
+        })
 
         # Initialize state
         self._reset_state()
@@ -289,9 +298,10 @@ class CryptoTradingEnv(gym.Env):
         1. Log return for optimal growth (Kelly criterion alignment)
         2. Sortino-style downside penalty (asymmetric risk)
         3. Symmetric upside bonus (reward positive returns)
+        4. Smoothness penalty (quadratic penalty on position changes)
 
         Returns:
-            Reward value in [-1.0, +1.0] (tanh scaled).
+            Reward value (linearly scaled, no tanh).
         """
         # 1. PnL proportionnel
         current_value = self._get_nav()
@@ -327,11 +337,11 @@ class CryptoTradingEnv(gym.Env):
         if hasattr(self, '_prev_position_pct') and current_smooth > 0:
             smoothness_penalty = -current_smooth * (position_delta ** 2)
 
-        # 7. Total + Tanh scaling
+        # 7. Total + Linear scaling (no tanh - allows gradient to flow)
         total_reward = reward_log_return + downside_penalty + upside_bonus + churn_penalty + smoothness_penalty
 
-        # Compute final scaled reward
-        scaled_reward = float(np.tanh(total_reward * self.reward_scaling))
+        # Compute final scaled reward (NO TANH - prevents vanishing gradient)
+        scaled_reward = float(total_reward * self.reward_scaling)
 
         # Store metrics for observability
         self.reward_metrics = {
@@ -467,12 +477,16 @@ class CryptoTradingEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    def _get_observation(self) -> np.ndarray:
-        """Get current observation window."""
+    def _get_observation(self) -> dict:
+        """Get current observation as dict with market data and position."""
         start_idx = self.current_step - self.window_size + 1
         end_idx = self.current_step + 1
         # Must return copy - SB3's replay buffer may modify observations in-place
-        return self.data[start_idx:end_idx].copy()
+        market_obs = self.data[start_idx:end_idx].copy()
+        return {
+            "market": market_obs,
+            "position": np.array([self.current_position_pct], dtype=np.float32)
+        }
 
     def _get_info(
         self,

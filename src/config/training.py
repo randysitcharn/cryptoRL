@@ -39,12 +39,12 @@ class TQCTrainingConfig:
     eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
 
     # Reward function
-    reward_scaling: float = 50.0  # Increased from 30 to amplify profit signal
+    reward_scaling: float = 1.0   # Reduced (no tanh saturation now)
     downside_coef: float = 10.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    churn_coef: float = 1.0  # Anti-churn penalty
-    smooth_coef: float = 0.1  # Smoothness penalty
+    churn_coef: float = 1.0       # Anti-churn penalty
+    smooth_coef: float = 0.0001   # Reduced 100x (was causing excessive penalty)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol

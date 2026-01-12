@@ -381,8 +381,15 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     n_envs = getattr(config, 'n_envs', 1)  # Default to 1 for backward compatibility
     train_env, eval_env, shared_fee, shared_smooth = create_environments(config, n_envs=n_envs)
 
-    obs_shape = train_env.observation_space.shape
-    print(f"      Observation space: {obs_shape}")
+    obs_space = train_env.observation_space
+    # Handle Dict observation space (market + position)
+    if hasattr(obs_space, 'spaces'):
+        market_shape = obs_space["market"].shape
+        pos_shape = obs_space["position"].shape
+        print(f"      Observation space: Dict(market={market_shape}, position={pos_shape})")
+    else:
+        market_shape = obs_space.shape
+        print(f"      Observation space: {market_shape}")
     print(f"      Action space: {train_env.action_space.shape}")
     print(f"      Device: {DEVICE}")
     print(f"      Volatility Scaling Active: Target={config.target_volatility}, Window={config.vol_window}")
@@ -394,7 +401,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"      Encoder: {config.encoder_path}")
     print(f"      Frozen: {config.freeze_encoder}")
     print(f"      Net arch: {config.net_arch}")
-    print(f"      features_dim: {obs_shape[0]} * {config.d_model} = {obs_shape[0] * config.d_model}")
+    print(f"      features_dim: {market_shape[0]} * {config.d_model} + 1(pos) = {market_shape[0] * config.d_model + 1}")
     print(f"      gSDE: {config.use_sde} (sample_freq={config.sde_sample_freq})")
 
     # ==================== Model Creation ====================
@@ -444,7 +451,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
         print("\n[3/4] Creating TQC model...")
 
         model = TQC(
-            policy="MlpPolicy",
+            policy="MultiInputPolicy",  # Dict obs space (market + position)
             env=train_env,
             learning_rate=linear_schedule(config.learning_rate),
             buffer_size=config.buffer_size,

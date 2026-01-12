@@ -72,8 +72,8 @@ class WFOConfig:
     batch_size: int = 512  # Larger batch for GPU utilization
     gamma: float = 0.95
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
-    churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
-    smooth_coef: float = 0.01  # Smoothness penalty (reduced from 0.07)
+    churn_coef: float = 0.0    # Disabled: smooth_coef handles position smoothing
+    smooth_coef: float = 0.0001  # Reduced 100x (position now visible, less penalty needed)
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol
