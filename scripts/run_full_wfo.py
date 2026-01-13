@@ -68,10 +68,11 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 300_000
+    tqc_timesteps: int = 50_000_000  # 50M steps per segment
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 3e-4
+    buffer_size: int = 2_500_000  # 2.5M replay buffer
     # batch_size: Auto-detected by HardwareManager (VRAM-based)
     # n_envs: Auto-detected by HardwareManager (CPU-based)
     gamma: float = 0.99    # Extended horizon ~100h (was 0.95 = 20h myopic)
@@ -443,7 +444,8 @@ class WFOPipeline:
         config.encoder_path = encoder_path
         config.total_timesteps = self.config.tqc_timesteps
         config.learning_rate = self.config.learning_rate
-        # batch_size, buffer_size, n_envs: Auto-detected by HardwareManager
+        config.buffer_size = self.config.buffer_size  # 2.5M replay buffer
+        # batch_size, n_envs: Auto-detected by HardwareManager
         config.gamma = self.config.gamma
         config.ent_coef = self.config.ent_coef
         config.churn_coef = self.config.churn_coef
