@@ -10,6 +10,7 @@ Provides all training-related callbacks:
 """
 
 import os
+import time
 import numpy as np
 from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
@@ -120,24 +121,40 @@ class TensorBoardStepCallback(BaseCallback):
                 if rewards is not None and len(rewards) > 0:
                     self.writer.add_scalar("rollout/reward", float(rewards[0]), step)
 
-            # Log environment info
+            # Log environment metrics (OPTIMIZED: use get_global_metrics for BatchCryptoEnv)
+            env = self.training_env
+            if hasattr(env, 'get_global_metrics'):
+                # BatchCryptoEnv path - direct GPU access
+                metrics = env.get_global_metrics()
+                self.writer.add_scalar("env/portfolio_value", metrics['portfolio_value'], step)
+                self.writer.add_scalar("env/price", metrics['price'], step)
+                self.writer.add_scalar("env/max_drawdown", metrics['max_drawdown'] * 100, step)
+            else:
+                # Fallback for SubprocVecEnv/DummyVecEnv - read from infos
+                if 'infos' in self.locals:
+                    infos = self.locals['infos']
+                    if infos is not None and len(infos) > 0:
+                        info = infos[0]
+                        if info is not None and isinstance(info, dict):
+                            if 'portfolio_value' in info:
+                                self.writer.add_scalar("env/portfolio_value", info['portfolio_value'], step)
+                            if 'price' in info:
+                                self.writer.add_scalar("env/price", info['price'], step)
+                            if 'max_drawdown' in info:
+                                self.writer.add_scalar("env/max_drawdown", info['max_drawdown'] * 100, step)
+
+            # Log episode info (still from infos - only present on done)
             if 'infos' in self.locals:
                 infos = self.locals['infos']
-                if infos is not None and len(infos) > 0:
-                    info = infos[0]
-                    if info is not None and isinstance(info, dict):
-                        if 'portfolio_value' in info:
-                            self.writer.add_scalar("env/portfolio_value", info['portfolio_value'], step)
-                        if 'price' in info:
-                            self.writer.add_scalar("env/price", info['price'], step)
-                        if 'max_drawdown' in info:
-                            self.writer.add_scalar("env/max_drawdown", info['max_drawdown'] * 100, step)
-                        if 'episode' in info:
+                if infos is not None:
+                    for info in infos:
+                        if info and 'episode' in info:
                             ep_info = info['episode']
                             if 'r' in ep_info:
                                 self.writer.add_scalar("rollout/ep_rew_mean", ep_info['r'], step)
                             if 'l' in ep_info:
                                 self.writer.add_scalar("rollout/ep_len_mean", ep_info['l'], step)
+                            break  # Only log first episode
 
             # Log training metrics
             if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
@@ -172,27 +189,36 @@ class StepLoggingCallback(BaseCallback):
         self.episode_lengths = []
         self.episode_trades = []
         self.last_episode_info = {}
+        # FPS tracking
+        self.last_time = None
+        self.last_step = 0
+
+    def _init_callback(self) -> None:
+        """Initialize FPS tracking at callback start."""
+        self.last_time = time.time()
+        self.last_step = 0
 
     def _on_step(self) -> bool:
-        # Collect episode info if available
+        # Collect episode info if available (only on done)
         if self.locals.get("infos"):
             for info in self.locals["infos"]:
-                if "episode" in info:
+                if info and "episode" in info:
                     ep_reward = info["episode"]["r"]
                     ep_length = info["episode"]["l"]
                     self.episode_rewards.append(ep_reward)
                     self.episode_lengths.append(ep_length)
-                    if "total_trades" in info:
-                        self.episode_trades.append(info["total_trades"])
                     self.last_episode_info = {"reward": ep_reward, "length": ep_length}
-
-                if "nav" in info:
-                    self.last_episode_info["nav"] = info["nav"]
-                if "position_pct" in info:
-                    self.last_episode_info["position"] = info["position_pct"]
 
         # Log every log_freq steps
         if self.num_timesteps % self.log_freq == 0:
+            # Get metrics from env (OPTIMIZED: use get_global_metrics for BatchCryptoEnv)
+            env = self.training_env
+            if hasattr(env, 'get_global_metrics'):
+                metrics = env.get_global_metrics()
+                self.last_episode_info["nav"] = metrics["portfolio_value"]
+                self.last_episode_info["position"] = metrics["position_pct"]
+                self.last_episode_info["max_drawdown"] = metrics["max_drawdown"]
+
             if self.episode_rewards:
                 mean_reward = np.mean(self.episode_rewards[-10:])
                 mean_length = np.mean(self.episode_lengths[-10:])
@@ -215,16 +241,31 @@ class StepLoggingCallback(BaseCallback):
 
             self.logger.dump(self.num_timesteps)
 
+            # Calculate FPS manually (fixes FPS=0 bug with BatchCryptoEnv)
+            current_time = time.time()
+            if self.last_time is not None:
+                dt = current_time - self.last_time
+                if dt > 0:
+                    fps = (self.num_timesteps - self.last_step) / dt
+                    self.logger.record("time/fps_live", fps)
+                else:
+                    fps = 0
+            else:
+                fps = 0
+            self.last_time = current_time
+            self.last_step = self.num_timesteps
+
             # Console log
-            fps = self.model.logger.name_to_value.get("time/fps", 0)
             nav = self.last_episode_info.get("nav", 0)
             pos = self.last_episode_info.get("position", 0)
+            max_dd = self.last_episode_info.get("max_drawdown", 0) * 100  # Convert to %
 
             print(f"Step {self.num_timesteps:>7} | "
                   f"Reward: {mean_reward:>8.2f} | "
                   f"NAV: {nav:>10.2f} | "
                   f"Pos: {pos:>+5.2f} | "
-                  f"FPS: {fps:>5.0f}")
+                  f"DD: {max_dd:>5.1f}% | "
+                  f"FPS: {fps:>7.0f}")
 
         return True
 
@@ -551,10 +592,20 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         return True
 
     def _update_envs(self):
-        """Update penalties on all environments (DummyVecEnv only)."""
+        """Update penalties on all environments (DummyVecEnv or BatchCryptoEnv)."""
         env = self.model.env
 
-        if isinstance(env, VecEnv):
+        # BatchCryptoEnv uses set_attr directly (GPU-vectorized, no envs list)
+        if hasattr(env, 'set_attr') and not hasattr(env, 'envs'):
+            try:
+                env.set_attr('smooth_coef', self.current_smooth)
+                env.set_attr('churn_coef', self.current_churn)
+                return
+            except NotImplementedError:
+                pass  # Fall through to DummyVecEnv path
+
+        # DummyVecEnv path - access individual environments
+        if isinstance(env, VecEnv) and hasattr(env, 'envs'):
             for i in range(env.num_envs):
                 base_env = env.envs[i]
                 while hasattr(base_env, 'env'):
