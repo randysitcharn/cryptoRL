@@ -52,6 +52,9 @@ class WFOConfig:
 
     # Data
     raw_data_path: str = "data/raw_training_data.parquet"
+
+    # GPU Acceleration
+    use_batch_env: bool = False  # Use BatchCryptoEnv for GPU-accelerated training
     output_dir: str = "data/wfo"
     models_dir: str = "models/wfo"
     weights_dir: str = "weights/wfo"
@@ -68,8 +71,9 @@ class WFOConfig:
     tqc_timesteps: int = 300_000
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
-    learning_rate: float = 9e-5
-    batch_size: int = 512  # Larger batch for GPU utilization
+    learning_rate: float = 3e-4
+    # batch_size: Auto-detected by HardwareManager (VRAM-based)
+    # n_envs: Auto-detected by HardwareManager (CPU-based)
     gamma: float = 0.99    # Extended horizon ~100h (was 0.95 = 20h myopic)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 1.0    # Aligned with commission (1.0 = exact cost)
@@ -411,15 +415,23 @@ class WFOPipeline:
         self,
         train_path: str,
         encoder_path: str,
-        segment_id: int
+        segment_id: int,
+        use_batch_env: bool = False
     ) -> tuple[str, Dict[str, Any]]:
         """
         Train TQC agent on segment train data.
 
+        Args:
+            train_path: Path to train data parquet.
+            encoder_path: Path to encoder weights.
+            segment_id: Segment identifier.
+            use_batch_env: If True, use GPU-accelerated BatchCryptoEnv.
+
         Returns:
             Tuple of (path to saved agent, training metrics dict).
         """
-        print(f"\n[Segment {segment_id}] Training TQC...")
+        env_type = "BatchCryptoEnv (GPU)" if use_batch_env else "SubprocVecEnv (CPU)"
+        print(f"\n[Segment {segment_id}] Training TQC with {env_type}...")
 
         # Import here to avoid circular imports
         import torch
@@ -431,7 +443,7 @@ class WFOPipeline:
         config.encoder_path = encoder_path
         config.total_timesteps = self.config.tqc_timesteps
         config.learning_rate = self.config.learning_rate
-        config.batch_size = self.config.batch_size
+        # batch_size, buffer_size, n_envs: Auto-detected by HardwareManager
         config.gamma = self.config.gamma
         config.ent_coef = self.config.ent_coef
         config.churn_coef = self.config.churn_coef
@@ -440,10 +452,8 @@ class WFOPipeline:
         config.vol_window = self.config.vol_window
         config.max_leverage = self.config.max_leverage
 
-        # P0 Optimization: SubprocVecEnv for 2-4x speedup
         # 3-Phase Curriculum: Discovery → Discipline → Refinement (Gemini 2026-01-13)
-        config.use_curriculum = True  # Re-enabled with 3-phase curriculum
-        config.n_envs = 4  # Parallel training environments
+        config.use_curriculum = True
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
@@ -460,7 +470,7 @@ class WFOPipeline:
         os.makedirs(config.tensorboard_log, exist_ok=True)
 
         # Train - now returns (model, train_metrics)
-        model, train_metrics = train(config)
+        model, train_metrics = train(config, use_batch_env=use_batch_env)
 
         print(f"  TQC trained. Saved: {config.save_path}")
 
@@ -660,10 +670,16 @@ class WFOPipeline:
     def run_segment(
         self,
         df_raw: pd.DataFrame,
-        segment: Dict[str, int]
+        segment: Dict[str, int],
+        use_batch_env: bool = False
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Run full WFO pipeline for a single segment.
+
+        Args:
+            df_raw: Raw DataFrame with OHLCV data.
+            segment: Segment boundaries dict.
+            use_batch_env: If True, use GPU-accelerated BatchCryptoEnv for TQC.
 
         Returns:
             Tuple of (metrics dict, train_metrics dict) for this segment.
@@ -694,7 +710,9 @@ class WFOPipeline:
         encoder_path = self.train_mae(train_path, segment_id)
 
         # 5. TQC Training
-        tqc_path, train_metrics = self.train_tqc(train_path, encoder_path, segment_id)
+        tqc_path, train_metrics = self.train_tqc(
+            train_path, encoder_path, segment_id, use_batch_env=use_batch_env
+        )
 
         # 6. Evaluation (skip context_rows in metrics)
         metrics, navs = self.evaluate_segment(
@@ -1007,6 +1025,7 @@ class WFOPipeline:
         print(f"  Test: {self.config.test_months} months ({self.config.test_rows} rows)")
         print(f"  Step: {self.config.step_months} months ({self.config.step_rows} rows)")
         print(f"  Volatility Scaling: Target={self.config.target_volatility}, Window={self.config.vol_window}")
+        print(f"  GPU Acceleration: {'BatchCryptoEnv' if self.config.use_batch_env else 'SubprocVecEnv (CPU)'}")
 
         # Load raw data
         print(f"\nLoading raw data: {self.config.raw_data_path}")
@@ -1034,7 +1053,9 @@ class WFOPipeline:
         all_metrics = []
         for segment in segments:
             try:
-                metrics, train_metrics = self.run_segment(df_raw, segment)
+                metrics, train_metrics = self.run_segment(
+                    df_raw, segment, use_batch_env=self.config.use_batch_env
+                )
                 all_metrics.append(metrics)
                 self.save_results(metrics)
 
@@ -1208,6 +1229,8 @@ def main():
                         help="Re-run evaluation only (skip MAE/TQC training)")
     parser.add_argument("--eval-segments", type=str, default=None,
                         help="Comma-separated segment IDs to evaluate (e.g., '0,1,2')")
+    parser.add_argument("--use-batch-env", action="store_true",
+                        help="Use GPU-accelerated BatchCryptoEnv for TQC training (10-50x speedup)")
 
     args = parser.parse_args()
 
@@ -1219,6 +1242,7 @@ def main():
     config.train_months = args.train_months
     config.test_months = args.test_months
     config.step_months = args.step_months
+    config.use_batch_env = args.use_batch_env
 
     # Create pipeline
     pipeline = WFOPipeline(config)
