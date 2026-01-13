@@ -463,3 +463,111 @@ class CurriculumFeesCallback(BaseCallback):
             print(f"  target_fee_rate: {self.target_fee_rate:.6f}")
             print(f"  target_smooth_coef: {self.target_smooth_coef:.2f}")
             print(f"  warmup_steps: {self.warmup_steps:,}")
+
+
+class ThreePhaseCurriculumCallback(BaseCallback):
+    """
+    Three-Phase Curriculum Learning (Gemini recommendation 2026-01-13).
+
+    Phases:
+    - Phase 1 (0-20%): Discovery - smooth_coef=0 (free exploration)
+    - Phase 2 (20-80%): Discipline - linear ramp to target
+    - Phase 3 (80-100%): Refinement - hold at target
+
+    This prevents the agent from learning to "hold 0" due to early penalties,
+    while still teaching it to be efficient once it has found profitable patterns.
+
+    Args:
+        total_timesteps: Total training timesteps.
+        target_smooth_coef: Target smoothness coefficient.
+        target_churn_coef: Target churn coefficient (aligned with commission).
+        start_ramp_frac: When to start ramping (default: 0.1 = 10%).
+        end_ramp_frac: When to finish ramping (default: 0.8 = 80%).
+        shared_smooth: Shared memory for SubprocVecEnv.
+        verbose: Verbosity level.
+    """
+
+    def __init__(
+        self,
+        total_timesteps: int,
+        target_smooth_coef: float = 0.005,
+        target_churn_coef: float = 1.0,
+        start_ramp_frac: float = 0.1,
+        end_ramp_frac: float = 0.8,
+        shared_smooth: Optional["Synchronized"] = None,
+        verbose: int = 0
+    ):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.target_smooth_coef = target_smooth_coef
+        self.target_churn_coef = target_churn_coef
+        self.start_ramp_frac = start_ramp_frac
+        self.end_ramp_frac = end_ramp_frac
+        self.shared_smooth = shared_smooth
+
+        # Phase boundaries in steps
+        self.start_ramp_step = int(total_timesteps * start_ramp_frac)
+        self.end_ramp_step = int(total_timesteps * end_ramp_frac)
+
+        self.current_smooth = 0.0
+        self.current_churn = 0.0
+        self._phase = 1
+
+    def _on_step(self) -> bool:
+        step = self.num_timesteps
+
+        if step < self.start_ramp_step:
+            # Phase 1: Discovery (free exploration)
+            self.current_smooth = 0.0
+            self.current_churn = 0.0
+            self._phase = 1
+
+        elif step > self.end_ramp_step:
+            # Phase 3: Refinement (hold at target)
+            self.current_smooth = self.target_smooth_coef
+            self.current_churn = self.target_churn_coef
+            self._phase = 3
+
+        else:
+            # Phase 2: Discipline (linear ramp)
+            progress = (step - self.start_ramp_step) / (self.end_ramp_step - self.start_ramp_step)
+            self.current_smooth = progress * self.target_smooth_coef
+            self.current_churn = progress * self.target_churn_coef
+            self._phase = 2
+
+        # Update via shared memory (SubprocVecEnv)
+        if self.shared_smooth is not None:
+            self.shared_smooth.value = self.current_smooth
+
+        # Fallback for DummyVecEnv
+        else:
+            self._update_envs()
+
+        # Log to TensorBoard
+        self.logger.record("curriculum/smooth_coef", self.current_smooth)
+        self.logger.record("curriculum/churn_coef", self.current_churn)
+        self.logger.record("curriculum/phase", self._phase)
+
+        return True
+
+    def _update_envs(self):
+        """Update penalties on all environments (DummyVecEnv only)."""
+        env = self.model.env
+
+        if isinstance(env, VecEnv):
+            for i in range(env.num_envs):
+                base_env = env.envs[i]
+                while hasattr(base_env, 'env'):
+                    base_env = base_env.env
+                if hasattr(base_env, 'set_smooth_coef'):
+                    base_env.set_smooth_coef(self.current_smooth)
+                if hasattr(base_env, 'set_churn_coef'):
+                    base_env.set_churn_coef(self.current_churn)
+
+    def _on_training_start(self) -> None:
+        if self.verbose > 0:
+            print(f"\n[3-Phase Curriculum] Configuration:")
+            print(f"  Phase 1 (Discovery):   steps 0 - {self.start_ramp_step:,} (smooth=0)")
+            print(f"  Phase 2 (Discipline):  steps {self.start_ramp_step:,} - {self.end_ramp_step:,} (ramp)")
+            print(f"  Phase 3 (Refinement):  steps {self.end_ramp_step:,}+ (smooth={self.target_smooth_coef})")
+            print(f"  Target churn_coef: {self.target_churn_coef}")

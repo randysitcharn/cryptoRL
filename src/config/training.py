@@ -38,13 +38,13 @@ class TQCTrainingConfig:
     episode_length: int = 2048
     eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
 
-    # Reward function
-    reward_scaling: float = 1.0   # Reduced (no tanh saturation now)
+    # Reward function (x100 SCALE applied in env.py)
+    reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
     downside_coef: float = 10.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    churn_coef: float = 1.0       # Anti-churn penalty
-    smooth_coef: float = 0.0001   # Reduced 100x (was causing excessive penalty)
+    churn_coef: float = 1.0       # Aligned with commission (1.0 = exact cost)
+    smooth_coef: float = 0.005    # Curriculum target (régularisation)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol
@@ -62,7 +62,7 @@ class TQCTrainingConfig:
     learning_rate: float = 9e-5
     buffer_size: int = 200_000
     batch_size: int = 1024
-    gamma: float = 0.95
+    gamma: float = 0.99  # Extended horizon ~100h (was 0.95 = 20h, too myopic)
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto"
     train_freq: int = 1

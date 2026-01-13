@@ -67,13 +67,13 @@ class WFOConfig:
     mae_epochs: int = 90
     tqc_timesteps: int = 150_000
 
-    # TQC Hyperparameters (aggressive regularization)
+    # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 9e-5
     batch_size: int = 512  # Larger batch for GPU utilization
-    gamma: float = 0.95
+    gamma: float = 0.99    # Extended horizon ~100h (was 0.95 = 20h myopic)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
-    churn_coef: float = 0.0    # Disabled: smooth_coef handles position smoothing
-    smooth_coef: float = 0.0001  # Reduced 100x (position now visible, less penalty needed)
+    churn_coef: float = 1.0    # Aligned with commission (1.0 = exact cost)
+    smooth_coef: float = 0.005  # Curriculum target (x100 SCALE in env)
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol

@@ -265,6 +265,17 @@ class CryptoTradingEnv(gym.Env):
             return self.shared_smooth.value
         return self.smooth_coef
 
+    def set_smooth_coef(self, value: float) -> None:
+        """Set smooth_coef (for curriculum learning callback).
+
+        Updates local value. For SubprocVecEnv, use shared_smooth instead.
+        """
+        self.smooth_coef = value
+
+    def set_churn_coef(self, value: float) -> None:
+        """Set churn_coef (for curriculum learning callback)."""
+        self.churn_coef = value
+
     def _calculate_volatility(self) -> float:
         """
         Calculate rolling volatility using EMA variance (O(1) per step).
@@ -292,55 +303,61 @@ class CryptoTradingEnv(gym.Env):
 
     def _calculate_reward(self) -> float:
         """
-        Hybrid Log-Sortino Reward Function.
+        Hybrid Log-Sortino Reward Function with x100 Scaling.
 
-        Combines:
-        1. Log return for optimal growth (Kelly criterion alignment)
-        2. Sortino-style downside penalty (asymmetric risk)
-        3. Symmetric upside bonus (reward positive returns)
-        4. Smoothness penalty (quadratic penalty on position changes)
+        Scaling rationale (Gemini collab 2026-01-13):
+        - Raw log_return is ~0.001 (0.1%), too small for NN precision
+        - SCALE=100 makes 1% return = 1.0 reward point
+        - Churn penalty aligned with real commission cost
+        - Smoothness for regularization only
 
         Returns:
-            Reward value (linearly scaled, no tanh).
+            Reward value (scaled x100, no tanh).
         """
+        # SCALE FACTOR: 1% return = 1.0 reward (Gemini recommendation)
+        SCALE = 100.0
+
         # 1. PnL proportionnel
         current_value = self._get_nav()
         step_return = (current_value - self._prev_valuation) / self._prev_valuation
 
-        # 2. Log Return (croissance optimale)
+        # 2. Log Return (croissance optimale) - SCALED
         safe_return = max(step_return, -0.99)
-        reward_log_return = np.log(1.0 + safe_return)
+        reward_log_return = np.log(1.0 + safe_return) * SCALE
 
-        # 3. Pénalité Sortino (downside)
+        # 3. Pénalité Sortino (downside) - SCALED
         downside_penalty = 0.0
         if step_return < 0:
-            downside_penalty = -(step_return ** 2) * self.downside_coef
+            downside_penalty = -(step_return ** 2) * self.downside_coef * SCALE
 
-        # 4. Bonus symétrique (upside)
+        # 4. Bonus symétrique (upside) - SCALED
         upside_bonus = 0.0
         if step_return > 0:
-            upside_bonus = (step_return ** 2) * self.upside_coef
+            upside_bonus = (step_return ** 2) * self.upside_coef * SCALE
 
-        # 5. Pénalité de churn (Taxe Cognitive) - LINÉAIRE
-        churn_penalty = 0.0
+        # 5. Position delta (pour churn et smoothness)
         position_delta = 0.0
         if hasattr(self, '_prev_position_pct'):
             position_delta = abs(self.current_position_pct - self._prev_position_pct)
-            if position_delta > 0 and self.churn_coef > 0:
-                # Coût estimé * Multiplicateur d'amplification
-                cost_rate = self._get_commission() + self.slippage  # 0.07%
-                churn_penalty = -position_delta * cost_rate * self.churn_coef
 
-        # 6. Smoothness penalty - QUADRATIQUE (pénalise les changements brusques)
+        # 6. Pénalité de churn (Taxe Cognitive) - LINÉAIRE, alignée avec commission
+        # Avec churn_coef=1.0, l'agent "paie" exactement les frais dans son reward
+        churn_penalty = 0.0
+        if position_delta > 0 and self.churn_coef > 0:
+            cost_rate = self._get_commission() + self.slippage  # ex: 0.0015
+            churn_penalty = -position_delta * cost_rate * self.churn_coef * SCALE
+
+        # 7. Smoothness penalty - QUADRATIQUE (régularisation légère)
+        # smooth_coef devrait être ~0.005 pour être significatif avec SCALE
         smoothness_penalty = 0.0
         current_smooth = self._get_smooth_coef()
         if hasattr(self, '_prev_position_pct') and current_smooth > 0:
-            smoothness_penalty = -current_smooth * (position_delta ** 2)
+            smoothness_penalty = -current_smooth * (position_delta ** 2) * SCALE
 
-        # 7. Total + Linear scaling (no tanh - allows gradient to flow)
+        # 8. Total (déjà scalé, plus besoin de reward_scaling externe)
         total_reward = reward_log_return + downside_penalty + upside_bonus + churn_penalty + smoothness_penalty
 
-        # Compute final scaled reward (NO TANH - prevents vanishing gradient)
+        # Note: reward_scaling kept for backward compatibility but should be 1.0
         scaled_reward = float(total_reward * self.reward_scaling)
 
         # Store metrics for observability
