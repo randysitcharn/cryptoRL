@@ -219,8 +219,16 @@ total_reward = reward_log_return + churn_penalty + smoothness_penalty
 - [x] Réactiver churn_penalty aligné avec commission
 - [x] Passer gamma de 0.95 à 0.99
 - [x] Implémenter Curriculum Learning pour smooth_coef
-- [ ] Relancer l'entraînement WFO
+- [x] Relancer l'entraînement WFO
 - [ ] Comparer les métriques (trades_per_episode < 500 attendu)
+
+## Vérification Post-Implémentation (Step 4000)
+
+```
+curriculum/churn_coef: 0     ✓ Phase 1 (Discovery)
+curriculum/smooth_coef: 0    ✓ Exploration libre
+Position: +0.30, +1.00, -0.40  ✓ Agent explore
+```
 
 ---
 
