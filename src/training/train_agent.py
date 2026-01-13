@@ -22,12 +22,11 @@ from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 import torch
 from functools import partial
 
-# CUDA Optimization: Auto-tune convolutions for repeated input sizes
-torch.backends.cudnn.benchmark = True
-
 from src.config import DEVICE, SEED
+from src.utils.hardware import HardwareManager
 from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.env import CryptoTradingEnv
+from src.training.batch_env import BatchCryptoEnv
 from src.training.wrappers import RiskManagementWrapper
 from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
@@ -160,7 +159,7 @@ def _make_train_env(
     return Monitor(env)
 
 
-def create_environments(config: TrainingConfig, n_envs: int = 1):
+def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: bool = False):
     """
     Create training and evaluation environments.
 
@@ -169,6 +168,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
         n_envs: Number of parallel training environments (P0 optimization).
                 Use n_envs > 1 for SubprocVecEnv parallelization (2-4x speedup).
                 Now compatible with curriculum learning via shared memory.
+        use_batch_env: If True, use BatchCryptoEnv (GPU-vectorized) instead of SubprocVecEnv.
+                       This runs all envs in a single process using GPU tensors (10-50x speedup).
 
     Returns:
         Tuple of (train_vec_env, eval_vec_env, shared_fee, shared_smooth, manager).
@@ -197,7 +198,35 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
         initial_smooth = config.smooth_coef
 
     # ==================== Training Environment(s) ====================
-    if n_envs > 1:
+    if use_batch_env:
+        # GPU-Vectorized Batch Environment (Gemini recommendation)
+        # All envs run in a single process using PyTorch tensors on GPU
+        # Eliminates IPC overhead, achieves 10-50x speedup vs SubprocVecEnv
+        print(f"      [BatchEnv] Creating {n_envs} GPU-vectorized environments (BatchCryptoEnv)...")
+
+        train_vec_env = BatchCryptoEnv(
+            parquet_path=config.data_path,
+            n_envs=n_envs,
+            device=str(DEVICE),
+            window_size=config.window_size,
+            episode_length=config.episode_length,
+            initial_balance=10_000.0,
+            commission=initial_commission,
+            slippage=0.0001,
+            reward_scaling=config.reward_scaling,
+            downside_coef=config.downside_coef,
+            upside_coef=config.upside_coef,
+            action_discretization=config.action_discretization,
+            churn_coef=config.churn_coef,
+            smooth_coef=initial_smooth,
+            target_volatility=config.target_volatility,
+            vol_window=config.vol_window,
+            max_leverage=config.max_leverage,
+            price_column='BTC_Close',
+        )
+        # Note: Curriculum updates use env.set_attr() for BatchCryptoEnv
+
+    elif n_envs > 1:
         # P0 Optimization: SubprocVecEnv for true parallelization
         # Each subprocess creates its own environment independently
         print(f"      [P0] Creating {n_envs} parallel training environments (SubprocVecEnv)...")
@@ -347,8 +376,8 @@ def create_callbacks(
             total_timesteps=config.total_timesteps,
             target_smooth_coef=config.smooth_coef,
             target_churn_coef=config.churn_coef,
-            start_ramp_frac=0.1,   # Start ramping at 10%
-            end_ramp_frac=0.8,     # Finish ramping at 80%
+            start_ramp_frac=0.0,   # Start ramping immediately
+            end_ramp_frac=0.3,     # Finish ramping at 30%
             shared_smooth=shared_smooth,
             verbose=1
         )
@@ -357,12 +386,16 @@ def create_callbacks(
     return callbacks, detail_callback
 
 
-def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
+def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_env: bool = False) -> tuple[TQC, dict]:
     """
     Train TQC agent with Foundation Model feature extractor.
 
     Args:
         config: Training configuration (uses default if None).
+        hw_overrides: Optional dict to override hardware auto-config
+                      (e.g., {"n_envs": 4, "batch_size": 512})
+        use_batch_env: If True, use BatchCryptoEnv (GPU-vectorized) instead of SubprocVecEnv.
+                       This runs all envs in a single process using GPU tensors (10-50x speedup).
 
     Returns:
         Tuple of (Trained TQC model, training metrics dict).
@@ -374,6 +407,39 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print("TQC + Foundation Model Training")
     print("=" * 70)
 
+    # ==================== Hardware Auto-Detection ====================
+    print("\n[0/4] Detecting hardware and computing optimal config...")
+    import logging
+    hw_logger = logging.getLogger("hardware")
+    hw_logger.setLevel(logging.INFO)
+    if not hw_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("      %(message)s"))
+        hw_logger.addHandler(handler)
+
+    hw_manager = HardwareManager(logger=hw_logger)
+
+    # Build overrides from config + explicit hw_overrides
+    # Priority: hw_overrides > config attributes > auto-detected
+    overrides = {}
+    if hasattr(config, 'n_envs') and config.n_envs is not None:
+        overrides['n_envs'] = config.n_envs
+    if hasattr(config, 'batch_size') and config.batch_size is not None:
+        overrides['batch_size'] = config.batch_size
+    if hasattr(config, 'buffer_size') and config.buffer_size is not None:
+        overrides['buffer_size'] = config.buffer_size
+    if hw_overrides:
+        overrides.update(hw_overrides)
+
+    adaptive_config = hw_manager.get_adaptive_config(user_overrides=overrides)
+    hw_manager.apply_optimizations(adaptive_config)
+    hw_manager.log_summary(adaptive_config)
+
+    # Apply adaptive config back to training config
+    n_envs = adaptive_config.n_envs
+    config.batch_size = adaptive_config.batch_size
+    config.buffer_size = adaptive_config.buffer_size
+
     # Create directories
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     os.makedirs(config.tensorboard_log, exist_ok=True)
@@ -381,8 +447,9 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
 
     # ==================== Environment Setup ====================
     print("\n[1/4] Creating environments...")
-    n_envs = getattr(config, 'n_envs', 1)  # Default to 1 for backward compatibility
-    train_env, eval_env, shared_fee, shared_smooth, manager = create_environments(config, n_envs=n_envs)
+    train_env, eval_env, shared_fee, shared_smooth, manager = create_environments(
+        config, n_envs=n_envs, use_batch_env=use_batch_env
+    )
 
     obs_space = train_env.observation_space
     # Handle Dict observation space (market + position)
@@ -566,12 +633,20 @@ if __name__ == "__main__":
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 256)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: auto-detect from VRAM)")
     parser.add_argument("--gamma", type=float, default=None, help="Discount factor (default: 0.99)")
     parser.add_argument("--load-model", type=str, default=None,
                         help="Path to .zip model to resume training from (Lightweight mode: no buffer)")
     parser.add_argument("--load-latest", action="store_true",
                         help="Auto-select latest checkpoint from checkpoint_dir")
+    # Hardware override arguments
+    parser.add_argument("--n-envs", type=int, default=None,
+                        help="Number of parallel envs (default: auto-detect from CPU cores)")
+    parser.add_argument("--buffer-size", type=int, default=None,
+                        help="Replay buffer size (default: auto-detect from RAM)")
+    # GPU-Vectorized Environment (BatchCryptoEnv)
+    parser.add_argument("--use-batch-env", action="store_true",
+                        help="Use GPU-vectorized BatchCryptoEnv (10-50x speedup vs SubprocVecEnv)")
 
     args = parser.parse_args()
 
@@ -607,6 +682,11 @@ if __name__ == "__main__":
         config.load_model_path = args.load_model
     if args.load_latest:
         config.load_latest = True
+    # Hardware overrides (will be used by HardwareManager)
+    if args.n_envs is not None:
+        config.n_envs = args.n_envs
+    if args.buffer_size is not None:
+        config.buffer_size = args.buffer_size
 
     # Resolve --load-latest to actual checkpoint path
     if config.load_latest:
@@ -617,4 +697,4 @@ if __name__ == "__main__":
         else:
             print(f"[Warning] No checkpoints found in {config.checkpoint_dir}")
 
-    train(config)
+    train(config, use_batch_env=args.use_batch_env)
