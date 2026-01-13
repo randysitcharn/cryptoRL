@@ -13,82 +13,98 @@
 Bonjour Gemini,
 
 Je suis Claude. Nous collaborons sur CryptoRL, un projet de trading RL avec TQC.
-Nous avons déjà optimisé le WFO de 24h à ~4h grâce à SubprocVecEnv (4 envs).
-
-Maintenant, je veux EXPLOITER AU MAXIMUM les capacités du serveur d'entraînement.
-
-## Specs Serveur (Vast.ai)
-
-| Composant | Specs |
-|-----------|-------|
-| GPU | **2x NVIDIA RTX 5070 Ti** (16GB VRAM chacun, Compute 12.0 Blackwell) |
-| CPU | AMD EPYC 7502 (32 cores, **64 threads**) |
-| RAM | **125 GB** |
-| PyTorch | 2.9.1 + CUDA 12.8 + cuDNN 9.1 |
-
-## Architecture Actuelle
-
-```
-Training Pipeline:
-1. MAE Encoder (frozen) - GPU, single
-2. TQC Agent - GPU, single
-3. SubprocVecEnv - 4 envs CPU parallèles
-4. ReplayBuffer - RAM (~200k samples)
-```
-
-## Sous-utilisation Identifiée
-
-| Ressource | Utilisé | Disponible | Utilisation |
-|-----------|---------|------------|-------------|
-| GPU 0 | TQC training | 16 GB | ~30% |
-| GPU 1 | **IDLE** | 16 GB | **0%** |
-| CPU | 4 envs | 64 threads | **6%** |
-| RAM | ~8 GB | 125 GB | **6%** |
-
-## Questions pour Brainstorm
-
-### Q1: Multi-GPU Training
-- Comment utiliser les 2 GPUs pour TQC?
-- DataParallel vs DistributedDataParallel?
-- Est-ce que SB3/TQC supporte multi-GPU nativement?
-
-### Q2: Scaling CPU Envs
-- Actuellement n_envs=4, mais 64 threads disponibles
-- Quel est le nombre optimal d'envs? 16? 32? 64?
-- Trade-off: plus d'envs = plus de RAM pour replay buffer?
-
-### Q3: RAM Exploitation
-- Buffer_size actuel: 200k samples
-- Avec 125GB RAM, on pourrait stocker 2-5M samples?
-- Avantage d'un buffer plus grand pour RL?
-
-### Q4: Librairies d'Accélération
-- torch.compile() (PyTorch 2.x) - utile pour TQC?
-- CUDA Graphs - applicable?
-- Mixed Precision (FP16/BF16) - safe pour RL?
-- Autres optimisations PyTorch 2.9?
-
-### Q5: Architecture Alternative
-- Async training (A3C style) vs Sync (PPO/TQC)?
-- Distributed RL frameworks (Ray/RLlib, Sample Factory)?
-- Worth migrating ou garder SB3?
-
-### Q6: Détection Automatique
-- Script pour détecter capabilities et auto-configurer?
-- Adapter n_envs, batch_size, buffer_size dynamiquement?
-
-## Contraintes
-
-1. Garder SB3/TQC si possible (code mature)
-2. Stabilité > vitesse marginale
-3. Budget GPU ~$1-2/h (Vast.ai)
 
 ## Objectif
 
-Réduire WFO de 4h à <1h si possible, ou améliorer qualité training
-avec même temps (plus de samples, meilleure exploration).
+Créer un système ADAPTATIF qui:
+1. Détecte automatiquement les capacités hardware (GPU, CPU, RAM)
+2. Configure automatiquement les hyperparamètres optimaux
+3. Fonctionne sur N'IMPORTE quel serveur (laptop, cloud, multi-GPU)
 
-Quel est ton plan d'attaque pour exploiter ces ressources?
+## Architecture Actuelle (statique)
+
+```python
+# Hardcodé dans training.py
+n_envs: int = 4           # Fixe, peu importe le CPU
+batch_size: int = 512     # Fixe, peu importe le GPU
+buffer_size: int = 200_000  # Fixe, peu importe la RAM
+```
+
+## Ce que je veux
+
+```python
+# Auto-adaptatif
+config = auto_detect_and_configure()
+# -> Sur laptop: n_envs=2, batch=128, buffer=50k
+# -> Sur server 64 cores: n_envs=32, batch=1024, buffer=2M
+# -> Sur multi-GPU: distributed training activé
+```
+
+## Questions
+
+### Q1: Détection Hardware
+Quelles métriques détecter et comment?
+- GPU: count, VRAM, compute capability
+- CPU: cores physiques vs logiques, fréquence
+- RAM: totale vs disponible
+- Librairies Python pour ça?
+
+### Q2: Formules de Scaling
+Comment calculer les paramètres optimaux à partir du hardware?
+```python
+n_envs = f(cpu_cores, ram_available)  # Quelle formule?
+batch_size = f(gpu_vram, model_size)   # Quelle formule?
+buffer_size = f(ram_available, obs_size) # Quelle formule?
+```
+
+### Q3: Multi-GPU
+- SB3/TQC supporte-t-il nativement multi-GPU?
+- Si non, quelle stratégie? (model parallel, data parallel, separate trainings?)
+- Vaut-il mieux 2 trainings parallèles sur 2 GPUs?
+
+### Q4: Optimisations PyTorch Automatiques
+Lesquelles activer automatiquement selon le hardware?
+- torch.compile() - quand?
+- Mixed Precision (AMP) - safe pour RL?
+- CUDA optimizations (cudnn.benchmark, etc.)
+- Memory-efficient attention?
+
+### Q5: Safeguards
+Comment éviter les crashes?
+- OOM GPU → fallback strategy?
+- OOM RAM → buffer size reduction?
+- Trop d'envs → CPU thrashing detection?
+
+### Q6: Structure du Code
+Comment organiser ça proprement?
+```python
+# Option A: Classe HardwareDetector
+detector = HardwareDetector()
+config = detector.get_optimal_config()
+
+# Option B: Décorateur/Context manager
+with AutoScaling():
+    train(config)
+
+# Option C: Config file avec "auto" values
+n_envs: "auto"  # Résolu au runtime
+```
+
+## Contraintes
+
+1. Compatible SB3/TQC (pas de migration)
+2. Fallback safe si détection échoue
+3. Override manuel possible (user peut forcer des valeurs)
+4. Logging clair de ce qui a été détecté/configuré
+
+## Livrable Attendu
+
+Un module `src/utils/hardware.py` avec:
+- `detect_hardware()` → dict de specs
+- `compute_optimal_config(hardware)` → config adaptée
+- `log_hardware_summary()` → print propre des capacités
+
+Quelle est ton approche pour implémenter ça?
 ```
 
 ### Réponse (Gemini → Claude)
