@@ -171,14 +171,15 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
                 Now compatible with curriculum learning via shared memory.
 
     Returns:
-        Tuple of (train_vec_env, eval_vec_env, shared_fee, shared_smooth).
-        shared_fee and shared_smooth are None if not using curriculum with SubprocVecEnv.
+        Tuple of (train_vec_env, eval_vec_env, shared_fee, shared_smooth, manager).
+        shared_fee, shared_smooth, and manager are None if not using curriculum with SubprocVecEnv.
     """
     from src.config import SEED
 
     # Shared memory for curriculum learning with SubprocVecEnv
     shared_fee = None
     shared_smooth = None
+    manager = None  # Track Manager for proper cleanup (Gemini recommendation)
 
     # Curriculum Learning: start with 0 fees/smoothness if enabled
     if config.use_curriculum:
@@ -286,7 +287,7 @@ def create_environments(config: TrainingConfig, n_envs: int = 1):
     val_env_monitored = Monitor(val_env)
     eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
 
-    return train_vec_env, eval_vec_env, shared_fee, shared_smooth
+    return train_vec_env, eval_vec_env, shared_fee, shared_smooth, manager
 
 
 def create_callbacks(
@@ -381,7 +382,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     # ==================== Environment Setup ====================
     print("\n[1/4] Creating environments...")
     n_envs = getattr(config, 'n_envs', 1)  # Default to 1 for backward compatibility
-    train_env, eval_env, shared_fee, shared_smooth = create_environments(config, n_envs=n_envs)
+    train_env, eval_env, shared_fee, shared_smooth, manager = create_environments(config, n_envs=n_envs)
 
     obs_space = train_env.observation_space
     # Handle Dict observation space (market + position)
@@ -490,13 +491,23 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
 
     # reset_num_timesteps=False continues TensorBoard from previous run
     is_resume = config.load_model_path is not None
-    model.learn(
-        total_timesteps=config.total_timesteps,
-        callback=callbacks,
-        tb_log_name=tb_log_name,
-        progress_bar=True,
-        reset_num_timesteps=not is_resume,  # False for resume, True for fresh
-    )
+
+    try:
+        model.learn(
+            total_timesteps=config.total_timesteps,
+            callback=callbacks,
+            tb_log_name=tb_log_name,
+            progress_bar=True,
+            reset_num_timesteps=not is_resume,  # False for resume, True for fresh
+        )
+    finally:
+        # ==================== Cleanup Resources (Gemini recommendation) ====================
+        print("\n[Cleanup] Closing environments...")
+        train_env.close()
+        eval_env.close()
+        if manager is not None:
+            manager.shutdown()
+            print("      Manager shutdown complete.")
 
     # ==================== Capture Training Metrics ====================
     training_metrics = detail_callback.get_training_metrics()

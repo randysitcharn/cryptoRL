@@ -249,9 +249,69 @@ gSDE std: 0.05                    ✓ Exploration active
 
 ---
 
-## Réponses de Gemini
+## Réponses de Gemini (2026-01-13)
 
-*(À compléter après échange)*
+### Verdict Global: ✅ Architecture Solide
+
+> "Tout est au vert. Tes optimisations sont techniquement justes pour du RL en Python."
+
+### Q1: Manager().Value() vs Value()
+
+**Verdict: Garde Manager().Value()**
+
+- Avec `SubprocVecEnv` et `start_method='spawn'`, les objets doivent être sérialisés (pickled)
+- `multiprocessing.Value` est capricieux avec spawn (selon OS/Python version)
+- `Manager().Value()` crée un processus serveur distinct = **option la plus robuste**
+- **Performance:** L'overhead IPC est ~microseconde vs milliseconds pour l'inférence Transformer (< 0.1%)
+- **Action:** Ajouter `manager.shutdown()` pour éviter processus orphelins ✅
+
+### Q2: start_method='spawn' vs 'fork'
+
+**Verdict: spawn est IMPÉRATIF avec CUDA**
+
+- `fork` après CUDA init = contexte corrompu → deadlocks silencieux
+- `spawn` crée un processus Python vierge = seul moyen sûr avec PyTorch/CUDA
+- **Action:** Ne pas changer, même si `fork` semble plus rapide sur Linux
+
+### Q3: Seed Diversity
+
+**Verdict: Suffisant**
+
+- `SEED+i` donne 4 générateurs distincts
+- Décorrèle les expériences dans le ReplayBuffer
+- Stabilise l'apprentissage (réduit variance des gradients)
+
+### Q4: Observation View vs Copy
+
+**Verdict: Safe (sous condition)**
+
+- **Risque théorique:** Si SB3 stocke la vue sans copier et que `self.data` change → corruption
+- **Réalité SB3:** `ReplayBuffer.add()` **copie** les observations dans son stockage interne
+- **Condition:** `self.data` doit être **immutable** pendant l'épisode
+- **Vérification:** Code utilise `.copy()` ligne 502 → double sécurité ✅
+
+### Q5: EMA Variance
+
+**Verdict: Excellente approximation**
+
+- EMA variance = estimateur standard de volatilité locale (RiskMetrics)
+- **Avantage:** O(1) vs O(n) pour std() rolling
+- **Trading:** EMA donne plus de poids aux événements récents → mieux pour détecter les changements de régime
+
+### Points d'Attention Résolus
+
+| Point | Réponse Gemini |
+|-------|----------------|
+| Race Condition? | Non. Écriture/lecture de `double` est atomique. Manager gère le verrouillage implicitement. |
+| Memory Leak? | **OUI si pas de shutdown()** → Corrigé avec try/finally |
+| Overhead IPC? | Négligeable (< 0.1% du temps d'inférence) |
+| Seed Collision? | Non. 4 seeds distinctes = diversité suffisante |
+
+### Correctifs Appliqués
+
+1. ✅ `create_environments()` retourne `manager`
+2. ✅ `train()` utilise try/finally avec `manager.shutdown()`
+3. ✅ `train_env.close()` et `eval_env.close()` appelés
 
 ---
 
