@@ -312,6 +312,7 @@ gSDE std: 0.05                    ✓ Exploration active
 1. ✅ `create_environments()` retourne `manager`
 2. ✅ `train()` utilise try/finally avec `manager.shutdown()`
 3. ✅ `train_env.close()` et `eval_env.close()` appelés
+4. ✅ **"First Step" Lag Fix:** `shared_smooth.value = 0.0` avant `model.learn()`
 
 ---
 

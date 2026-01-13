@@ -492,6 +492,13 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     # reset_num_timesteps=False continues TensorBoard from previous run
     is_resume = config.load_model_path is not None
 
+    # ==================== Initialize Curriculum State (Gemini safeguard) ====================
+    # Prevents "First Step" lag where shared values might be uninitialized
+    if shared_smooth is not None:
+        shared_smooth.value = 0.0
+    if shared_fee is not None:
+        shared_fee.value = 0.0
+
     try:
         model.learn(
             total_timesteps=config.total_timesteps,
