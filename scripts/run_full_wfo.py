@@ -73,8 +73,8 @@ class WFOConfig:
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 3e-4
     buffer_size: int = 2_500_000  # 2.5M replay buffer
+    n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
     # batch_size: Auto-detected by HardwareManager (VRAM-based)
-    # n_envs: Auto-detected by HardwareManager (CPU-based)
     gamma: float = 0.99    # Extended horizon ~100h (was 0.95 = 20h myopic)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 1.0    # Aligned with commission (1.0 = exact cost)
@@ -472,7 +472,9 @@ class WFOPipeline:
         os.makedirs(config.tensorboard_log, exist_ok=True)
 
         # Train - now returns (model, train_metrics)
-        model, train_metrics = train(config, use_batch_env=use_batch_env)
+        # Pass n_envs override for GPU-optimized parallelism
+        hw_overrides = {'n_envs': self.config.n_envs} if use_batch_env else None
+        model, train_metrics = train(config, hw_overrides=hw_overrides, use_batch_env=use_batch_env)
 
         print(f"  TQC trained. Saved: {config.save_path}")
 
