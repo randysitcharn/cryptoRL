@@ -34,6 +34,7 @@ from src.training.callbacks import (
     StepLoggingCallback,
     DetailTensorboardCallback,
     CurriculumFeesCallback,
+    ThreePhaseCurriculumCallback,
 )
 
 
@@ -339,13 +340,14 @@ def create_callbacks(
     detail_callback = DetailTensorboardCallback(verbose=0)
     callbacks.append(detail_callback)
 
-    # Curriculum Learning callback
+    # Curriculum Learning callback (3-Phase: Discovery → Discipline → Refinement)
     if config.use_curriculum:
-        curriculum_callback = CurriculumFeesCallback(
-            target_fee_rate=config.commission,
+        curriculum_callback = ThreePhaseCurriculumCallback(
+            total_timesteps=config.total_timesteps,
             target_smooth_coef=config.smooth_coef,
-            warmup_steps=config.curriculum_warmup_steps,
-            shared_fee=shared_fee,
+            target_churn_coef=config.churn_coef,
+            start_ramp_frac=0.1,   # Start ramping at 10%
+            end_ramp_frac=0.8,     # Finish ramping at 80%
             shared_smooth=shared_smooth,
             verbose=1
         )

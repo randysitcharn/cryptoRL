@@ -441,8 +441,8 @@ class WFOPipeline:
         config.max_leverage = self.config.max_leverage
 
         # P0 Optimization: SubprocVecEnv for 2-4x speedup
-        # Curriculum now works with SubprocVecEnv via shared memory
-        config.use_curriculum = False  # Disabled: prevents churn learning
+        # 3-Phase Curriculum: Discovery → Discipline → Refinement (Gemini 2026-01-13)
+        config.use_curriculum = True  # Re-enabled with 3-phase curriculum
         config.n_envs = 4  # Parallel training environments
 
         # Set segment-specific paths
