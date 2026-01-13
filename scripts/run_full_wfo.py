@@ -65,7 +65,7 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 150_000
+    tqc_timesteps: int = 300_000
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 9e-5

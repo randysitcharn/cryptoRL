@@ -58,7 +58,7 @@ class TQCTrainingConfig:
     freeze_encoder: bool = True
 
     # --- TQC Hyperparameters ---
-    total_timesteps: int = 150_000
+    total_timesteps: int = 300_000
     learning_rate: float = 9e-5
     buffer_size: int = 200_000
     batch_size: int = 1024
