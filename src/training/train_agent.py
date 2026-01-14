@@ -371,13 +371,10 @@ def create_callbacks(
     callbacks.append(detail_callback)
 
     # Curriculum Learning callback (3-Phase: Discovery → Discipline → Refinement)
+    # Phases calibrées dans callbacks.py pour ratio |PnL|/|Penalties| ≈ 1.0
     if config.use_curriculum:
         curriculum_callback = ThreePhaseCurriculumCallback(
             total_timesteps=config.total_timesteps,
-            target_smooth_coef=config.smooth_coef,
-            target_churn_coef=config.churn_coef,
-            start_ramp_frac=0.0,   # Start ramping immediately
-            end_ramp_frac=0.3,     # Finish ramping at 30%
             shared_smooth=shared_smooth,
             verbose=1
         )
