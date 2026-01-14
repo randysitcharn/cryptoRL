@@ -224,6 +224,9 @@ class BatchCryptoEnv(VecEnv):
         self._rew_churn = torch.zeros(n, device=device)
         self._rew_smooth = torch.zeros(n, device=device)
 
+        # OPTIMIZATION: Pre-allocate window offsets to avoid torch.arange in hot path
+        self.window_offsets = torch.arange(self.window_size, device=device)
+
     def _get_prices(self, steps: torch.Tensor) -> torch.Tensor:
         """Get prices at given steps for all envs. Shape: (n_envs,)"""
         return self.prices[steps]
@@ -257,18 +260,18 @@ class BatchCryptoEnv(VecEnv):
     def _get_batch_windows(self, steps: torch.Tensor) -> torch.Tensor:
         """
         Extract observation windows for all envs efficiently.
+        Optimized: Uses pre-allocated offsets to avoid GPU memory allocation per step.
 
-        Uses advanced indexing to extract windows in one operation.
         Shape: (n_envs, window_size, n_features)
         """
-        n = self.num_envs
         w = self.window_size
 
-        # Build indices: (n_envs, window_size)
-        # start_idx = steps - window_size + 1
-        offsets = torch.arange(w, device=self.device)  # [0, 1, ..., w-1]
-        start_indices = steps - w + 1  # (n_envs,)
-        indices = start_indices.unsqueeze(1) + offsets.unsqueeze(0)  # (n_envs, w)
+        # Calculate start indices: (n_envs,)
+        start_indices = steps - w + 1
+
+        # Broadcasting: (n_envs, 1) + (1, window_size) -> (n_envs, window_size)
+        # Uses pre-allocated self.window_offsets (zero allocation)
+        indices = start_indices.unsqueeze(1) + self.window_offsets.unsqueeze(0)
 
         # Gather data: (n_envs, window_size, n_features)
         return self.data[indices]
