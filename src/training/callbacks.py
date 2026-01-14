@@ -129,6 +129,12 @@ class TensorBoardStepCallback(BaseCallback):
                 self.writer.add_scalar("env/portfolio_value", metrics['portfolio_value'], step)
                 self.writer.add_scalar("env/price", metrics['price'], step)
                 self.writer.add_scalar("env/max_drawdown", metrics['max_drawdown'] * 100, step)
+
+                # Reward components (for observability)
+                if 'avg_rew_pnl' in metrics:
+                    self.writer.add_scalar("rewards/pnl", metrics['avg_rew_pnl'], step)
+                    self.writer.add_scalar("rewards/churn_penalty", metrics['avg_rew_churn'], step)
+                    self.writer.add_scalar("rewards/smooth_penalty", metrics['avg_rew_smooth'], step)
             else:
                 # Fallback for SubprocVecEnv/DummyVecEnv - read from infos
                 if 'infos' in self.locals:
@@ -218,6 +224,12 @@ class StepLoggingCallback(BaseCallback):
                 self.last_episode_info["nav"] = metrics["portfolio_value"]
                 self.last_episode_info["position"] = metrics["position_pct"]
                 self.last_episode_info["max_drawdown"] = metrics["max_drawdown"]
+
+                # Log reward components (for observability)
+                if "avg_rew_pnl" in metrics:
+                    self.logger.record("rewards/pnl", metrics["avg_rew_pnl"])
+                    self.logger.record("rewards/churn_penalty", metrics["avg_rew_churn"])
+                    self.logger.record("rewards/smooth_penalty", metrics["avg_rew_smooth"])
 
             if self.episode_rewards:
                 mean_reward = np.mean(self.episode_rewards[-10:])
@@ -508,79 +520,70 @@ class CurriculumFeesCallback(BaseCallback):
 
 class ThreePhaseCurriculumCallback(BaseCallback):
     """
-    Three-Phase Curriculum Learning (Gemini recommendation 2026-01-13).
+    Three-Phase Curriculum Learning (recalibré 2026-01-14).
 
-    Phases:
-    - Phase 1 (0-20%): Discovery - smooth_coef=0 (free exploration)
-    - Phase 2 (20-80%): Discipline - linear ramp to target
-    - Phase 3 (80-100%): Refinement - hold at target
+    Phases avec interpolation linéaire dans chaque phase:
+    - Phase 1 (0-30%): Discovery - churn 0→0.05, smooth=0
+    - Phase 2 (30-70%): Discipline - churn 0.05→0.20, smooth 0→0.0005
+    - Phase 3 (70-100%): Refinement - churn 0.20→0.50, smooth 0.0005→0.001
 
-    This prevents the agent from learning to "hold 0" due to early penalties,
-    while still teaching it to be efficient once it has found profitable patterns.
+    Les pénalités augmentent progressivement pour ne pas dominer le PnL.
 
     Args:
         total_timesteps: Total training timesteps.
-        target_smooth_coef: Target smoothness coefficient.
-        target_churn_coef: Target churn coefficient (aligned with commission).
-        start_ramp_frac: When to start ramping (default: 0.1 = 10%).
-        end_ramp_frac: When to finish ramping (default: 0.8 = 80%).
         shared_smooth: Shared memory for SubprocVecEnv.
         verbose: Verbosity level.
     """
 
+    # Phase definitions: (end_progress, churn_range, smooth_range)
+    # Calibré pour |PnL| / |Penalties| ≈ 1.0 en fin de training (vérifié avec check_reward_balance.py)
+    PHASES = [
+        # Phase 1: Discovery (exploration libre, pas de pénalités)
+        {'end_progress': 0.3, 'churn': (0.0, 0.05), 'smooth': (0.0, 0.0)},
+        # Phase 2: Discipline (ramp-up progressif)
+        {'end_progress': 0.7, 'churn': (0.05, 0.25), 'smooth': (0.0, 0.00003)},
+        # Phase 3: Refinement (valeurs finales: ratio ~1.0)
+        {'end_progress': 1.0, 'churn': (0.25, 0.50), 'smooth': (0.00003, 0.00005)},
+    ]
+
     def __init__(
         self,
         total_timesteps: int,
-        target_smooth_coef: float = 0.005,
-        target_churn_coef: float = 1.0,
-        start_ramp_frac: float = 0.1,
-        end_ramp_frac: float = 0.8,
         shared_smooth: Optional["Synchronized"] = None,
         verbose: int = 0
     ):
         super().__init__(verbose)
         self.total_timesteps = total_timesteps
-        self.target_smooth_coef = target_smooth_coef
-        self.target_churn_coef = target_churn_coef
-        self.start_ramp_frac = start_ramp_frac
-        self.end_ramp_frac = end_ramp_frac
         self.shared_smooth = shared_smooth
-
-        # Phase boundaries in steps
-        self.start_ramp_step = int(total_timesteps * start_ramp_frac)
-        self.end_ramp_step = int(total_timesteps * end_ramp_frac)
 
         self.current_smooth = 0.0
         self.current_churn = 0.0
         self._phase = 1
 
     def _on_step(self) -> bool:
-        step = self.num_timesteps
+        progress = self.num_timesteps / self.total_timesteps
 
-        if step < self.start_ramp_step:
-            # Phase 1: Discovery (free exploration)
-            self.current_smooth = 0.0
-            self.current_churn = 0.0
-            self._phase = 1
+        # Find current phase and interpolate
+        prev_end = 0.0
+        for phase_idx, phase in enumerate(self.PHASES):
+            if progress <= phase['end_progress']:
+                self._phase = phase_idx + 1
 
-        elif step > self.end_ramp_step:
-            # Phase 3: Refinement (hold at target)
-            self.current_smooth = self.target_smooth_coef
-            self.current_churn = self.target_churn_coef
-            self._phase = 3
+                # Linear interpolation within phase
+                phase_progress = (progress - prev_end) / (phase['end_progress'] - prev_end)
+                phase_progress = max(0.0, min(1.0, phase_progress))
 
-        else:
-            # Phase 2: Discipline (linear ramp)
-            progress = (step - self.start_ramp_step) / (self.end_ramp_step - self.start_ramp_step)
-            self.current_smooth = progress * self.target_smooth_coef
-            self.current_churn = progress * self.target_churn_coef
-            self._phase = 2
+                churn_start, churn_end = phase['churn']
+                smooth_start, smooth_end = phase['smooth']
+
+                self.current_churn = churn_start + phase_progress * (churn_end - churn_start)
+                self.current_smooth = smooth_start + phase_progress * (smooth_end - smooth_start)
+                break
+            prev_end = phase['end_progress']
 
         # Update via shared memory (SubprocVecEnv)
         if self.shared_smooth is not None:
             self.shared_smooth.value = self.current_smooth
-
-        # Fallback for DummyVecEnv
         else:
             self._update_envs()
 
@@ -617,8 +620,9 @@ class ThreePhaseCurriculumCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         if self.verbose > 0:
-            print(f"\n[3-Phase Curriculum] Configuration:")
-            print(f"  Phase 1 (Discovery):   steps 0 - {self.start_ramp_step:,} (smooth=0)")
-            print(f"  Phase 2 (Discipline):  steps {self.start_ramp_step:,} - {self.end_ramp_step:,} (ramp)")
-            print(f"  Phase 3 (Refinement):  steps {self.end_ramp_step:,}+ (smooth={self.target_smooth_coef})")
-            print(f"  Target churn_coef: {self.target_churn_coef}")
+            print(f"\n[3-Phase Curriculum] Configuration (recalibré):")
+            for i, phase in enumerate(self.PHASES):
+                pct = int(phase['end_progress'] * 100)
+                churn_str = f"{phase['churn'][0]:.2f}→{phase['churn'][1]:.2f}"
+                smooth_str = f"{phase['smooth'][0]:.4f}→{phase['smooth'][1]:.4f}"
+                print(f"  Phase {i+1} (0-{pct}%): churn={churn_str}, smooth={smooth_str}")

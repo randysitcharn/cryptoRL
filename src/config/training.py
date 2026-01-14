@@ -43,8 +43,8 @@ class TQCTrainingConfig:
     downside_coef: float = 10.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    churn_coef: float = 1.0       # Aligned with commission (1.0 = exact cost)
-    smooth_coef: float = 0.005    # Curriculum target (régularisation)
+    churn_coef: float = 0.5       # Max target après curriculum (réduit)
+    smooth_coef: float = 1e-5     # Très bas par défaut (curriculum monte à 0.001 max)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol
@@ -59,10 +59,10 @@ class TQCTrainingConfig:
 
     # --- TQC Hyperparameters ---
     total_timesteps: int = 300_000
-    learning_rate: float = 9e-5
-    buffer_size: int = 200_000
-    batch_size: int = 1024
-    gamma: float = 0.99  # Extended horizon ~100h (was 0.95 = 20h, too myopic)
+    learning_rate: float = 3e-4
+    buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
+    batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
+    gamma: float = 0.95  # Horizon ~20h (réduit pour stabilité du Critic)
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto"
     train_freq: int = 1
@@ -102,8 +102,8 @@ class TQCTrainingConfig:
     risk_augment_obs: bool = False
 
     # --- Parallelization (P0 Optimization) ---
-    n_envs: int = 4  # Number of parallel training envs (SubprocVecEnv)
-                     # Set to 1 to disable (use DummyVecEnv)
+    n_envs: Optional[int] = None  # Auto-detect from CPU cores (HardwareManager)
+                                  # Set to 1 to disable (use DummyVecEnv)
 
 
 # =============================================================================

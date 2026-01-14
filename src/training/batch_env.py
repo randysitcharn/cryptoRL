@@ -215,6 +215,11 @@ class BatchCryptoEnv(VecEnv):
         # Done flags buffer (for _build_infos optimization)
         self._dones = torch.zeros(n, dtype=torch.bool, device=device)
 
+        # Reward component buffers (pour observabilité)
+        self._rew_pnl = torch.zeros(n, device=device)
+        self._rew_churn = torch.zeros(n, device=device)
+        self._rew_smooth = torch.zeros(n, device=device)
+
     def _get_prices(self, steps: torch.Tensor) -> torch.Tensor:
         """Get prices at given steps for all envs. Shape: (n_envs,)"""
         return self.prices[steps]
@@ -239,6 +244,10 @@ class BatchCryptoEnv(VecEnv):
             "price": self.prices[self.current_steps[0]].item(),
             "position_pct": self.position_pcts.mean().item(),
             "nav_std": navs.std().item(),
+            # Reward components (for observability)
+            "avg_rew_pnl": self._rew_pnl.mean().item(),
+            "avg_rew_churn": self._rew_churn.mean().item(),
+            "avg_rew_smooth": self._rew_smooth.mean().item(),
         }
 
     def _get_batch_windows(self, steps: torch.Tensor) -> torch.Tensor:
@@ -322,8 +331,13 @@ class BatchCryptoEnv(VecEnv):
         # 5. Smoothness penalty (quadratic, regularization)
         smoothness_penalties = -self._current_smooth_coef * (position_deltas ** 2) * SCALE
 
-        # 6. Total reward
-        total = log_returns + downside_penalties + upside_bonuses + churn_penalties + smoothness_penalties
+        # 6. Store components for observability (BEFORE scaling)
+        self._rew_pnl = log_returns + downside_penalties + upside_bonuses
+        self._rew_churn = churn_penalties
+        self._rew_smooth = smoothness_penalties
+
+        # 7. Total reward
+        total = self._rew_pnl + self._rew_churn + self._rew_smooth
 
         return total * self.reward_scaling
 
