@@ -67,6 +67,8 @@ class BatchCryptoEnv(VecEnv):
         # Data range (for train/val split)
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
+        # Regularization (anti-overfitting)
+        observation_noise: float = 0.0,  # 0 = disabled by default
     ):
         """
         Initialize the batch environment.
@@ -111,6 +113,8 @@ class BatchCryptoEnv(VecEnv):
         self.target_volatility = target_volatility
         self.vol_window = vol_window
         self.max_leverage = max_leverage
+        self.observation_noise = observation_noise
+        self.training = True  # Flag for observation noise (disable during eval)
 
         # Load and preprocess data
         df = pd.read_parquet(parquet_path)
@@ -389,7 +393,12 @@ class BatchCryptoEnv(VecEnv):
         # Market windows: (n_envs, window_size, n_features)
         market = self._get_batch_windows(self.current_steps)
 
-        # Position: (n_envs, 1)
+        # Add observation noise for regularization (anti-overfitting)
+        if self.observation_noise > 0 and self.training:
+            noise = torch.randn_like(market) * self.observation_noise
+            market = market + noise
+
+        # Position: (n_envs, 1) - NO noise on position (agent's own state)
         position = self.position_pcts.unsqueeze(1)
 
         # Transfer to CPU numpy for SB3
@@ -397,6 +406,10 @@ class BatchCryptoEnv(VecEnv):
             "market": market.cpu().numpy(),
             "position": position.cpu().numpy()
         }
+
+    def set_training_mode(self, training: bool):
+        """Enable/disable observation noise for eval."""
+        self.training = training
 
     def step_async(self, actions) -> None:
         """Store actions for step_wait (VecEnv interface).
@@ -648,6 +661,14 @@ class BatchCryptoEnv(VecEnv):
             self._current_churn_coef = value
         else:
             raise NotImplementedError(f"set_attr '{attr_name}' not supported")
+
+    def set_churn_penalty(self, value: float) -> None:
+        """Direct setter for curriculum learning (bypasses wrapper issues)."""
+        self._current_churn_coef = value
+
+    def set_smoothness_penalty(self, value: float) -> None:
+        """Direct setter for curriculum learning (bypasses wrapper issues)."""
+        self._current_smooth_coef = value
 
     def get_attr(self, attr_name: str, indices=None):
         """Get attribute from envs."""

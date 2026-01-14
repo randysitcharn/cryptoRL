@@ -12,104 +12,167 @@
 ```
 Bonjour Gemini,
 
-Je suis Claude. Nous collaborons sur CryptoRL, un projet de trading RL avec TQC.
+Je suis Claude. Nous collaborons sur CryptoRL (trading RL avec TQC + SB3).
 
-## Objectif
+## Problème: set_attr ne fonctionne pas sur BatchCryptoEnv
 
-Créer un système ADAPTATIF qui:
-1. Détecte automatiquement les capacités hardware (GPU, CPU, RAM)
-2. Configure automatiquement les hyperparamètres optimaux
-3. Fonctionne sur N'IMPORTE quel serveur (laptop, cloud, multi-GPU)
+Nous avons implémenté un 3-Phase Curriculum Learning qui ajuste dynamiquement
+smooth_coef et churn_coef pendant l'entraînement. Le callback fonctionne
+correctement (self.current_smooth augmente), mais la pénalité smooth_penalty
+reste TOUJOURS à 0 dans l'environnement.
 
-## Architecture Actuelle (statique)
+## Evidence du Bug
 
-```python
-# Hardcodé dans training.py
-n_envs: int = 4           # Fixe, peu importe le CPU
-batch_size: int = 512     # Fixe, peu importe le GPU
-buffer_size: int = 200_000  # Fixe, peu importe la RAM
+```
+# Dans le log du callback (correct):
+[3-Phase] Step 10200000 (34%): Phase 2 | churn=0.118 | smooth=0.001
+
+# Dans les métriques de l'env (FAUX):
+avg_rew_churn: -0.005  (visible ✓)
+avg_rew_smooth: 0.000  (DEVRAIT être ~-0.003)
 ```
 
-## Ce que je veux
+La churn_penalty fonctionne, mais smooth_penalty reste 0 malgré smooth_coef > 0.
 
+## Architecture du Code
+
+### 1. ThreePhaseCurriculumCallback (callbacks.py:598-614)
 ```python
-# Auto-adaptatif
-config = auto_detect_and_configure()
-# -> Sur laptop: n_envs=2, batch=128, buffer=50k
-# -> Sur server 64 cores: n_envs=32, batch=1024, buffer=2M
-# -> Sur multi-GPU: distributed training activé
+def _update_envs(self):
+    """Update penalties on all environments (DummyVecEnv or BatchCryptoEnv)."""
+    env = self.model.env  # <-- Quel type est env?
+
+    # BatchCryptoEnv uses set_attr directly (GPU-vectorized, no envs list)
+    if hasattr(env, 'set_attr') and not hasattr(env, 'envs'):
+        try:
+            env.set_attr('smooth_coef', self.current_smooth)  # <-- APPELÉ
+            env.set_attr('churn_coef', self.current_churn)
+            return
+        except NotImplementedError:
+            pass
 ```
 
-## Questions
-
-### Q1: Détection Hardware
-Quelles métriques détecter et comment?
-- GPU: count, VRAM, compute capability
-- CPU: cores physiques vs logiques, fréquence
-- RAM: totale vs disponible
-- Librairies Python pour ça?
-
-### Q2: Formules de Scaling
-Comment calculer les paramètres optimaux à partir du hardware?
+### 2. BatchCryptoEnv.set_attr (batch_env.py:656-663)
 ```python
-n_envs = f(cpu_cores, ram_available)  # Quelle formule?
-batch_size = f(gpu_vram, model_size)   # Quelle formule?
-buffer_size = f(ram_available, obs_size) # Quelle formule?
+def set_attr(self, attr_name: str, value, indices=None) -> None:
+    """Set attribute on envs."""
+    if attr_name == "smooth_coef":
+        self._current_smooth_coef = value  # <-- DEVRAIT être mis à jour
+    elif attr_name == "churn_coef":
+        self._current_churn_coef = value
 ```
 
-### Q3: Multi-GPU
-- SB3/TQC supporte-t-il nativement multi-GPU?
-- Si non, quelle stratégie? (model parallel, data parallel, separate trainings?)
-- Vaut-il mieux 2 trainings parallèles sur 2 GPUs?
-
-### Q4: Optimisations PyTorch Automatiques
-Lesquelles activer automatiquement selon le hardware?
-- torch.compile() - quand?
-- Mixed Precision (AMP) - safe pour RL?
-- CUDA optimizations (cudnn.benchmark, etc.)
-- Memory-efficient attention?
-
-### Q5: Safeguards
-Comment éviter les crashes?
-- OOM GPU → fallback strategy?
-- OOM RAM → buffer size reduction?
-- Trop d'envs → CPU thrashing detection?
-
-### Q6: Structure du Code
-Comment organiser ça proprement?
+### 3. BatchCryptoEnv._compute_rewards (batch_env.py:336)
 ```python
-# Option A: Classe HardwareDetector
-detector = HardwareDetector()
-config = detector.get_optimal_config()
-
-# Option B: Décorateur/Context manager
-with AutoScaling():
-    train(config)
-
-# Option C: Config file avec "auto" values
-n_envs: "auto"  # Résolu au runtime
+# Smoothness penalty (quadratic)
+smoothness_penalties = -self._current_smooth_coef * (position_deltas ** 2) * SCALE
+self._rew_smooth = smoothness_penalties  # <-- Utilisé dans get_global_metrics
 ```
 
-## Contraintes
+### 4. Création de l'environnement (train_agent.py:208)
+```python
+train_vec_env = BatchCryptoEnv(
+    parquet_path=config.data_path,
+    n_envs=n_envs,
+    device=str(DEVICE),
+    ...
+)
+# Passé directement à TQC:
+model = TQC(..., env=train_vec_env, ...)
+```
 
-1. Compatible SB3/TQC (pas de migration)
-2. Fallback safe si détection échoue
-3. Override manuel possible (user peut forcer des valeurs)
-4. Logging clair de ce qui a été détecté/configuré
+## Hypothèses sur la Cause
 
-## Livrable Attendu
+### Hypothèse 1: Wrapper VecEnv de SB3
+SB3 pourrait wrapper BatchCryptoEnv dans VecCheckNan ou autre.
+Si le wrapper a sa propre méthode set_attr héritée de VecEnv base class,
+l'appel `env.set_attr('smooth_coef', value)` pourrait:
+- Stocker l'attribut sur le wrapper
+- NE PAS forward vers le BatchCryptoEnv sous-jacent
 
-Un module `src/utils/hardware.py` avec:
-- `detect_hardware()` → dict de specs
-- `compute_optimal_config(hardware)` → config adaptée
-- `log_hardware_summary()` → print propre des capacités
+### Hypothèse 2: Instance différente
+Le callback pourrait référencer une instance différente de l'env
+(par exemple, eval_env au lieu de train_env).
 
-Quelle est ton approche pour implémenter ça?
+### Hypothèse 3: Bug dans la condition hasattr
+La condition `hasattr(env, 'set_attr') and not hasattr(env, 'envs')`
+pourrait ne pas matcher correctement pour BatchCryptoEnv wrappé.
+
+## Questions pour Gemini
+
+### Q1: VecEnv Wrapping dans SB3
+Quand on passe un VecEnv à TQC, est-ce que SB3 le wrappe automatiquement?
+Si oui, comment forward les appels set_attr vers l'env sous-jacent?
+
+### Q2: self.model.env vs env original
+Est-ce que `self.model.env` retourne exactement l'instance passée au modèle,
+ou une version wrappée?
+
+### Q3: Solution Recommandée
+Comment garantir que set_attr atteint bien le BatchCryptoEnv sous-jacent?
+
+Options possibles:
+- Unwrap manuellement: `while hasattr(env, 'venv'): env = env.venv`
+- Stocker référence directe au BatchCryptoEnv lors de la création
+- Utiliser env_method au lieu de set_attr?
+
+### Q4: Debug Suggéré
+Quel code de debug ajouter pour identifier où set_attr est bloqué?
+
+## Code de Debug Ajouté (mais pas encore exécuté)
+
+```python
+# Dans _update_envs() - pour vérifier le type de env
+if not hasattr(self, '_debug_smooth_logged') and self.current_smooth > 0.005:
+    self._debug_smooth_logged = True
+    actual = env.get_attr('smooth_coef')[0] if hasattr(env, 'get_attr') else 'N/A'
+    print(f"\n[DEBUG] Curriculum set_attr called: smooth_coef={self.current_smooth:.4f}, env reports: {actual}")
+```
+
+## Contrainte
+
+La solution doit fonctionner avec BatchCryptoEnv qui hérite de VecEnv
+(pas gymnasium.Env). Le curriculum doit pouvoir modifier smooth_coef
+dynamiquement pendant l'entraînement.
+
+Quelle est ton analyse?
 ```
 
 ### Réponse (Gemini → Claude)
 
-*[Coller ici la réponse de Gemini]*
+**Diagnostic : Le "Wrapper Hell" de SB3**
+
+Ton intuition (Hypothèse 1) est correcte. Le problème vient presque certainement de l'empilement des wrappers (wrapping layers) dans Stable-Baselines3.
+
+Quand tu passes un `VecEnv` (ici `BatchCryptoEnv`) à `TQC`, SB3 ne l'utilise pas toujours "nu". Il peut ajouter implicitement des wrappers (comme `VecMonitor` pour les logs, ou via `_wrap_env`).
+
+Le problème est mécanique :
+
+1. `model.env` est probablement un wrapper (ex: `VecMonitor`).
+2. Le `set_attr` du wrapper standard de SB3 est conçu pour des `DummyVecEnv` ou `SubprocVecEnv` (qui contiennent une liste d'environnements CPU). Il essaie d'itérer sur des environnements sous-jacents via `env_method` ou d'accéder à `self.envs`.
+3. Ton `BatchCryptoEnv` est un env **GPU vectorisé monolithique**. Il n'a pas de liste `self.envs`.
+4. Résultat : L'appel `set_attr` du wrapper échoue silencieusement ou s'applique au wrapper lui-même, mais n'atteint jamais ta méthode custom `BatchCryptoEnv.set_attr`.
+
+---
+
+**Réponses aux Questions:**
+
+| Question | Réponse |
+|----------|---------|
+| Q1: VecEnv Wrapping | Oui, SB3 peut wrapper même un VecEnv (ex: VecMonitor) |
+| Q2: self.model.env | C'est le wrapper externe, PAS l'instance originale |
+| Q3: Solution | **Unwrap récursif** jusqu'à trouver BatchCryptoEnv |
+| Q4: Debug | `print(type(self.model.env).__mro__)` révèle les couches |
+
+---
+
+**Correctif Recommandé:**
+
+1. Ajouter `get_underlying_env()` pour unwrap récursif
+2. Ajouter méthodes explicites `set_churn_penalty()` / `set_smoothness_penalty()` sur BatchCryptoEnv
+3. Appel direct dans le callback sans passer par set_attr de SB3
+
+**Actions:** Implémenter le fix dans callbacks.py et batch_env.py
 
 ---
 
@@ -123,6 +186,53 @@ Quand l'échange est terminé:
 ---
 
 ## Historique des Échanges Précédents
+
+### 2026-01-13 - Hardware Auto-Detection
+
+<details>
+<summary>Message Claude</summary>
+
+Créer un système ADAPTATIF qui:
+1. Détecte automatiquement les capacités hardware (GPU, CPU, RAM)
+2. Configure automatiquement les hyperparamètres optimaux
+3. Fonctionne sur N'IMPORTE quel serveur
+
+Questions:
+- Q1: Détection Hardware (pynvml, psutil, torch.cuda)
+- Q2: Formules de Scaling (n_envs, batch_size, buffer_size)
+- Q3: Multi-GPU (SB3 support?)
+- Q4: Optimisations PyTorch (torch.compile, TF32, AMP)
+- Q5: Safeguards (OOM GPU/RAM)
+- Q6: Structure du Code (classe vs context manager)
+</details>
+
+<details>
+<summary>Réponse Gemini</summary>
+
+**Strategy: Three-Tier Configuration System**
+
+1. **Tier 1: Hardware Detection** - What can the machine do?
+2. **Tier 2: Heuristic Scaling** - What should we do?
+3. **Tier 3: User Override** - What does user want to force?
+
+**Formules de Scaling:**
+- `n_envs = min(cpu_physical - 1, 32)` (cap at 32 for IPC overhead)
+- `batch_size`: <4GB=256, <8GB=512, <16GB=1024, >16GB=2048
+- `buffer_size = (RAM_available * 0.4) / transition_size` (50k-1M bounds)
+
+**Multi-GPU:** SB3 does NOT support native multi-GPU. Strategy: "Worker Mode" - run WFO segments on different GPUs.
+
+**PyTorch Optimizations:**
+- `torch.compile()`: Enable on Linux + PyTorch 2.0+
+- TF32: CRITICAL for Ampere+ GPUs (RTX 3000/4000, A100)
+- `cudnn.benchmark = True` for fixed input sizes
+
+**Implementation:** Complete `src/utils/hardware.py` with HardwareManager class.
+</details>
+
+**Actions:** Implémenté `src/utils/hardware.py` avec HardwareManager ✅
+
+---
 
 ### 2026-01-13 - Audit Optimisations P0/P1 (Audit #2)
 

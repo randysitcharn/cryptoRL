@@ -51,6 +51,36 @@ def get_next_run_dir(base_dir: str, prefix: str = "run") -> str:
     return os.path.join(base_dir, f"{prefix}_{next_num}")
 
 
+def get_underlying_batch_env(env):
+    """
+    Unwrap récursif pour trouver BatchCryptoEnv sous les wrappers SB3.
+
+    SB3 peut wrapper les VecEnv dans VecMonitor, VecNormalize, etc.
+    Ces wrappers ne forwardent pas correctement set_attr pour les envs GPU.
+
+    Args:
+        env: L'environnement (potentiellement wrappé)
+
+    Returns:
+        L'instance BatchCryptoEnv sous-jacente, ou l'env original si non trouvé
+    """
+    depth = 0
+    while depth < 20:
+        # Cible atteinte (méthode spécifique BatchCryptoEnv)
+        if hasattr(env, 'set_smoothness_penalty'):
+            return env
+        # Wrapper VecEnv (ex: VecMonitor, VecNormalize)
+        elif hasattr(env, 'venv'):
+            env = env.venv
+        # Wrapper Gym standard
+        elif hasattr(env, 'env'):
+            env = env.env
+        else:
+            break
+        depth += 1
+    return env
+
+
 # ============================================================================
 # TensorBoard Callbacks
 # ============================================================================
@@ -524,10 +554,10 @@ class ThreePhaseCurriculumCallback(BaseCallback):
 
     Phases avec interpolation linéaire dans chaque phase:
     - Phase 1 (0-30%): Discovery - churn 0→0.05, smooth=0
-    - Phase 2 (30-70%): Discipline - churn 0.05→0.20, smooth 0→0.0005
-    - Phase 3 (70-100%): Refinement - churn 0.20→0.50, smooth 0.0005→0.001
+    - Phase 2 (30-70%): Discipline - churn 0.05→0.25, smooth 0→0.01
+    - Phase 3 (70-100%): Refinement - churn 0.25→0.50, smooth 0.01→0.02
 
-    Les pénalités augmentent progressivement pour ne pas dominer le PnL.
+    smooth_coef=0.02 final donne penalty ≈ -0.005 (comparable au churn_penalty).
 
     Args:
         total_timesteps: Total training timesteps.
@@ -536,14 +566,15 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     """
 
     # Phase definitions: (end_progress, churn_range, smooth_range)
-    # Calibré pour |PnL| / |Penalties| ≈ 1.0 en fin de training (vérifié avec check_reward_balance.py)
+    # Calibré pour |PnL| / |Penalties| ≈ 1.0 en fin de training
+    # smooth_coef x100 pour effet visible (penalty = -smooth * delta², delta~0.05)
     PHASES = [
         # Phase 1: Discovery (exploration libre, pas de pénalités)
         {'end_progress': 0.3, 'churn': (0.0, 0.05), 'smooth': (0.0, 0.0)},
         # Phase 2: Discipline (ramp-up progressif)
-        {'end_progress': 0.7, 'churn': (0.05, 0.25), 'smooth': (0.0, 0.00003)},
-        # Phase 3: Refinement (valeurs finales: ratio ~1.0)
-        {'end_progress': 1.0, 'churn': (0.25, 0.50), 'smooth': (0.00003, 0.00005)},
+        {'end_progress': 0.7, 'churn': (0.05, 0.25), 'smooth': (0.0, 0.01)},
+        # Phase 3: Refinement (valeurs finales - smooth_coef=0.02 donne penalty ≈ -0.005)
+        {'end_progress': 1.0, 'churn': (0.25, 0.50), 'smooth': (0.01, 0.02)},
     ]
 
     def __init__(
@@ -595,22 +626,20 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         return True
 
     def _update_envs(self):
-        """Update penalties on all environments (DummyVecEnv or BatchCryptoEnv)."""
-        env = self.model.env
+        """Update penalties on all environments (unwrap for BatchCryptoEnv)."""
+        # Unwrap pour atteindre BatchCryptoEnv sous les wrappers SB3
+        real_env = get_underlying_batch_env(self.model.env)
 
-        # BatchCryptoEnv uses set_attr directly (GPU-vectorized, no envs list)
-        if hasattr(env, 'set_attr') and not hasattr(env, 'envs'):
-            try:
-                env.set_attr('smooth_coef', self.current_smooth)
-                env.set_attr('churn_coef', self.current_churn)
-                return
-            except NotImplementedError:
-                pass  # Fall through to DummyVecEnv path
+        # Appel direct (contourne le Wrapper Hell de SB3)
+        if hasattr(real_env, 'set_smoothness_penalty'):
+            real_env.set_smoothness_penalty(self.current_smooth)
+            real_env.set_churn_penalty(self.current_churn)
+            return
 
-        # DummyVecEnv path - access individual environments
-        if isinstance(env, VecEnv) and hasattr(env, 'envs'):
-            for i in range(env.num_envs):
-                base_env = env.envs[i]
+        # Fallback: DummyVecEnv path (CPU envs)
+        if isinstance(self.model.env, VecEnv) and hasattr(self.model.env, 'envs'):
+            for i in range(self.model.env.num_envs):
+                base_env = self.model.env.envs[i]
                 while hasattr(base_env, 'env'):
                     base_env = base_env.env
                 if hasattr(base_env, 'set_smooth_coef'):
@@ -626,3 +655,62 @@ class ThreePhaseCurriculumCallback(BaseCallback):
                 churn_str = f"{phase['churn'][0]:.2f}→{phase['churn'][1]:.2f}"
                 smooth_str = f"{phase['smooth'][0]:.4f}→{phase['smooth'][1]:.4f}"
                 print(f"  Phase {i+1} (0-{pct}%): churn={churn_str}, smooth={smooth_str}")
+
+
+# ============================================================================
+# Overfitting Guard Callback
+# ============================================================================
+
+class OverfittingGuardCallback(BaseCallback):
+    """
+    Early stopping if training shows signs of overfitting.
+
+    Triggers abort if NAV exceeds threshold (e.g., 5x initial = +400%).
+    Such returns are unrealistic and indicate memorization of training data.
+    """
+
+    def __init__(
+        self,
+        nav_threshold: float = 5.0,  # 5x = +400%
+        initial_nav: float = 10_000.0,
+        check_freq: int = 25_600,
+        verbose: int = 1
+    ):
+        """
+        Args:
+            nav_threshold: Multiplier of initial NAV to trigger stop (5.0 = +400%).
+            initial_nav: Starting portfolio value.
+            check_freq: How often to check (in timesteps).
+            verbose: Verbosity level.
+        """
+        super().__init__(verbose)
+        self.nav_threshold = nav_threshold
+        self.initial_nav = initial_nav
+        self.check_freq = check_freq
+        self.max_nav_seen = initial_nav
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.check_freq != 0:
+            return True
+
+        # Get current NAV from env
+        env = self.training_env
+        if hasattr(env, 'get_global_metrics'):
+            metrics = env.get_global_metrics()
+            current_nav = metrics.get("portfolio_value", self.initial_nav)
+            self.max_nav_seen = max(self.max_nav_seen, current_nav)
+
+            # Check threshold
+            if self.max_nav_seen > self.initial_nav * self.nav_threshold:
+                ratio = self.max_nav_seen / self.initial_nav
+                print("\n" + "=" * 60)
+                print("  EARLY STOPPING: Potential Overfitting Detected!")
+                print("=" * 60)
+                print(f"  Max NAV seen: {self.max_nav_seen:,.0f}")
+                print(f"  Ratio vs initial: {ratio:.1f}x (+{(ratio-1)*100:.0f}%)")
+                print(f"  Threshold: {self.nav_threshold}x")
+                print("  Such returns are unrealistic - likely memorization.")
+                print("=" * 60 + "\n")
+                return False  # Stop training
+
+        return True
