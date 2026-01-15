@@ -394,7 +394,12 @@ def create_callbacks(
     return callbacks, detail_callback
 
 
-def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_env: bool = False) -> tuple[TQC, dict]:
+def train(
+    config: TrainingConfig = None,
+    hw_overrides: dict = None,
+    use_batch_env: bool = False,
+    resume_path: str = None
+) -> tuple[TQC, dict]:
     """
     Train TQC agent with Foundation Model feature extractor.
 
@@ -404,6 +409,8 @@ def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_en
                       (e.g., {"n_envs": 4, "batch_size": 512})
         use_batch_env: If True, use BatchCryptoEnv (GPU-vectorized) instead of SubprocVecEnv.
                        This runs all envs in a single process using GPU tensors (10-50x speedup).
+        resume_path: Path to checkpoint to resume from (e.g., tqc_last.zip).
+                     If provided, loads model and continues TensorBoard steps.
 
     Returns:
         Tuple of (Trained TQC model, training metrics dict).
@@ -486,13 +493,17 @@ def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_en
     # Use custom name for TensorBoard if provided
     tb_log_name = config.name if config.name else "TQC"
 
-    if config.load_model_path:
-        # ========== LIGHTWEIGHT RESUME MODE ==========
-        print(f"\n[3/4] Loading model from {config.load_model_path}...")
-        print("      Mode: Lightweight Resume (no buffer)")
+    # Determine resume path: explicit resume_path takes precedence
+    effective_resume_path = resume_path if resume_path and os.path.exists(resume_path) else config.load_model_path
+    is_resume = effective_resume_path is not None
+
+    if effective_resume_path:
+        # ========== RESUME MODE ==========
+        print(f"\n[3/4] 🔄 RESUMING training from {effective_resume_path}...")
+        print("      Mode: Resume (continuing TensorBoard steps)")
 
         model = TQC.load(
-            config.load_model_path,
+            effective_resume_path,
             env=train_env,
             device=DEVICE,
             tensorboard_log=config.tensorboard_log,
@@ -575,8 +586,8 @@ def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_en
         config, eval_env, shared_fee=shared_fee, shared_smooth=shared_smooth
     )
 
+    # Note: is_resume was set earlier in Model Creation section
     # reset_num_timesteps=False continues TensorBoard from previous run
-    is_resume = config.load_model_path is not None
 
     # ==================== Initialize Curriculum State (Gemini safeguard) ====================
     # Prevents "First Step" lag where shared values might be uninitialized

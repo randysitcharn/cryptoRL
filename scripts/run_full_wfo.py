@@ -55,6 +55,7 @@ class WFOConfig:
 
     # GPU Acceleration
     use_batch_env: bool = True  # Use BatchCryptoEnv for GPU-accelerated training (default ON)
+    resume: bool = False  # Resume TQC training from tqc_last.zip
     output_dir: str = "data/wfo"
     models_dir: str = "models/wfo"
     weights_dir: str = "weights/wfo"
@@ -423,7 +424,8 @@ class WFOPipeline:
         train_path: str,
         encoder_path: str,
         segment_id: int,
-        use_batch_env: bool = False
+        use_batch_env: bool = False,
+        resume: bool = False
     ) -> tuple[str, Dict[str, Any]]:
         """
         Train TQC agent on segment train data.
@@ -433,6 +435,7 @@ class WFOPipeline:
             encoder_path: Path to encoder weights.
             segment_id: Segment identifier.
             use_batch_env: If True, use GPU-accelerated BatchCryptoEnv.
+            resume: If True, resume from tqc_last.zip (continues TensorBoard steps).
 
         Returns:
             Tuple of (path to saved agent, training metrics dict).
@@ -484,7 +487,23 @@ class WFOPipeline:
             'n_envs': self.config.n_envs,
             'batch_size': self.config.batch_size
         } if use_batch_env else None
-        model, train_metrics = train(config, hw_overrides=hw_overrides, use_batch_env=use_batch_env)
+
+        # Resume logic: use tqc_last.zip if --resume flag is set
+        resume_path = None
+        if resume:
+            tqc_last_path = os.path.join(weights_dir, "tqc_last.zip")
+            if os.path.exists(tqc_last_path):
+                resume_path = tqc_last_path
+                print(f"  🔄 RESUME MODE: Loading from {tqc_last_path}")
+            else:
+                print(f"  ⚠️ Resume requested but {tqc_last_path} not found. Starting fresh.")
+
+        model, train_metrics = train(
+            config,
+            hw_overrides=hw_overrides,
+            use_batch_env=use_batch_env,
+            resume_path=resume_path
+        )
 
         print(f"  TQC trained. Saved: {config.save_path}")
 
@@ -685,7 +704,8 @@ class WFOPipeline:
         self,
         df_raw: pd.DataFrame,
         segment: Dict[str, int],
-        use_batch_env: bool = False
+        use_batch_env: bool = False,
+        resume: bool = False
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Run full WFO pipeline for a single segment.
@@ -694,6 +714,7 @@ class WFOPipeline:
             df_raw: Raw DataFrame with OHLCV data.
             segment: Segment boundaries dict.
             use_batch_env: If True, use GPU-accelerated BatchCryptoEnv for TQC.
+            resume: If True, resume TQC training from tqc_last.zip.
 
         Returns:
             Tuple of (metrics dict, train_metrics dict) for this segment.
@@ -725,7 +746,9 @@ class WFOPipeline:
 
         # 5. TQC Training
         tqc_path, train_metrics = self.train_tqc(
-            train_path, encoder_path, segment_id, use_batch_env=use_batch_env
+            train_path, encoder_path, segment_id,
+            use_batch_env=use_batch_env,
+            resume=resume
         )
 
         # 6. Evaluation (skip context_rows in metrics)
@@ -747,10 +770,11 @@ class WFOPipeline:
 
     def _cleanup_segment(self, segment_id: int) -> int:
         """
-        Clean up intermediate files after segment results are saved.
+        Clean up intermediate files and implement Swap & Archive logic.
 
-        Removes redundant checkpoints while keeping essential files
-        (tqc.zip, encoder.pth, train.parquet) for evaluation.
+        Artifact Strategy:
+        - tqc.zip: BEST model (highest eval reward) - used for evaluation
+        - tqc_last.zip: LAST model (end of training) - used for resume/extend
 
         Args:
             segment_id: ID of the segment to clean up
@@ -763,7 +787,30 @@ class WFOPipeline:
         freed_bytes = 0
         segment_weights_dir = Path(self.config.models_dir) / f"segment_{segment_id}"
 
-        # 1. Remove checkpoints/ directory (largest, redundant with tqc.zip)
+        # === SWAP & ARCHIVE LOGIC ===
+        tqc_path = segment_weights_dir / "tqc.zip"
+        tqc_last_path = segment_weights_dir / "tqc_last.zip"
+        best_model_path = segment_weights_dir / "best_model.zip"
+
+        # Step A: Archive Last (tqc.zip -> tqc_last.zip)
+        if tqc_path.exists():
+            tqc_path.rename(tqc_last_path)
+            print(f"  [ARCHIVE] tqc.zip -> tqc_last.zip (Resume point)")
+
+        # Step B: Promote Best or Fallback
+        if best_model_path.exists():
+            # Promote best_model.zip to tqc.zip
+            best_model_path.rename(tqc_path)
+            print(f"  🏆 Optimization: 'tqc.zip' is now the BEST model (Eval). "
+                  f"Last state archived as 'tqc_last.zip' (Resume).")
+        elif tqc_last_path.exists():
+            # Fallback: copy tqc_last.zip back to tqc.zip
+            shutil.copy2(tqc_last_path, tqc_path)
+            print(f"  ⚠️ No best_model found. 'tqc.zip' remains the LAST model.")
+
+        # === CLEANUP INTERMEDIATE FILES ===
+
+        # 1. Remove checkpoints/ directory (intermediate periodic saves)
         checkpoints_dir = segment_weights_dir / "checkpoints"
         if checkpoints_dir.exists():
             size = sum(f.stat().st_size for f in checkpoints_dir.rglob('*') if f.is_file())
@@ -771,15 +818,7 @@ class WFOPipeline:
             freed_bytes += size
             print(f"  [CLEANUP] Removed checkpoints/: {size / 1024 / 1024:.1f} MB")
 
-        # 2. Remove best_model.zip (redundant with tqc.zip)
-        best_model = segment_weights_dir / "best_model.zip"
-        if best_model.exists():
-            size = best_model.stat().st_size
-            best_model.unlink()
-            freed_bytes += size
-            print(f"  [CLEANUP] Removed best_model.zip: {size / 1024 / 1024:.1f} MB")
-
-        # 3. Remove mae_full.pth (encoder.pth is sufficient for inference)
+        # 2. Remove mae_full.pth (encoder.pth is sufficient for inference)
         mae_full = segment_weights_dir / "mae_full.pth"
         if mae_full.exists():
             size = mae_full.stat().st_size
@@ -1068,7 +1107,9 @@ class WFOPipeline:
         for segment in segments:
             try:
                 metrics, train_metrics = self.run_segment(
-                    df_raw, segment, use_batch_env=self.config.use_batch_env
+                    df_raw, segment,
+                    use_batch_env=self.config.use_batch_env,
+                    resume=self.config.resume
                 )
                 all_metrics.append(metrics)
                 self.save_results(metrics)
@@ -1245,6 +1286,8 @@ def main():
                         help="Comma-separated segment IDs to evaluate (e.g., '0,1,2')")
     parser.add_argument("--no-batch-env", action="store_true",
                         help="Disable GPU-accelerated BatchCryptoEnv (Force CPU mode)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from tqc_last.zip (continues TensorBoard steps)")
 
     args = parser.parse_args()
 
@@ -1263,6 +1306,11 @@ def main():
         config.use_batch_env = False
     else:
         config.use_batch_env = True
+
+    # Resume mode: continue from tqc_last.zip
+    if args.resume:
+        print("[INFO] RESUME MODE: Will continue from tqc_last.zip (TensorBoard continues)")
+        config.resume = True
 
     # Create pipeline
     pipeline = WFOPipeline(config)
