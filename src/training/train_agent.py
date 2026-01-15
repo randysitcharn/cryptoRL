@@ -34,6 +34,7 @@ from src.training.callbacks import (
     DetailTensorboardCallback,
     CurriculumFeesCallback,
     ThreePhaseCurriculumCallback,
+    OverfittingGuardCallback,
 )
 
 
@@ -223,6 +224,7 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
             vol_window=config.vol_window,
             max_leverage=config.max_leverage,
             price_column='BTC_Close',
+            observation_noise=config.observation_noise,  # Anti-overfitting
         )
         # Note: Curriculum updates use env.set_attr() for BatchCryptoEnv
 
@@ -379,6 +381,15 @@ def create_callbacks(
             verbose=1
         )
         callbacks.append(curriculum_callback)
+
+    # Overfitting guard - stop training if NAV exceeds 5x (unrealistic returns)
+    overfitting_guard = OverfittingGuardCallback(
+        nav_threshold=5.0,
+        initial_nav=10_000.0,
+        check_freq=25_600,  # Check every ~25k steps
+        verbose=1
+    )
+    callbacks.append(overfitting_guard)
 
     return callbacks, detail_callback
 
@@ -541,6 +552,18 @@ def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_en
 
     print(f"      Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
     print(f"      Trainable parameters: {sum(p.numel() for p in model.policy.parameters() if p.requires_grad):,}")
+
+    # --- OPTIMIZATION: JIT Compilation (Phase 2) ---
+    # Apply torch.compile to the policy network if CUDA is available
+    if torch.cuda.is_available() and hasattr(torch, "compile"):
+        print("\n[Optim] Enabling torch.compile() for TQC Policy...")
+        try:
+            # Mode 'reduce-overhead' is best for RL (small batches, high frequency)
+            model.policy = torch.compile(model.policy, mode="reduce-overhead")
+            print("[Optim] JIT Compilation ACTIVE (mode='reduce-overhead').")
+        except Exception as e:
+            print(f"[Optim] Compilation failed, falling back to eager mode: {e}")
+    # -----------------------------------------------
 
     # ==================== Training ====================
     print("\n[4/4] Starting training...")
