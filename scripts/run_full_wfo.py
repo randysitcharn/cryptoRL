@@ -403,6 +403,9 @@ class WFOPipeline:
         config.tensorboard_log = "logs/wfo/mae/"
         config.run_name = f"segment_{segment_id}"
 
+        # DEBUG: Verify d_model alignment
+        print(f"  DEBUG: Starting MAE Training with d_model={config.d_model}")
+
         # Train
         model, best_loss = train(config, from_scratch=True)
 

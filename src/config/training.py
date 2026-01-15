@@ -167,7 +167,7 @@ class FoundationTrainingConfig:
     train_ratio: float = 0.8
 
     # --- Model Architecture ---
-    d_model: int = 128
+    d_model: int = 256  # Updated to match TQC d_model
     n_heads: int = 4
     n_layers: int = 2
     dropout: float = 0.1
