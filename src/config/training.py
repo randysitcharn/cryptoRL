@@ -51,6 +51,9 @@ class TQCTrainingConfig:
     vol_window: int = 24
     max_leverage: float = 2.0
 
+    # Regularization (anti-overfitting)
+    observation_noise: float = 0.01  # 1% Gaussian noise on market observations
+
     # --- Foundation Model ---
     d_model: int = 128
     n_heads: int = 4
@@ -58,8 +61,8 @@ class TQCTrainingConfig:
     freeze_encoder: bool = True
 
     # --- TQC Hyperparameters ---
-    total_timesteps: int = 300_000
-    learning_rate: float = 3e-4
+    total_timesteps: int = 3_000_000  # 3M (réduit pour éviter overfitting)
+    learning_rate: float = 1e-4      # Réduit pour éviter mémorisation
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
     gamma: float = 0.95  # Horizon ~20h (réduit pour stabilité du Critic)
