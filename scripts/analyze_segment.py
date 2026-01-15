@@ -140,7 +140,7 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
     nav_history = np.array(nav_history)
 
     total_return = calculate_total_return(nav_history)
-    sharpe_ratio = calculate_sharpe_ratio(returns, annualize=True)
+    sharpe_ratio = calculate_sharpe_ratio(returns)  # Already annualized (8760 periods/year)
     max_drawdown = calculate_max_drawdown(nav_history)
     win_rate = calculate_win_rate(returns)
 
