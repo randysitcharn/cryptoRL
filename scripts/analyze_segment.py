@@ -83,7 +83,7 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
         window_size=64,
         commission=0.0006,  # Lower commission for eval (realistic)
         episode_length=len(test_df) - 64,  # Full test period
-        mode="eval",
+        random_start=False,  # Deterministic start for eval
     )
 
     # Load model
