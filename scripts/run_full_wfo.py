@@ -68,17 +68,20 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 50_000_000  # 50M steps per segment
+    tqc_timesteps: int = 30_000_000  # 30M steps
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4      # Réduit pour éviter mémorisation
     buffer_size: int = 2_500_000  # 2.5M replay buffer
     n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
-    batch_size: int = 512  # Fixed batch size for stability
-    gamma: float = 0.99    # Extended horizon ~100h (was 0.95 = 20h myopic)
+    batch_size: int = 2048  # Large batch for GPU efficiency
+    gamma: float = 0.95    # Horizon ~20h (réduit pour stabilité du Critic)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
-    churn_coef: float = 1.0    # Aligned with commission (1.0 = exact cost)
-    smooth_coef: float = 0.005  # Curriculum target (x100 SCALE in env)
+    churn_coef: float = 0.5    # Max target après curriculum (réduit)
+    smooth_coef: float = 1e-5  # Très bas (curriculum monte à 0.00005 max)
+
+    # Regularization (anti-overfitting)
+    observation_noise: float = 0.01  # 1% Gaussian noise on market observations
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol
@@ -450,6 +453,7 @@ class WFOPipeline:
         config.ent_coef = self.config.ent_coef
         config.churn_coef = self.config.churn_coef
         config.smooth_coef = self.config.smooth_coef
+        config.observation_noise = self.config.observation_noise  # Anti-overfitting
         config.target_volatility = self.config.target_volatility
         config.vol_window = self.config.vol_window
         config.max_leverage = self.config.max_leverage
@@ -754,7 +758,7 @@ class WFOPipeline:
         import shutil
 
         freed_bytes = 0
-        segment_weights_dir = self.config.model_dir / f"segment_{segment_id}"
+        segment_weights_dir = Path(self.config.models_dir) / f"segment_{segment_id}"
 
         # 1. Remove checkpoints/ directory (largest, redundant with tqc.zip)
         checkpoints_dir = segment_weights_dir / "checkpoints"
@@ -1236,8 +1240,8 @@ def main():
                         help="Re-run evaluation only (skip MAE/TQC training)")
     parser.add_argument("--eval-segments", type=str, default=None,
                         help="Comma-separated segment IDs to evaluate (e.g., '0,1,2')")
-    parser.add_argument("--use-batch-env", action="store_true",
-                        help="Use GPU-accelerated BatchCryptoEnv for TQC training (10-50x speedup)")
+    parser.add_argument("--no-batch-env", action="store_true",
+                        help="Disable GPU-accelerated BatchCryptoEnv (Force CPU mode)")
 
     args = parser.parse_args()
 
@@ -1249,7 +1253,13 @@ def main():
     config.train_months = args.train_months
     config.test_months = args.test_months
     config.step_months = args.step_months
-    config.use_batch_env = args.use_batch_env
+    # Default to GPU (True) unless explicitly disabled via CLI
+    # This prevents accidental CPU runs which are 100x slower
+    if args.no_batch_env:
+        print("[WARNING] GPU Acceleration DISABLED via --no-batch-env flag")
+        config.use_batch_env = False
+    else:
+        config.use_batch_env = True
 
     # Create pipeline
     pipeline = WFOPipeline(config)
