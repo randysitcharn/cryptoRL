@@ -554,15 +554,14 @@ def train(config: TrainingConfig = None, hw_overrides: dict = None, use_batch_en
     print(f"      Trainable parameters: {sum(p.numel() for p in model.policy.parameters() if p.requires_grad):,}")
 
     # --- OPTIMIZATION: JIT Compilation (Phase 2) ---
-    # Apply torch.compile to the policy network if CUDA is available
-    if torch.cuda.is_available() and hasattr(torch, "compile"):
-        print("\n[Optim] Enabling torch.compile() for TQC Policy...")
-        try:
-            # Mode 'reduce-overhead' is best for RL (small batches, high frequency)
-            model.policy = torch.compile(model.policy, mode="reduce-overhead")
-            print("[Optim] JIT Compilation ACTIVE (mode='reduce-overhead').")
-        except Exception as e:
-            print(f"[Optim] Compilation failed, falling back to eager mode: {e}")
+    # TEMPORARILY DISABLED: Causes state_dict keys mismatch during WFO loading/eval
+    # if torch.cuda.is_available() and hasattr(torch, "compile"):
+    #     print("\n[Optim] Enabling torch.compile() for TQC Policy...")
+    #     try:
+    #         model.policy = torch.compile(model.policy, mode="reduce-overhead")
+    #         print("[Optim] JIT Compilation ACTIVE (mode='reduce-overhead').")
+    #     except Exception as e:
+    #         print(f"[Optim] Compilation failed, falling back to eager mode: {e}")
     # -----------------------------------------------
 
     # ==================== Training ====================
