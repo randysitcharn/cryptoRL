@@ -75,7 +75,7 @@ class WFOConfig:
     buffer_size: int = 2_500_000  # 2.5M replay buffer
     n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
     batch_size: int = 2048  # Large batch for GPU efficiency
-    gamma: float = 0.95    # Horizon ~20h (réduit pour stabilité du Critic)
+    gamma: float = 0.99    # Horizon ~100h (increased for long-term strategy)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 0.5    # Max target après curriculum (réduit)
     smooth_coef: float = 1e-5  # Très bas (curriculum monte à 0.00005 max)

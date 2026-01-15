@@ -40,6 +40,7 @@ class TQCTrainingConfig:
 
     # Reward function (x100 SCALE applied in env.py)
     reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
+    # TODO: Monitor for risk paralysis (0 trades). Decrease to 2.0 if needed.
     downside_coef: float = 10.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
@@ -55,7 +56,7 @@ class TQCTrainingConfig:
     observation_noise: float = 0.01  # 1% Gaussian noise on market observations
 
     # --- Foundation Model ---
-    d_model: int = 128
+    d_model: int = 256  # Increased capacity for complex patterns
     n_heads: int = 4
     n_layers: int = 2
     freeze_encoder: bool = True
@@ -65,7 +66,7 @@ class TQCTrainingConfig:
     learning_rate: float = 1e-4      # Réduit pour éviter mémorisation
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
-    gamma: float = 0.95  # Horizon ~20h (réduit pour stabilité du Critic)
+    gamma: float = 0.99  # Horizon ~100h (increased for long-term strategy)
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto"
     train_freq: int = 1
