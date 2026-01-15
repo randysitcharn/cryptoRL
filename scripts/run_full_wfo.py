@@ -66,6 +66,7 @@ class WFOConfig:
     test_months: int = 3
     step_months: int = 3  # Rolling step
     hours_per_month: int = 720  # 30 days * 24 hours
+    window_size: int = 64  # Observation window for transformer encoder
 
     # Training Parameters
     mae_epochs: int = 90
@@ -74,7 +75,7 @@ class WFOConfig:
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 3e-4      # Increased for faster convergence
     buffer_size: int = 2_500_000  # 2.5M replay buffer
-    n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
+    n_envs: int = 512   # Optimized for dual-GPU parallel run (CPU bottleneck relief)
     batch_size: int = 2048  # Large batch for GPU efficiency
     gamma: float = 0.99    # Horizon ~100h (increased for long-term strategy)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
@@ -474,9 +475,10 @@ class WFOPipeline:
         config.tensorboard_log = f"logs/wfo/segment_{segment_id}/"
         config.name = f"WFO_seg{segment_id}"
 
-        # We don't have separate eval data in WFO mode
-        # Use train data for eval (not ideal but necessary)
-        config.eval_data_path = train_path
+        # NOTE: eval_data_path intentionally NOT set to avoid data leakage.
+        # Using train data for EvalCallback would select the most overfitted model.
+        # Instead, we rely on _organize_artifacts to use tqc_last.zip (final curriculum state).
+        # config.eval_data_path = train_path  # DISABLED: causes data leakage
 
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.tensorboard_log, exist_ok=True)
@@ -558,7 +560,7 @@ class WFOPipeline:
         # Create test environment
         env = CryptoTradingEnv(
             parquet_path=test_path,
-            window_size=64,
+            window_size=self.config.window_size,
             commission=0.0004,  # churn_analysis.yaml
             episode_length=None,  # Full episode
             random_start=False,
@@ -607,9 +609,14 @@ class WFOPipeline:
         all_rewards = np.array(rewards)
         all_navs = np.array(navs) if navs else np.array([10000])
 
-        # Skip warmup rows for metrics calculation
-        rewards = all_rewards[context_rows:] if len(all_rewards) > context_rows else all_rewards
-        navs = all_navs[context_rows:] if len(all_navs) > context_rows else all_navs
+        # Skip warmup rows for metrics calculation (with safety check)
+        if len(all_rewards) <= context_rows:
+            print(f"  [WARNING] Test data ({len(all_rewards)}) shorter than warmup ({context_rows}). Using full data.")
+            rewards = all_rewards
+            navs = all_navs
+        else:
+            rewards = all_rewards[context_rows:]
+            navs = all_navs[context_rows:]
 
         print(f"  Total steps: {len(all_rewards)}, Metrics computed on: {len(rewards)} steps")
 
@@ -640,8 +647,8 @@ class WFOPipeline:
         prices = test_df['BTC_Close'].values
 
         # Align with agent evaluation period (skip warmup, match length)
-        # Agent starts at window_size (64), then we skip context_rows
-        price_start_idx = 64 + context_rows
+        # Agent starts at window_size, then we skip context_rows
+        price_start_idx = self.config.window_size + context_rows
         price_end_idx = price_start_idx + len(navs)
         if price_end_idx > len(prices):
             price_end_idx = len(prices)
@@ -1193,13 +1200,10 @@ class WFOPipeline:
 
     def _setup_logging(self):
         """Clear old logs. TensorBoard must be started manually to avoid race conditions."""
-        import time
+        # NOTE: We intentionally do NOT kill TensorBoard processes here.
+        # Using pkill on shared servers is dangerous. User should manage TB manually.
 
-        # 1. Kill any TensorBoard watching logs/wfo to avoid race conditions
-        subprocess.run(["pkill", "-f", "tensorboard.*logs/wfo"], capture_output=True)
-        time.sleep(0.5)
-
-        # 2. Clear logs directory
+        # Clear logs directory
         logs_dir = "logs/wfo"
         if os.path.exists(logs_dir):
             shutil.rmtree(logs_dir)
@@ -1358,35 +1362,48 @@ class WFOPipeline:
                 del train_df, test_df, hmm
                 gc.collect()
 
-                # 4. Check if TQC model exists
-                tqc_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "tqc.zip")
-                encoder_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "encoder.pth")
+                # 4. Check encoder exists
+                weights_dir = os.path.join(self.config.weights_dir, f"segment_{seg_id}")
+                encoder_path = os.path.join(weights_dir, "encoder.pth")
 
-                if not os.path.exists(tqc_path):
-                    print(f"  [ERROR] TQC model not found: {tqc_path}")
-                    continue
                 if not os.path.exists(encoder_path):
                     print(f"  [ERROR] Encoder not found: {encoder_path}")
                     continue
 
-                print(f"  Using existing models: {tqc_path}")
+                # 5. Evaluate both Best and Last models (like run_segment)
+                models_to_eval = [
+                    ('best', os.path.join(weights_dir, "tqc.zip")),
+                    ('last', os.path.join(weights_dir, "tqc_last.zip"))
+                ]
 
-                # 5. Evaluate
-                metrics, navs = self.evaluate_segment(
-                    test_path, encoder_path, tqc_path, seg_id,
-                    context_rows=context_rows,
-                    train_metrics={},  # No training metrics in eval-only mode
-                    train_path=train_path
-                )
+                for model_type, tqc_path in models_to_eval:
+                    if not os.path.exists(tqc_path):
+                        print(f"  [SKIP] {model_type.upper()} model not found: {tqc_path}")
+                        continue
 
-                all_metrics.append(metrics)
-                self.save_results(metrics)
+                    print(f"\n  --- Evaluating {model_type.upper()} model ---")
+                    print(f"  Using: {tqc_path}")
 
-                # Generate plots (with minimal train_metrics)
-                self.generate_segment_plots(seg_id, navs, metrics, {
-                    'action_saturation': 0, 'avg_entropy': 0,
-                    'avg_critic_loss': 0, 'avg_churn_ratio': 0
-                })
+                    metrics, navs = self.evaluate_segment(
+                        test_path, encoder_path, tqc_path, seg_id,
+                        context_rows=context_rows,
+                        train_metrics={},  # No training metrics in eval-only mode
+                        train_path=train_path
+                    )
+
+                    # Tag metrics with model type
+                    metrics['model_type'] = model_type
+
+                    all_metrics.append(metrics)
+                    self.save_results(metrics)
+
+                    # Generate plots (with minimal train_metrics)
+                    prefix = f"{model_type}_" if model_type != 'best' else ""
+                    self.generate_segment_plots(
+                        seg_id, navs, metrics,
+                        {'action_saturation': 0, 'avg_entropy': 0, 'avg_critic_loss': 0, 'avg_churn_ratio': 0},
+                        prefix=prefix
+                    )
 
             except Exception as e:
                 print(f"\n[ERROR] Segment {seg_id} failed: {e}")
