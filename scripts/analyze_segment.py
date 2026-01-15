@@ -78,14 +78,20 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
     if verbose:
         print(f"\n[2/4] Creating evaluation environment...")
 
+    # Episode length: total rows - window_size (start) - 1 (safety margin)
+    episode_len = len(test_df) - 64 - 1
+
     env = CryptoTradingEnv(
         df=test_df,
         price_column="BTC_Close",
         window_size=64,
         commission=0.0006,  # Lower commission for eval (realistic)
-        episode_length=len(test_df) - 64,  # Full test period
+        episode_length=episode_len,
         random_start=False,  # Deterministic start for eval
     )
+
+    if verbose:
+        print(f"      Episode length: {episode_len} steps")
 
     # Load model
     if verbose:
