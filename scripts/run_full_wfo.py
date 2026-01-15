@@ -634,6 +634,61 @@ class WFOPipeline:
         # Number of trades (total from env, not split by warmup)
         total_trades = info.get('total_trades', 0)
 
+        # ==================== BENCHMARK: Buy & Hold ====================
+        # Load price series for same period
+        test_df = pd.read_parquet(test_path)
+        prices = test_df['BTC_Close'].values
+
+        # Align with agent evaluation period (skip warmup, match length)
+        # Agent starts at window_size (64), then we skip context_rows
+        price_start_idx = 64 + context_rows
+        price_end_idx = price_start_idx + len(navs)
+        if price_end_idx > len(prices):
+            price_end_idx = len(prices)
+
+        bnh_prices = prices[price_start_idx:price_end_idx]
+
+        if len(bnh_prices) > 1:
+            # B&H Return
+            bnh_return = (bnh_prices[-1] - bnh_prices[0]) / bnh_prices[0]
+            bnh_pct = bnh_return * 100
+
+            # B&H NAV (normalized to 10,000 like agent)
+            bnh_navs = (bnh_prices / bnh_prices[0]) * 10000
+
+            # Alpha = Agent PnL - B&H PnL
+            alpha = pnl_pct - bnh_pct
+
+            # Market Regime
+            if bnh_return > 0.15:
+                market_regime = "BULLISH 🟢"
+            elif bnh_return < -0.15:
+                market_regime = "BEARISH 🔴"
+            else:
+                market_regime = "RANGING ⚪"
+
+            # Correlation (agent returns vs market returns)
+            if len(navs) > 10:
+                agent_returns = np.diff(navs) / navs[:-1]
+                market_returns = np.diff(bnh_prices) / bnh_prices[:-1]
+                min_len = min(len(agent_returns), len(market_returns))
+                if min_len > 10:
+                    correlation = np.corrcoef(agent_returns[:min_len], market_returns[:min_len])[0, 1]
+                else:
+                    correlation = 0.0
+            else:
+                correlation = 0.0
+        else:
+            bnh_pct = 0.0
+            bnh_navs = np.array([10000])
+            alpha = pnl_pct
+            market_regime = "UNKNOWN"
+            correlation = 0.0
+
+        print(f"    B&H Return: {bnh_pct:+.2f}%")
+        print(f"    Alpha: {alpha:+.2f}%")
+        print(f"    Market: {market_regime}")
+
         metrics = {
             'segment_id': segment_id,
             'total_reward': float(rewards.sum()),  # Sum of actual test period
@@ -646,6 +701,12 @@ class WFOPipeline:
             'final_nav': navs[-1] if len(navs) > 0 else 10000,
             'test_rows': len(rewards),
             'context_rows': context_rows,
+            # Benchmark metrics
+            'bnh_pct': bnh_pct,
+            'bnh_navs': bnh_navs,  # For plotting overlay
+            'alpha': alpha,
+            'market_regime': market_regime,
+            'correlation': correlation,
         }
 
         # Merge training diagnostics if provided
@@ -934,11 +995,24 @@ class WFOPipeline:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         fig.suptitle(f"Segment {segment_id} - Diagnostic Report", fontsize=14)
 
-        # 1. NAV Curve
+        # 1. NAV Curve with B&H Benchmark Overlay
         ax1 = axes[0, 0]
-        ax1.plot(navs, color='blue', linewidth=1)
-        ax1.axhline(y=10000, color='gray', linestyle='--', alpha=0.5)
-        ax1.set_title(f"NAV Curve (Final: {navs[-1]:.0f}, PnL: {metrics['pnl_pct']:+.2f}%)")
+        ax1.plot(navs, color='blue', linewidth=1.5, label='Agent')
+
+        # Overlay B&H benchmark if available
+        bnh_navs = metrics.get('bnh_navs')
+        if bnh_navs is not None and len(bnh_navs) > 1:
+            # Align lengths (in case of mismatch)
+            plot_len = min(len(navs), len(bnh_navs))
+            ax1.plot(bnh_navs[:plot_len], color='gray', linestyle='--', linewidth=1, label='B&H', alpha=0.7)
+            ax1.legend(loc='upper left')
+
+        ax1.axhline(y=10000, color='black', linestyle=':', alpha=0.3)
+
+        # Title with Alpha
+        alpha = metrics.get('alpha', 0)
+        alpha_color = 'green' if alpha > 0 else 'red'
+        ax1.set_title(f"NAV vs B&H (Alpha: {alpha:+.2f}%)", color=alpha_color)
         ax1.set_xlabel("Step")
         ax1.set_ylabel("NAV")
         ax1.grid(True, alpha=0.3)
@@ -963,51 +1037,90 @@ class WFOPipeline:
         # 3. Key Metrics Text
         ax3 = axes[1, 0]
         ax3.axis('off')
+
+        # Extract benchmark metrics
+        bnh_pct = metrics.get('bnh_pct', 0)
+        alpha = metrics.get('alpha', 0)
+        market_regime = metrics.get('market_regime', 'UNKNOWN')
+        correlation = metrics.get('correlation', 0)
+
         text = f"""
-    EVALUATION METRICS
-    ==================
-    Sharpe Ratio: {metrics['sharpe']:.2f}
+    MARKET CONTEXT
+    ==============
+    Market: {market_regime}
+    B&H Return: {bnh_pct:+.2f}%
+    Correlation: {correlation:.2f}
+
+    AGENT PERFORMANCE
+    =================
     PnL: {metrics['pnl_pct']:+.2f}%
-    Max Drawdown: {metrics['max_drawdown']:.2f}%
-    Total Trades: {metrics['total_trades']}
+    Alpha: {alpha:+.2f}%
+    Sharpe: {metrics['sharpe']:.2f}
+    Max DD: {metrics['max_drawdown']:.2f}%
+    Trades: {metrics['total_trades']}
 
-    TRAINING DIAGNOSTICS
-    ====================
-    Action Saturation: {train_metrics.get('action_saturation', 0):.3f}
-    Avg Entropy: {train_metrics.get('avg_entropy', 0):.4f}
-    Avg Critic Loss: {train_metrics.get('avg_critic_loss', 0):.4f}
-    Churn Ratio: {train_metrics.get('avg_churn_ratio', 0):.3f}
+    TRAINING HEALTH
+    ===============
+    Entropy: {train_metrics.get('avg_entropy', 0):.2f}
+    Churn: {train_metrics.get('avg_churn_ratio', 0):.3f}
         """
-        ax3.text(0.1, 0.5, text, fontsize=10, family='monospace', va='center')
+        ax3.text(0.05, 0.5, text, fontsize=9, family='monospace', va='center')
 
-        # 4. Pass/Fail Summary
+        # 4. Pass/Fail Summary with Alpha Context
         ax4 = axes[1, 1]
         ax4.axis('off')
 
         issues = []
+        positives = []
+
+        # Training health checks
         if train_metrics.get('avg_entropy', 0) < -20:
             issues.append("OVERFITTING (entropy < -20)")
         if train_metrics.get('action_saturation', 0) > 0.98:
             issues.append("SATURATION (action_sat > 0.98)")
         if train_metrics.get('avg_churn_ratio', 0) > 0.3:
             issues.append("HIGH CHURN (ratio > 0.3)")
-        if metrics['sharpe'] < 0:
-            issues.append("NEGATIVE SHARPE")
+
+        # Performance checks (relative to benchmark)
+        if alpha > 5:
+            positives.append(f"STRONG ALPHA (+{alpha:.1f}%)")
+        elif alpha > 0:
+            positives.append(f"POSITIVE ALPHA (+{alpha:.1f}%)")
+        elif alpha < -10:
+            issues.append(f"UNDERPERFORM B&H ({alpha:.1f}%)")
+
+        if metrics['sharpe'] > 1:
+            positives.append(f"GOOD SHARPE ({metrics['sharpe']:.2f})")
+        elif metrics['sharpe'] < -1:
+            issues.append(f"BAD SHARPE ({metrics['sharpe']:.2f})")
+
         if metrics['pnl_pct'] < -20:
             issues.append("SEVERE LOSS (> 20%)")
 
-        if issues:
+        # Determine overall status
+        if len(issues) >= 2 or (len(issues) == 1 and alpha < -5):
             status = "FAIL"
             color = 'red'
-            detail = "\n".join(f"  - {issue}" for issue in issues)
-        else:
+        elif len(positives) >= 2 or alpha > 5:
             status = "PASS"
             color = 'green'
-            detail = "  All metrics within acceptable range"
+        else:
+            status = "MIXED"
+            color = 'orange'
 
-        ax4.text(0.5, 0.6, status, fontsize=40, ha='center', va='center',
+        # Build detail text
+        detail_lines = []
+        if positives:
+            detail_lines.extend([f"  ✓ {p}" for p in positives[:2]])
+        if issues:
+            detail_lines.extend([f"  ✗ {i}" for i in issues[:2]])
+        if not detail_lines:
+            detail_lines.append("  Neutral performance")
+        detail = "\n".join(detail_lines)
+
+        ax4.text(0.5, 0.65, status, fontsize=36, ha='center', va='center',
                  color=color, fontweight='bold')
-        ax4.text(0.5, 0.3, detail, fontsize=10, ha='center', va='center',
+        ax4.text(0.5, 0.3, detail, fontsize=9, ha='center', va='center',
                  family='monospace')
 
         plt.tight_layout()
