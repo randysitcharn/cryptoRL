@@ -73,7 +73,7 @@ class WFOConfig:
     tqc_timesteps: int = 30_000_000  # 30M steps
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
-    learning_rate: float = 3e-4      # Increased for faster convergence
+    learning_rate: float = 1e-4      # Conservative for stability
     buffer_size: int = 2_500_000  # 2.5M replay buffer
     n_envs: int = 512   # Optimized for dual-GPU parallel run (CPU bottleneck relief)
     batch_size: int = 2048  # Large batch for GPU efficiency
