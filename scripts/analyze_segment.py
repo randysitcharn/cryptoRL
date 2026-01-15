@@ -99,10 +99,12 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
     if verbose:
         print(f"\n[4/4] Running backtest on test period...")
 
-    obs, _ = env.reset()
+    obs, info = env.reset()
     done = False
 
-    nav_history = [env.nav]
+    # Get initial NAV from environment
+    initial_nav = env._get_nav()
+    nav_history = [initial_nav]
     action_history = []
     position_history = [0.0]
     returns = []
@@ -113,9 +115,10 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        nav_history.append(env.nav)
+        current_nav = info['nav']
+        nav_history.append(current_nav)
         action_history.append(float(action[0]))
-        position_history.append(env.position)
+        position_history.append(info['position_pct'])
 
         # Calculate step return
         if len(nav_history) > 1:
@@ -124,7 +127,7 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
 
         step += 1
         if verbose and step % 500 == 0:
-            print(f"      Step {step}: NAV={env.nav:.2f}, Pos={env.position:.2f}")
+            print(f"      Step {step}: NAV={current_nav:.2f}, Pos={info['position_pct']:.2f}")
 
     # Calculate metrics
     returns = np.array(returns)
