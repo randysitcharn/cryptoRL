@@ -91,18 +91,9 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
     if verbose:
         print(f"\n[3/4] Loading model: {model_path}")
 
-    custom_objects = {
-        "policy_kwargs": {
-            "features_extractor_class": FoundationFeatureExtractor,
-            "features_extractor_kwargs": {
-                "encoder_path": str(encoder_path),
-                "d_model": 256,
-                "freeze_encoder": True,
-            },
-        }
-    }
-
-    model = TQC.load(str(model_path), env=env, custom_objects=custom_objects)
+    # Load without custom_objects - model has all config saved
+    # (custom_objects can cause net_arch mismatch)
+    model = TQC.load(str(model_path), env=env)
 
     # Run backtest
     if verbose:
