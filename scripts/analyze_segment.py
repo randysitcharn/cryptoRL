@@ -80,6 +80,7 @@ def analyze_segment(segment_id: int, verbose: bool = True) -> dict:
 
     env = CryptoTradingEnv(
         df=test_df,
+        price_column="BTC_Close",
         window_size=64,
         commission=0.0006,  # Lower commission for eval (realistic)
         episode_length=len(test_df) - 64,  # Full test period
