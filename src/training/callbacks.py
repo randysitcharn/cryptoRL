@@ -550,14 +550,15 @@ class CurriculumFeesCallback(BaseCallback):
 
 class ThreePhaseCurriculumCallback(BaseCallback):
     """
-    Three-Phase Curriculum Learning (recalibré 2026-01-14).
+    Three-Phase Curriculum Learning with Ramp & Plateau (2026-01-15).
 
-    Phases avec interpolation linéaire dans chaque phase:
-    - Phase 1 (0-30%): Discovery - churn 0→0.05, smooth=0
-    - Phase 2 (30-70%): Discipline - churn 0.05→0.25, smooth 0→0.01
-    - Phase 3 (70-100%): Refinement - churn 0.25→0.50, smooth 0.01→0.02
+    Strategy: Ramp penalties 0-80%, then PLATEAU at max to let agent consolidate.
+    - Phase 1 (0-30%): Discovery - churn 0→0.10, smooth=0 (free exploration)
+    - Phase 2 (30-80%): Discipline - churn 0.10→0.50, smooth 0→0.02 (ramp up)
+    - Phase 3 (80-100%): Consolidation - churn=0.50, smooth=0.02 (PLATEAU)
 
-    smooth_coef=0.02 final donne penalty ≈ -0.005 (comparable au churn_penalty).
+    The plateau phase (20% of training) allows the agent to stabilize behavior
+    at max penalty instead of chasing a moving target until the last step.
 
     Args:
         total_timesteps: Total training timesteps.
@@ -566,15 +567,14 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     """
 
     # Phase definitions: (end_progress, churn_range, smooth_range)
-    # Calibré pour |PnL| / |Penalties| ≈ 1.0 en fin de training
-    # smooth_coef x100 pour effet visible (penalty = -smooth * delta², delta~0.05)
+    # Ramp ends at 80%, then plateau for consolidation
     PHASES = [
-        # Phase 1: Discovery (exploration libre, pas de pénalités)
-        {'end_progress': 0.3, 'churn': (0.0, 0.05), 'smooth': (0.0, 0.0)},
-        # Phase 2: Discipline (ramp-up progressif)
-        {'end_progress': 0.7, 'churn': (0.05, 0.25), 'smooth': (0.0, 0.01)},
-        # Phase 3: Refinement (valeurs finales - smooth_coef=0.02 donne penalty ≈ -0.005)
-        {'end_progress': 1.0, 'churn': (0.25, 0.50), 'smooth': (0.01, 0.02)},
+        # Phase 1: Discovery (exploration libre, faibles pénalités)
+        {'end_progress': 0.3, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
+        # Phase 2: Discipline (ramp-up vers max)
+        {'end_progress': 0.8, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
+        # Phase 3: Consolidation (PLATEAU - agent stabilizes at max penalty)
+        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
     ]
 
     def __init__(

@@ -5,6 +5,7 @@ utils - Utility functions for cryptoRL.
 Provides:
 - Financial metrics (Sharpe, Sortino, max drawdown, etc.)
 - Reproducibility utilities (seed_everything)
+- Hardware auto-detection and adaptive configuration
 """
 
 from src.utils.metrics import (
@@ -19,6 +20,13 @@ from src.utils.metrics import (
 
 from src.utils.reproducibility import seed_everything
 
+from src.utils.hardware import (
+    HardwareManager,
+    HardwareSpecs,
+    OptimalConfig,
+    get_hardware_summary,
+)
+
 __all__ = [
     # Metrics
     "calculate_sharpe_ratio",
@@ -30,4 +38,9 @@ __all__ = [
     "calculate_profit_factor",
     # Reproducibility
     "seed_everything",
+    # Hardware
+    "HardwareManager",
+    "HardwareSpecs",
+    "OptimalConfig",
+    "get_hardware_summary",
 ]

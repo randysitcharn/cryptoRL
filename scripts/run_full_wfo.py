@@ -751,36 +751,70 @@ class WFOPipeline:
             resume=resume
         )
 
-        # 6. Evaluation (skip context_rows in metrics)
-        metrics, navs = self.evaluate_segment(
-            test_path, encoder_path, tqc_path, segment_id,
-            context_rows=context_rows,
-            train_metrics=train_metrics,
-            train_path=train_path
-        )
+        # 6. Organize Artifacts (Swap & Archive) - BEFORE evaluation
+        # This ensures tqc.zip=Best and tqc_last.zip=Last exist on disk
+        self._organize_artifacts(segment_id)
 
-        # 7. Teacher Report - Hyperparameter Hints
-        self._print_teacher_report(train_metrics, segment_id)
+        # 7. Double Evaluation: Best Model + Last Model
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        models_to_eval = [
+            ('best', os.path.join(weights_dir, "tqc.zip")),
+            ('last', os.path.join(weights_dir, "tqc_last.zip"))
+        ]
 
-        # 8. Generate diagnostic plots (PNG for visual analysis)
-        plot_path = self.generate_segment_plots(segment_id, navs, metrics, train_metrics)
-        metrics['plot_path'] = plot_path
+        best_metrics = None
+        for model_type, model_path in models_to_eval:
+            if not os.path.exists(model_path):
+                print(f"  [SKIP] {model_type} model not found: {model_path}")
+                continue
 
-        return metrics, train_metrics
+            print(f"\n  [EVAL] Evaluating {model_type.upper()} model: {model_path}")
 
-    def _cleanup_segment(self, segment_id: int) -> int:
+            # Evaluate
+            metrics, navs = self.evaluate_segment(
+                test_path, encoder_path, model_path, segment_id,
+                context_rows=context_rows,
+                train_metrics=train_metrics,
+                train_path=train_path
+            )
+
+            # Tag results
+            metrics['model_type'] = model_type
+
+            # Generate diagnostic plots with prefix
+            plot_path = self.generate_segment_plots(
+                segment_id, navs, metrics, train_metrics, prefix=f"{model_type}_"
+            )
+            metrics['plot_path'] = plot_path
+
+            # Save results
+            self.save_results(metrics)
+
+            # Keep best_metrics for return value and teacher report
+            if model_type == 'best':
+                best_metrics = metrics
+
+        # 8. Teacher Report - Hyperparameter Hints (based on best model)
+        if best_metrics:
+            self._print_teacher_report(train_metrics, segment_id)
+
+        return best_metrics if best_metrics else metrics, train_metrics
+
+    def _organize_artifacts(self, segment_id: int) -> int:
         """
-        Clean up intermediate files and implement Swap & Archive logic.
+        Organize model artifacts with Swap & Archive logic.
+
+        Called AFTER training, BEFORE evaluation to ensure both models exist.
 
         Artifact Strategy:
         - tqc.zip: BEST model (highest eval reward) - used for evaluation
         - tqc_last.zip: LAST model (end of training) - used for resume/extend
 
         Args:
-            segment_id: ID of the segment to clean up
+            segment_id: ID of the segment to organize
 
         Returns:
-            Total bytes freed
+            Total bytes freed from cleanup
         """
         import shutil
 
@@ -877,10 +911,18 @@ class WFOPipeline:
         segment_id: int,
         navs: np.ndarray,
         metrics: Dict[str, Any],
-        train_metrics: Dict[str, Any]
+        train_metrics: Dict[str, Any],
+        prefix: str = ""
     ) -> str:
         """
         Generate diagnostic plots for a segment and save as PNG.
+
+        Args:
+            segment_id: Segment identifier.
+            navs: NAV history array.
+            metrics: Evaluation metrics dict.
+            train_metrics: Training metrics dict.
+            prefix: Filename prefix (e.g., "best_" or "last_").
 
         Returns:
             Path to the generated PNG file.
@@ -973,7 +1015,7 @@ class WFOPipeline:
         # Save
         plot_dir = "results/plots"
         os.makedirs(plot_dir, exist_ok=True)
-        plot_path = os.path.join(plot_dir, f"segment_{segment_id}_report.png")
+        plot_path = os.path.join(plot_dir, f"segment_{segment_id}_{prefix}report.png")
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
@@ -1112,10 +1154,7 @@ class WFOPipeline:
                     resume=self.config.resume
                 )
                 all_metrics.append(metrics)
-                self.save_results(metrics)
-
-                # Cleanup intermediate files to free disk space
-                self._cleanup_segment(segment['id'])
+                # Note: save_results is now called inside run_segment for each model type
 
                 # GATE: Disabled - let WFO run all segments regardless of segment 0 performance
                 # if segment['id'] == 0:
