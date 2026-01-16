@@ -51,7 +51,7 @@ class WFOConfig:
     """Walk-Forward Optimization configuration."""
 
     # Data
-    raw_data_path: str = "data/raw_training_data.parquet"
+    raw_data_path: str = "data/raw_historical/multi_asset_historical.csv"
 
     # GPU Acceleration
     use_batch_env: bool = True  # Use BatchCryptoEnv for GPU-accelerated training (default ON)
@@ -149,6 +149,46 @@ class WFOPipeline:
         os.makedirs(config.models_dir, exist_ok=True)
         os.makedirs(config.weights_dir, exist_ok=True)
         os.makedirs(os.path.dirname(config.results_path), exist_ok=True)
+
+    def _load_raw_data(self, path: str) -> pd.DataFrame:
+        """
+        Smart loader for raw data files (CSV or Parquet).
+
+        Handles:
+        - CSV: Auto-parses dates, sets DatetimeIndex
+        - Parquet: Direct load
+
+        Args:
+            path: Path to data file (.csv or .parquet)
+
+        Returns:
+            DataFrame with sorted DatetimeIndex
+        """
+        if path.endswith('.csv'):
+            print(f"  [INFO] Detected CSV input. Auto-parsing dates...")
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+
+            # Safety check: ensure DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                # Try to find a date/timestamp column
+                date_cols = [c for c in df.columns if c.lower() in ('date', 'timestamp', 'datetime', 'time')]
+                if date_cols:
+                    df[date_cols[0]] = pd.to_datetime(df[date_cols[0]])
+                    df.set_index(date_cols[0], inplace=True)
+                    print(f"  [INFO] Set '{date_cols[0]}' as DatetimeIndex")
+                else:
+                    raise ValueError(f"Could not find DatetimeIndex. Index type: {type(df.index)}")
+        else:
+            df = pd.read_parquet(path)
+
+        # Ensure sorted index (required for WFO slicing)
+        df.sort_index(inplace=True)
+
+        # Final validation
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError(f"Data must have DatetimeIndex, got {type(df.index)}")
+
+        return df
 
     def calculate_segments(self, total_rows: int) -> List[Dict[str, int]]:
         """
@@ -1241,7 +1281,7 @@ class WFOPipeline:
 
         # Load raw data
         print(f"\nLoading raw data: {self.config.raw_data_path}")
-        df_raw = pd.read_parquet(self.config.raw_data_path)
+        df_raw = self._load_raw_data(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
 
         # Pre-calculate features globally (P1 optimization: ~20-30% speedup)
@@ -1333,7 +1373,7 @@ class WFOPipeline:
 
         # Load raw data
         print(f"\nLoading raw data: {self.config.raw_data_path}")
-        df_raw = pd.read_parquet(self.config.raw_data_path)
+        df_raw = self._load_raw_data(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
 
         # Pre-calculate features globally (P1 optimization)
