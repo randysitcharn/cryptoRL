@@ -715,14 +715,32 @@ def train(
             progress_bar=True,
             reset_num_timesteps=not is_resume,  # False for resume, True for fresh
         )
+    except Exception as e:
+        print(f"\n[CRITICAL] Exception during training: {e}")
+        emergency_path = os.path.join(config.checkpoint_dir, "emergency_save_internal.zip")
+        print(f"[CRITICAL] Attempting internal emergency save to {emergency_path}...")
+        try:
+            model.save(emergency_path)
+            print("[CRITICAL] Emergency save SUCCESS.")
+        except Exception as save_err:
+            print(f"[CRITICAL] Emergency save FAILED: {save_err}")
+        raise e  # Re-raise to stop the script properly
     finally:
-        # ==================== Cleanup Resources (Gemini recommendation) ====================
+        # ==================== Cleanup Resources ====================
         print("\n[Cleanup] Closing environments...")
-        train_env.close()
-        eval_env.close()
+        if train_env is not None:
+            train_env.close()
+
+        # Fix for 'NoneType' object has no attribute 'close' on eval_env
+        if eval_env is not None:
+            eval_env.close()
+
         if manager is not None:
-            manager.shutdown()
-            print("      Manager shutdown complete.")
+            try:
+                manager.shutdown()
+                print("      Manager shutdown complete.")
+            except Exception:
+                pass
 
     # ==================== Capture Training Metrics ====================
     training_metrics = detail_callback.get_training_metrics()

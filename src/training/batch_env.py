@@ -224,6 +224,11 @@ class BatchCryptoEnv(VecEnv):
         self._rew_churn = torch.zeros(n, device=device)
         self._rew_smooth = torch.zeros(n, device=device)
 
+        # Adaptive Profit-Gated Churn (2026-01-16)
+        # EMA tracker for cumulative PnL - gate opens only when profitable
+        self.pnl_ema = torch.zeros(n, device=device, dtype=torch.float32)
+        self.ema_alpha = 0.02  # Smoothing factor (slow adaptation)
+
         # OPTIMIZATION: Pre-allocate window offsets to avoid torch.arange in hot path
         self.window_offsets = torch.arange(self.window_size, device=device)
 
@@ -298,13 +303,15 @@ class BatchCryptoEnv(VecEnv):
         self,
         step_returns: torch.Tensor,
         position_deltas: torch.Tensor,
+        dones: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Vectorized Hybrid Log-Sortino reward calculation.
+        Vectorized Hybrid Log-Sortino reward calculation with Adaptive Profit-Gated Churn.
 
         Args:
             step_returns: Simple returns (new_nav - old_nav) / old_nav. Shape: (n_envs,)
             position_deltas: |new_pos - old_pos|. Shape: (n_envs,)
+            dones: Episode termination flags. Shape: (n_envs,)
 
         Returns:
             Rewards for all envs. Shape: (n_envs,)
@@ -331,11 +338,22 @@ class BatchCryptoEnv(VecEnv):
             torch.zeros_like(step_returns)
         )
 
-        # 4. Churn penalty (linear, aligned with commission)
-        cost_rate = self.commission + self.slippage
-        churn_penalties = -position_deltas * cost_rate * self._current_churn_coef * SCALE
+        # 4. Adaptive Profit-Gated Churn (2026-01-16)
+        # Update PnL EMA tracker (step_returns = step PnL as fraction)
+        self.pnl_ema = (1 - self.ema_alpha) * self.pnl_ema + self.ema_alpha * step_returns
 
-        # 5. Smoothness penalty (quadratic, regularization)
+        # Sigmoid gate: Opens (→1) when profitable, Closes (→0) when losing
+        # Factor 100 makes gate sensitive around ±1% cumulative PnL
+        churn_gate = torch.sigmoid(self.pnl_ema * 100)
+
+        # Raw churn penalty (linear, aligned with commission)
+        cost_rate = self.commission + self.slippage
+        raw_churn_penalty = position_deltas * cost_rate * self._current_churn_coef * SCALE
+
+        # Apply gate: No penalty when unprofitable, full penalty when profitable
+        churn_penalties = -raw_churn_penalty * churn_gate
+
+        # 5. Smoothness penalty (quadratic, regularization) - NOT gated
         smoothness_penalties = -self._current_smooth_coef * (position_deltas ** 2) * SCALE
 
         # 6. Store components for observability (BEFORE scaling)
@@ -388,6 +406,9 @@ class BatchCryptoEnv(VecEnv):
         # Reset drawdown tracking
         self.peak_navs.fill_(self.initial_balance)
         self.current_drawdowns.zero_()
+
+        # Reset PnL EMA tracker (Adaptive Profit-Gated Churn)
+        self.pnl_ema.zero_()
 
         return self._get_observations()
 
@@ -503,8 +524,13 @@ class BatchCryptoEnv(VecEnv):
         # Update volatility with new returns
         self._calculate_volatility(step_returns)
 
-        # 9. Calculate rewards
-        rewards = self._calculate_rewards(step_returns, position_deltas)
+        # 12. Check termination (needed for reward calculation)
+        terminated = self.current_steps >= self.episode_ends
+        bankrupt = new_navs <= 0
+        dones = terminated | bankrupt
+
+        # 9. Calculate rewards (with Adaptive Profit-Gated Churn)
+        rewards = self._calculate_rewards(step_returns, position_deltas, dones)
 
         # 10. Update episode tracking (BEFORE checking dones)
         self.episode_rewards += rewards
@@ -514,13 +540,8 @@ class BatchCryptoEnv(VecEnv):
         self.prev_valuations = new_navs
         self.prev_position_pcts = self.position_pcts.clone()
 
-        # 12. Check termination
-        terminated = self.current_steps >= self.episode_ends
-        bankrupt = new_navs <= 0
-
-        # Apply bankruptcy penalty
+        # Apply bankruptcy penalty (dones already computed before rewards)
         rewards = torch.where(bankrupt, torch.full_like(rewards, -1.0), rewards)
-        dones = terminated | bankrupt
 
         # Store dones for _build_infos optimization
         self._dones = dones
@@ -586,6 +607,9 @@ class BatchCryptoEnv(VecEnv):
         # Reset drawdown tracking for done envs
         self.peak_navs[dones] = self.initial_balance
         self.current_drawdowns[dones] = 0.0
+
+        # Reset PnL EMA tracker for done envs (Adaptive Profit-Gated Churn)
+        self.pnl_ema[dones] = 0.0
 
     def _build_infos(
         self,

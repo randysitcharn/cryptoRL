@@ -14,7 +14,7 @@ import time
 import numpy as np
 from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import VecEnv
 
 if TYPE_CHECKING:
@@ -79,6 +79,46 @@ def get_underlying_batch_env(env):
             break
         depth += 1
     return env
+
+
+# ============================================================================
+# Checkpoint Callbacks
+# ============================================================================
+
+class RotatingCheckpointCallback(CheckpointCallback):
+    """
+    Checkpoint callback that keeps the last N checkpoints to prevent data loss.
+    Refactored 2026-01-16 to fix aggressive deletion bug.
+    """
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", verbose: int = 0, keep_last: int = 2):
+        super().__init__(save_freq, save_path, name_prefix, verbose)
+        self.keep_last = keep_last
+        self.saved_checkpoints = []  # List to track paths
+
+    def _on_step(self) -> bool:
+        # Call parent to save
+        result = super()._on_step()
+
+        # Logic matches CheckpointCallback naming convention
+        if self.n_calls % self.save_freq == 0:
+            step = self.num_timesteps
+            current_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps.zip")
+
+            # Track new file if it exists
+            if os.path.exists(current_path):
+                self.saved_checkpoints.append(current_path)
+
+                # Prune oldest if we exceed limit
+                while len(self.saved_checkpoints) > self.keep_last:
+                    to_remove = self.saved_checkpoints.pop(0)
+                    try:
+                        if os.path.exists(to_remove):
+                            os.remove(to_remove)
+                            if self.verbose > 0:
+                                print(f"  [Disk Opt] Pruned old checkpoint: {os.path.basename(to_remove)}")
+                    except OSError as e:
+                        print(f"  [Warning] Failed to prune {to_remove}: {e}")
+        return result
 
 
 # ============================================================================
@@ -550,43 +590,19 @@ class CurriculumFeesCallback(BaseCallback):
 
 class ThreePhaseCurriculumCallback(BaseCallback):
     """
-    Three-Phase Curriculum Learning with Ramp & Plateau (2026-01-16).
-
-    Strategy: Ramp penalties 0-60%, then PLATEAU at max to let agent consolidate.
-    - Phase 1 (0-20%): Discovery - churn 0→0.10, smooth=0 (free exploration)
-    - Phase 2 (20-60%): Discipline - churn 0.10→0.50, smooth 0→0.02 (ramp up)
-    - Phase 3 (60-100%): Consolidation - churn=0.50, smooth=0.02 (PLATEAU)
-
-    The plateau phase (40% of training) allows the agent to stabilize behavior
-    at max penalty instead of chasing a moving target until the last step.
-
-    Args:
-        total_timesteps: Total training timesteps.
-        shared_smooth: Shared memory for SubprocVecEnv.
-        verbose: Verbosity level.
+    Three-Phase Curriculum Learning with IPC Fault Tolerance.
+    Refactored 2026-01-16 to fix multiprocessing crashes.
     """
-
-    # Phase definitions: (end_progress, churn_range, smooth_range)
-    # Ramp ends at 60%, then plateau for consolidation (40% of training)
     PHASES = [
-        # Phase 1: Discovery (0% -> 10%) - exploration libre
         {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-        # Phase 2: Discipline (10% -> 30%) - ramp-up rapide vers max
         {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
-        # Phase 3: Consolidation (30% -> 100%) - LONG PLATEAU at max
         {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
     ]
 
-    def __init__(
-        self,
-        total_timesteps: int,
-        shared_smooth: Optional["Synchronized"] = None,
-        verbose: int = 0
-    ):
+    def __init__(self, total_timesteps: int, shared_smooth: Optional["Synchronized"] = None, verbose: int = 0):
         super().__init__(verbose)
         self.total_timesteps = total_timesteps
         self.shared_smooth = shared_smooth
-
         self.current_smooth = 0.0
         self.current_churn = 0.0
         self._phase = 1
@@ -594,35 +610,38 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     def _on_step(self) -> bool:
         progress = self.num_timesteps / self.total_timesteps
 
-        # Find current phase and interpolate
-        prev_end = 0.0
-        for phase_idx, phase in enumerate(self.PHASES):
-            if progress <= phase['end_progress']:
-                self._phase = phase_idx + 1
-
-                # Linear interpolation within phase
-                phase_progress = (progress - prev_end) / (phase['end_progress'] - prev_end)
-                phase_progress = max(0.0, min(1.0, phase_progress))
-
-                churn_start, churn_end = phase['churn']
-                smooth_start, smooth_end = phase['smooth']
-
-                self.current_churn = churn_start + phase_progress * (churn_end - churn_start)
-                self.current_smooth = smooth_start + phase_progress * (smooth_end - smooth_start)
+        # Locate Phase
+        phase_cfg = self.PHASES[-1]
+        for i, p in enumerate(self.PHASES):
+            if progress <= p['end_progress']:
+                phase_cfg = p
+                self._phase = i + 1
                 break
-            prev_end = phase['end_progress']
 
-        # Update via shared memory (SubprocVecEnv)
+        # Interpolate
+        prev_end = 0.0 if self._phase == 1 else self.PHASES[self._phase - 2]['end_progress']
+        phase_progress = (progress - prev_end) / (phase_cfg['end_progress'] - prev_end)
+        phase_progress = max(0.0, min(1.0, phase_progress))
+
+        c_start, c_end = phase_cfg['churn']
+        s_start, s_end = phase_cfg['smooth']
+
+        self.current_churn = c_start + (c_end - c_start) * phase_progress
+        self.current_smooth = s_start + (s_end - s_start) * phase_progress
+
+        # Apply Logic with IPC Safety Net
         if self.shared_smooth is not None:
-            self.shared_smooth.value = self.current_smooth
+            try:
+                self.shared_smooth.value = self.current_smooth
+            except (ConnectionResetError, BrokenPipeError, FileNotFoundError, OSError):
+                # Fail gracefully. Do not kill the training run for a metric update.
+                pass
         else:
             self._update_envs()
 
-        # Log to TensorBoard
         self.logger.record("curriculum/smooth_coef", self.current_smooth)
         self.logger.record("curriculum/churn_coef", self.current_churn)
         self.logger.record("curriculum/phase", self._phase)
-
         return True
 
     def _update_envs(self):
@@ -649,7 +668,7 @@ class ThreePhaseCurriculumCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         if self.verbose > 0:
-            print(f"\n[3-Phase Curriculum] Configuration (recalibré):")
+            print(f"\n[3-Phase Curriculum] Configuration (IPC-safe):")
             for i, phase in enumerate(self.PHASES):
                 pct = int(phase['end_progress'] * 100)
                 churn_str = f"{phase['churn'][0]:.2f}→{phase['churn'][1]:.2f}"

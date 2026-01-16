@@ -548,27 +548,22 @@ class WFOPipeline:
                 use_batch_env=use_batch_env,
                 resume_path=resume_path
             )
-
             print(f"  TQC trained. Saved: {config.save_path}")
 
-        except Exception as e:
-            # Emergency save on crash
-            emergency_path = os.path.join(weights_dir, "emergency_save.zip")
-            if model is not None:
-                try:
-                    model.save(emergency_path)
-                    print(f"  [EMERGENCY] Model saved to: {emergency_path}")
-                except Exception as save_error:
-                    print(f"  [EMERGENCY] Failed to save model: {save_error}")
-            else:
-                print(f"  [EMERGENCY] Model is None, cannot save.")
+        except KeyboardInterrupt:
+            print("\n[WFO] User interrupted training.")
+            sys.exit(0)
 
-            # Re-raise to let caller handle (fail-fast)
-            raise
+        except Exception as e:
+            print(f"\n[CRITICAL WFO FAILURE] Segment training crashed: {e}")
+            print(f"[INFO] Check 'emergency_save_internal.zip' in {weights_dir} (saved by train_agent.py).")
+            # Do NOT attempt to save model here (it is likely None).
+            # We re-raise to stop the WFO pipeline immediately.
+            raise e
 
         finally:
             # Cleanup regardless of success/failure
-            if model is not None:
+            if 'model' in locals() and model is not None:
                 del model
             torch.cuda.empty_cache()
             gc.collect()
