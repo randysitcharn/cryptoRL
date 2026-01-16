@@ -338,13 +338,16 @@ class BatchCryptoEnv(VecEnv):
             torch.zeros_like(step_returns)
         )
 
-        # 4. Adaptive Profit-Gated Churn (2026-01-16)
+        # 4. Adaptive Profit-Gated Churn (2026-01-16, Fixed 2026-01-16)
         # Update PnL EMA tracker (step_returns = step PnL as fraction)
         self.pnl_ema = (1 - self.ema_alpha) * self.pnl_ema + self.ema_alpha * step_returns
 
-        # Sigmoid gate: Opens (→1) when profitable, Closes (→0) when losing
-        # Factor 100 makes gate sensitive around ±1% cumulative PnL
-        churn_gate = torch.sigmoid(self.pnl_ema * 100)
+        # Linear Ratio Gate (replaces sigmoid to avoid gradient inversion)
+        # Target PnL threshold where full penalty applies (0.5% cumulative return)
+        target_pnl = 0.005
+        # Linear ramp: 0% penalty at PnL≤0, 100% penalty at PnL≥target_pnl
+        # This ensures: Net Reward = PnL × (1 - k) where k < 1, always increasing with PnL
+        churn_gate = torch.clamp(self.pnl_ema / target_pnl, min=0.0, max=1.0)
 
         # Raw churn penalty (linear, aligned with commission)
         cost_rate = self.commission + self.slippage
