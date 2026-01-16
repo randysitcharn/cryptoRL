@@ -79,6 +79,49 @@ class TrainingMetricsCallback(BaseCallback):
         return True
 
 
+class RotatingCheckpointCallback(CheckpointCallback):
+    """
+    Checkpoint callback that keeps only the last saved checkpoint (disk optimization).
+
+    Inherits from CheckpointCallback but deletes the previous checkpoint after
+    saving a new one. This prevents disk space from filling up during long
+    training runs.
+
+    Args:
+        save_freq: Save frequency in timesteps.
+        save_path: Directory to save checkpoints.
+        name_prefix: Prefix for checkpoint files.
+        verbose: Verbosity level.
+    """
+
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", verbose: int = 0):
+        super().__init__(save_freq, save_path, name_prefix, verbose)
+        self.last_model_path: Optional[str] = None
+
+    def _on_step(self) -> bool:
+        # Call parent to save the model
+        result = super()._on_step()
+
+        # Check if a save happened on this step
+        if self.n_calls % self.save_freq == 0:
+            step = self.num_timesteps
+            current_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps.zip")
+
+            # Delete old checkpoint if it exists and is different from current
+            if self.last_model_path and os.path.exists(self.last_model_path) and self.last_model_path != current_path:
+                try:
+                    os.remove(self.last_model_path)
+                    if self.verbose > 0:
+                        print(f"  [Disk Opt] Deleted old checkpoint: {os.path.basename(self.last_model_path)}")
+                except OSError as e:
+                    print(f"  [Warning] Could not delete {self.last_model_path}: {e}")
+
+            # Update tracker for next iteration
+            self.last_model_path = current_path
+
+        return result
+
+
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
     """
     Find the latest checkpoint in the checkpoint directory.
@@ -407,8 +450,8 @@ def create_callbacks(
         )
         callbacks.append(eval_callback)
 
-        # Standard checkpoint callback
-        checkpoint_callback = CheckpointCallback(
+        # Rotating checkpoint callback (keeps only last checkpoint to save disk space)
+        checkpoint_callback = RotatingCheckpointCallback(
             save_freq=config.checkpoint_freq,
             save_path=config.checkpoint_dir,
             name_prefix="tqc_foundation",
@@ -416,14 +459,25 @@ def create_callbacks(
         )
         callbacks.append(checkpoint_callback)
     else:
-        # WFO mode: no EvalCallback, no intermediate checkpoints
-        # Only tqc_last.zip (final state) will be saved at the end of training
-        print("      [WFO Mode] EvalCallback disabled. Only tqc_last.zip will be saved.")
+        # WFO mode: no EvalCallback, use safety checkpoint with rotation
+        print("      [WFO Mode] EvalCallback disabled.")
 
         # Add TrainingMetricsCallback for real-time portfolio monitoring
         training_metrics = TrainingMetricsCallback(log_freq=1000, verbose=0)
         callbacks.append(training_metrics)
         print("      [WFO Mode] TrainingMetricsCallback enabled (train/avg_nav, train/pnl_pct)")
+
+        # Safety checkpoint with disk rotation (keeps only last checkpoint)
+        n_envs = getattr(config, 'n_envs', 1) or 1
+        safety_freq = max(1000, 100_000 // n_envs)
+        safety_checkpoint = RotatingCheckpointCallback(
+            save_freq=safety_freq,
+            save_path=config.checkpoint_dir,
+            name_prefix="tqc_wfo_safety",
+            verbose=1,
+        )
+        callbacks.append(safety_checkpoint)
+        print(f"      [WFO Mode] RotatingCheckpointCallback enabled (freq={safety_freq}, keeps last only)")
 
     # Detail Tensorboard callback for reward components
     detail_callback = DetailTensorboardCallback(verbose=0)
