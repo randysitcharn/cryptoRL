@@ -550,14 +550,14 @@ class CurriculumFeesCallback(BaseCallback):
 
 class ThreePhaseCurriculumCallback(BaseCallback):
     """
-    Three-Phase Curriculum Learning with Ramp & Plateau (2026-01-15).
+    Three-Phase Curriculum Learning with Ramp & Plateau (2026-01-16).
 
-    Strategy: Ramp penalties 0-80%, then PLATEAU at max to let agent consolidate.
-    - Phase 1 (0-30%): Discovery - churn 0→0.10, smooth=0 (free exploration)
-    - Phase 2 (30-80%): Discipline - churn 0.10→0.50, smooth 0→0.02 (ramp up)
-    - Phase 3 (80-100%): Consolidation - churn=0.50, smooth=0.02 (PLATEAU)
+    Strategy: Ramp penalties 0-60%, then PLATEAU at max to let agent consolidate.
+    - Phase 1 (0-20%): Discovery - churn 0→0.10, smooth=0 (free exploration)
+    - Phase 2 (20-60%): Discipline - churn 0.10→0.50, smooth 0→0.02 (ramp up)
+    - Phase 3 (60-100%): Consolidation - churn=0.50, smooth=0.02 (PLATEAU)
 
-    The plateau phase (20% of training) allows the agent to stabilize behavior
+    The plateau phase (40% of training) allows the agent to stabilize behavior
     at max penalty instead of chasing a moving target until the last step.
 
     Args:
@@ -567,12 +567,12 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     """
 
     # Phase definitions: (end_progress, churn_range, smooth_range)
-    # Ramp ends at 80%, then plateau for consolidation
+    # Ramp ends at 60%, then plateau for consolidation (40% of training)
     PHASES = [
         # Phase 1: Discovery (exploration libre, faibles pénalités)
-        {'end_progress': 0.3, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
+        {'end_progress': 0.2, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
         # Phase 2: Discipline (ramp-up vers max)
-        {'end_progress': 0.8, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
+        {'end_progress': 0.6, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
         # Phase 3: Consolidation (PLATEAU - agent stabilizes at max penalty)
         {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
     ]
