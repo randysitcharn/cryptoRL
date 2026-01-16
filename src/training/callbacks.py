@@ -572,9 +572,9 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         # Phase 1: Discovery (exploration libre, faibles pénalités)
         {'end_progress': 0.2, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
         # Phase 2: Discipline (ramp-up vers max)
-        {'end_progress': 0.6, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
+        {'end_progress': 0.6, 'churn': (0.10, 0.30), 'smooth': (0.0, 0.02)},
         # Phase 3: Consolidation (PLATEAU - agent stabilizes at max penalty)
-        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
+        {'end_progress': 1.0, 'churn': (0.30, 0.30), 'smooth': (0.02, 0.02)},
     ]
 
     def __init__(

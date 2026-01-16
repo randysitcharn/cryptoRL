@@ -75,7 +75,7 @@ class WFOConfig:
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 1e-4      # Conservative for stability
     buffer_size: int = 2_500_000  # 2.5M replay buffer
-    n_envs: int = 512   # Optimized for dual-GPU parallel run (CPU bottleneck relief)
+    n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
     batch_size: int = 2048  # Large batch for GPU efficiency
     gamma: float = 0.99    # Horizon ~100h (increased for long-term strategy)
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
