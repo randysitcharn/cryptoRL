@@ -569,12 +569,12 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     # Phase definitions: (end_progress, churn_range, smooth_range)
     # Ramp ends at 60%, then plateau for consolidation (40% of training)
     PHASES = [
-        # Phase 1: Discovery (exploration libre, faibles pénalités)
-        {'end_progress': 0.2, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-        # Phase 2: Discipline (ramp-up vers max)
-        {'end_progress': 0.6, 'churn': (0.10, 0.30), 'smooth': (0.0, 0.02)},
-        # Phase 3: Consolidation (PLATEAU - agent stabilizes at max penalty)
-        {'end_progress': 1.0, 'churn': (0.30, 0.30), 'smooth': (0.02, 0.02)},
+        # Phase 1: Discovery (0% -> 10%) - exploration libre
+        {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
+        # Phase 2: Discipline (10% -> 30%) - ramp-up rapide vers max
+        {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
+        # Phase 3: Consolidation (30% -> 100%) - LONG PLATEAU at max
+        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
     ]
 
     def __init__(
