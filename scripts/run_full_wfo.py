@@ -475,10 +475,10 @@ class WFOPipeline:
         config.tensorboard_log = f"logs/wfo/segment_{segment_id}/"
         config.name = f"WFO_seg{segment_id}"
 
-        # NOTE: eval_data_path intentionally NOT set to avoid data leakage.
-        # Using train data for EvalCallback would select the most overfitted model.
-        # Instead, we rely on _organize_artifacts to use tqc_last.zip (final curriculum state).
-        # config.eval_data_path = train_path  # DISABLED: causes data leakage
+        # NOTE: eval_data_path set to None to disable EvalCallback (WFO mode).
+        # This prevents data leakage and crashes from mismatched eval environments.
+        # Safety CheckpointCallback saves every 100k steps instead.
+        config.eval_data_path = None  # WFO mode: disable EvalCallback
 
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.tensorboard_log, exist_ok=True)
