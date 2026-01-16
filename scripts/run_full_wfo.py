@@ -1279,7 +1279,18 @@ class WFOPipeline:
                 #         print("\n[WFO] Stopped at segment 0 gate.")
                 #         break
 
+            except KeyboardInterrupt:
+                print("\n[USER] Interrupted by user (Ctrl+C).")
+                sys.exit(0)
             except Exception as e:
+                error_msg = str(e).lower()
+                # OOM = Fail Fast (continuing would likely crash again immediately)
+                if isinstance(e, MemoryError) or "out of memory" in error_msg:
+                    print(f"\n[FATAL] OOM detected in Segment {segment['id']}: {e}")
+                    print("[FATAL] Stopping WFO to prevent cascading failures and system instability.")
+                    sys.exit(1)
+
+                # Generic error: log and continue to next segment
                 print(f"\n[ERROR] Segment {segment['id']} failed: {e}")
                 import traceback
                 traceback.print_exc()
