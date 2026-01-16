@@ -279,44 +279,50 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         train_env_monitored = Monitor(train_env)
         train_vec_env = DummyVecEnv([lambda: train_env_monitored])
 
-    # ==================== Eval Environment (always single) ====================
-    # Note: Eval env uses target values (no curriculum) for consistent evaluation
-    val_env = CryptoTradingEnv(
-        parquet_path=config.eval_data_path,
-        window_size=config.window_size,
-        commission=config.commission,
-        episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
-        reward_scaling=config.reward_scaling,
-        downside_coef=config.downside_coef,
-        upside_coef=config.upside_coef,
-        action_discretization=config.action_discretization,
-        churn_coef=config.churn_coef,
-        smooth_coef=config.smooth_coef,
-        random_start=False,  # Sequential for evaluation
-        target_volatility=config.target_volatility,
-        vol_window=config.vol_window,
-        max_leverage=config.max_leverage,
-        price_column='BTC_Close',
-    )
-
-    # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
-    # Train env: NO CB (agent learns from mistakes)
-    # Eval env: CB active at configured threshold (monitoring only)
-    if config.use_risk_management:
-        # Only wrap eval env with circuit breaker
-        val_env = RiskManagementWrapper(
-            val_env,
-            vol_window=config.risk_vol_window,
-            vol_threshold=config.risk_vol_threshold,
-            max_drawdown=config.risk_max_drawdown,
-            cooldown_steps=config.risk_cooldown,
-            augment_obs=config.risk_augment_obs,
+    # ==================== Eval Environment (optional) ====================
+    # Note: eval_data_path=None in WFO mode to prevent data leakage
+    if config.eval_data_path is not None:
+        # Note: Eval env uses target values (no curriculum) for consistent evaluation
+        val_env = CryptoTradingEnv(
+            parquet_path=config.eval_data_path,
+            window_size=config.window_size,
+            commission=config.commission,
+            episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
+            reward_scaling=config.reward_scaling,
+            downside_coef=config.downside_coef,
+            upside_coef=config.upside_coef,
+            action_discretization=config.action_discretization,
+            churn_coef=config.churn_coef,
+            smooth_coef=config.smooth_coef,
+            random_start=False,  # Sequential for evaluation
+            target_volatility=config.target_volatility,
+            vol_window=config.vol_window,
+            max_leverage=config.max_leverage,
+            price_column='BTC_Close',
         )
-        # Calibrate baseline volatility
-        val_env.calibrate_baseline(n_steps=2000)
 
-    val_env_monitored = Monitor(val_env)
-    eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
+        # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
+        # Train env: NO CB (agent learns from mistakes)
+        # Eval env: CB active at configured threshold (monitoring only)
+        if config.use_risk_management:
+            # Only wrap eval env with circuit breaker
+            val_env = RiskManagementWrapper(
+                val_env,
+                vol_window=config.risk_vol_window,
+                vol_threshold=config.risk_vol_threshold,
+                max_drawdown=config.risk_max_drawdown,
+                cooldown_steps=config.risk_cooldown,
+                augment_obs=config.risk_augment_obs,
+            )
+            # Calibrate baseline volatility
+            val_env.calibrate_baseline(n_steps=2000)
+
+        val_env_monitored = Monitor(val_env)
+        eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
+    else:
+        # WFO mode: no eval env to prevent data leakage
+        eval_vec_env = None
+        print("      [WFO Mode] Eval environment disabled (eval_data_path=None)")
 
     return train_vec_env, eval_vec_env, shared_fee, shared_smooth, manager
 
@@ -332,7 +338,7 @@ def create_callbacks(
 
     Args:
         config: Training configuration.
-        eval_env: Evaluation environment.
+        eval_env: Evaluation environment (None in WFO mode).
         shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
         shared_smooth: Shared memory Value for curriculum smooth_coef (SubprocVecEnv).
 
@@ -347,26 +353,41 @@ def create_callbacks(
 
     # Note: Gradient clipping is now handled by ClippedAdamW optimizer
 
-    # Evaluation callback
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=config.checkpoint_dir,
-        log_path="logs/",
-        eval_freq=config.eval_freq,
-        deterministic=True,
-        render=False,
-        verbose=1,
-    )
-    callbacks.append(eval_callback)
+    # Evaluation callback (only if eval_env is provided)
+    if eval_env is not None:
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=config.checkpoint_dir,
+            log_path="logs/",
+            eval_freq=config.eval_freq,
+            deterministic=True,
+            render=False,
+            verbose=1,
+        )
+        callbacks.append(eval_callback)
 
-    # Checkpoint callback
-    checkpoint_callback = CheckpointCallback(
-        save_freq=config.checkpoint_freq,
-        save_path=config.checkpoint_dir,
-        name_prefix="tqc_foundation",
-        verbose=1,
-    )
-    callbacks.append(checkpoint_callback)
+        # Standard checkpoint callback
+        checkpoint_callback = CheckpointCallback(
+            save_freq=config.checkpoint_freq,
+            save_path=config.checkpoint_dir,
+            name_prefix="tqc_foundation",
+            verbose=1,
+        )
+        callbacks.append(checkpoint_callback)
+    else:
+        # WFO mode: no EvalCallback, use safety CheckpointCallback instead
+        # Save more frequently since we don't have eval-based best_model saving
+        n_envs = getattr(config, 'n_envs', 1)
+        safety_save_freq = max(1000, 100_000 // max(1, n_envs))
+        print(f"      [WFO Mode] EvalCallback disabled. Safety CheckpointCallback every {safety_save_freq} steps.")
+
+        safety_checkpoint = CheckpointCallback(
+            save_freq=safety_save_freq,
+            save_path=config.checkpoint_dir,
+            name_prefix="tqc_safety",
+            verbose=1,
+        )
+        callbacks.append(safety_checkpoint)
 
     # Detail Tensorboard callback for reward components
     detail_callback = DetailTensorboardCallback(verbose=0)
