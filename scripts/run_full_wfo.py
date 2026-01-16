@@ -62,7 +62,7 @@ class WFOConfig:
     results_path: str = "results/wfo_results.csv"
 
     # WFO Parameters
-    train_months: int = 12
+    train_months: int = 18
     test_months: int = 3
     step_months: int = 3  # Rolling step
     hours_per_month: int = 720  # 30 days * 24 hours
