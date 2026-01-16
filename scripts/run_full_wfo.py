@@ -540,19 +540,38 @@ class WFOPipeline:
             else:
                 print(f"  ⚠️ Resume requested but {tqc_last_path} not found. Starting fresh.")
 
-        model, train_metrics = train(
-            config,
-            hw_overrides=hw_overrides,
-            use_batch_env=use_batch_env,
-            resume_path=resume_path
-        )
+        model = None
+        try:
+            model, train_metrics = train(
+                config,
+                hw_overrides=hw_overrides,
+                use_batch_env=use_batch_env,
+                resume_path=resume_path
+            )
 
-        print(f"  TQC trained. Saved: {config.save_path}")
+            print(f"  TQC trained. Saved: {config.save_path}")
 
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
+        except Exception as e:
+            # Emergency save on crash
+            emergency_path = os.path.join(weights_dir, "emergency_save.zip")
+            if model is not None:
+                try:
+                    model.save(emergency_path)
+                    print(f"  [EMERGENCY] Model saved to: {emergency_path}")
+                except Exception as save_error:
+                    print(f"  [EMERGENCY] Failed to save model: {save_error}")
+            else:
+                print(f"  [EMERGENCY] Model is None, cannot save.")
+
+            # Re-raise to let caller handle (fail-fast)
+            raise
+
+        finally:
+            # Cleanup regardless of success/failure
+            if model is not None:
+                del model
+            torch.cuda.empty_cache()
+            gc.collect()
 
         return config.save_path, train_metrics
 
@@ -1324,17 +1343,29 @@ class WFOPipeline:
                 sys.exit(0)
             except Exception as e:
                 error_msg = str(e).lower()
-                # OOM = Fail Fast (continuing would likely crash again immediately)
-                if isinstance(e, MemoryError) or "out of memory" in error_msg:
-                    print(f"\n[FATAL] OOM detected in Segment {segment['id']}: {e}")
-                    print("[FATAL] Stopping WFO to prevent cascading failures and system instability.")
-                    sys.exit(1)
 
-                # Generic error: log and continue to next segment
-                print(f"\n[ERROR] Segment {segment['id']} failed: {e}")
+                # Log the error with full traceback
+                print(f"\n[FATAL] Segment {segment['id']} failed: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
+
+                # OOM = Fail Fast (no point retrying)
+                if isinstance(e, MemoryError) or "out of memory" in error_msg:
+                    print("[FATAL] OOM detected. Stopping WFO to prevent cascading failures.")
+                    sys.exit(1)
+
+                # Numerical instability (NaN/Inf) = Fail Fast (model is corrupted)
+                if "nan" in error_msg or "inf" in error_msg or "numerical" in error_msg:
+                    print("[FATAL] Numerical instability detected. Model is corrupted.")
+                    sys.exit(1)
+
+                # FAIL FAST: Stop WFO on ANY training error (do not burn GPU credits)
+                print("\n" + "=" * 50)
+                print("[POLICY] FAIL-FAST: Stopping WFO on training error.")
+                print("         Fix the issue before restarting.")
+                print("         Use --segment N to resume from segment N.")
+                print("=" * 50)
+                sys.exit(1)
 
             # Force garbage collection between segments
             gc.collect()
