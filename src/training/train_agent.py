@@ -375,19 +375,9 @@ def create_callbacks(
         )
         callbacks.append(checkpoint_callback)
     else:
-        # WFO mode: no EvalCallback, use safety CheckpointCallback instead
-        # Save more frequently since we don't have eval-based best_model saving
-        n_envs = getattr(config, 'n_envs', 1)
-        safety_save_freq = max(1000, 100_000 // max(1, n_envs))
-        print(f"      [WFO Mode] EvalCallback disabled. Safety CheckpointCallback every {safety_save_freq} steps.")
-
-        safety_checkpoint = CheckpointCallback(
-            save_freq=safety_save_freq,
-            save_path=config.checkpoint_dir,
-            name_prefix="tqc_safety",
-            verbose=1,
-        )
-        callbacks.append(safety_checkpoint)
+        # WFO mode: no EvalCallback, no intermediate checkpoints
+        # Only tqc_last.zip (final state) will be saved at the end of training
+        print("      [WFO Mode] EvalCallback disabled. Only tqc_last.zip will be saved.")
 
     # Detail Tensorboard callback for reward components
     detail_callback = DetailTensorboardCallback(verbose=0)
