@@ -1199,16 +1199,16 @@ class WFOPipeline:
         print(f"\nResults saved to: {self.config.results_path}")
 
     def _setup_logging(self):
-        """Clear old logs. TensorBoard must be started manually to avoid race conditions."""
-        # NOTE: We intentionally do NOT kill TensorBoard processes here.
-        # Using pkill on shared servers is dangerous. User should manage TB manually.
+        """Setup logging directory. Does NOT delete existing logs (parallel execution support)."""
+        # NOTE: We intentionally do NOT delete logs here.
+        # Parallel GPU runs would delete each other's logs.
+        # User should manually clean logs/wfo if needed.
 
-        # Clear logs directory
         logs_dir = "logs/wfo"
-        if os.path.exists(logs_dir):
-            shutil.rmtree(logs_dir)
-            print(f"  Cleared old logs: {logs_dir}")
+        # if os.path.exists(logs_dir):
+        #     shutil.rmtree(logs_dir)  # DISABLED: breaks parallel execution
         os.makedirs(logs_dir, exist_ok=True)
+        print(f"  [INFO] Appending to logs dir: {logs_dir}")
 
         print("  TensorBoard: start manually with 'tensorboard --logdir logs/wfo --port 8081'")
 
