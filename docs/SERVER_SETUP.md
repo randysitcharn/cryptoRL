@@ -89,15 +89,20 @@ python3 scripts/run_full_wfo.py --segment 0 --timesteps 150000
 
 ### 8. Monitoring TensorBoard
 
+**IMPORTANT:** vast.ai lance TensorBoard automatiquement sur `/workspace` (port 16006).
+Il faut le reconfigurer pour pointer sur les logs WFO.
+
 Sur le serveur:
 ```bash
-tensorboard --logdir logs/wfo --port 8081 &
+# Arrêter le TensorBoard par défaut et relancer avec les bons logs
+pkill -f 'tensorboard.*16006'
+nohup tensorboard --logdir /workspace/cryptoRL/logs/wfo --port 16006 --bind_all > /dev/null 2>&1 &
 ```
 
 Tunnel SSH (depuis local):
 ```bash
-ssh -p PORT -L 8081:localhost:8081 root@HOST
-# Ouvrir http://localhost:8081
+ssh -p PORT -L 6006:localhost:16006 root@HOST
+# Ouvrir http://localhost:6006
 ```
 
 ### 9. Recuperer les resultats
