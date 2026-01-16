@@ -18,8 +18,9 @@ from typing import Optional, Tuple
 from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 import torch
+import numpy as np
 from functools import partial
 
 from src.config import DEVICE, SEED
@@ -36,6 +37,46 @@ from src.training.callbacks import (
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallback,
 )
+
+
+class TrainingMetricsCallback(BaseCallback):
+    """
+    Callback to log portfolio metrics during training (WFO mode).
+
+    Since EvalCallback is disabled in WFO mode, this provides real-time
+    monitoring of the training portfolio on TensorBoard.
+    """
+
+    def __init__(self, log_freq: int = 1000, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.log_freq != 0:
+            return True
+
+        # Access environment infos (list for vectorized envs)
+        infos = self.locals.get('infos', [])
+        if not infos:
+            return True
+
+        # Calculate mean metrics across all environments
+        navs = [info.get('nav', 10000) for info in infos if isinstance(info, dict)]
+        positions = [abs(info.get('position_pct', 0)) for info in infos if isinstance(info, dict)]
+
+        if navs:
+            avg_nav = np.mean(navs)
+            avg_position = np.mean(positions)
+
+            # Log to TensorBoard
+            self.logger.record("train/avg_nav", avg_nav)
+            self.logger.record("train/avg_position", avg_position)
+
+            # Calculate running PnL from initial NAV
+            pnl_pct = ((avg_nav - 10000) / 10000) * 100
+            self.logger.record("train/pnl_pct", pnl_pct)
+
+        return True
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
@@ -378,6 +419,11 @@ def create_callbacks(
         # WFO mode: no EvalCallback, no intermediate checkpoints
         # Only tqc_last.zip (final state) will be saved at the end of training
         print("      [WFO Mode] EvalCallback disabled. Only tqc_last.zip will be saved.")
+
+        # Add TrainingMetricsCallback for real-time portfolio monitoring
+        training_metrics = TrainingMetricsCallback(log_freq=1000, verbose=0)
+        callbacks.append(training_metrics)
+        print("      [WFO Mode] TrainingMetricsCallback enabled (train/avg_nav, train/pnl_pct)")
 
     # Detail Tensorboard callback for reward components
     detail_callback = DetailTensorboardCallback(verbose=0)
