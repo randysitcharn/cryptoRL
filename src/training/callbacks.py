@@ -642,6 +642,13 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         self.logger.record("curriculum/smooth_coef", self.current_smooth)
         self.logger.record("curriculum/churn_coef", self.current_churn)
         self.logger.record("curriculum/phase", self._phase)
+        self.logger.record("curriculum/progress", progress)
+
+        # Log curriculum_lambda from env if available
+        real_env = get_underlying_batch_env(self.model.env)
+        if hasattr(real_env, 'curriculum_lambda'):
+            self.logger.record("curriculum/lambda", real_env.curriculum_lambda)
+
         return True
 
     def _update_envs(self):
@@ -649,10 +656,16 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         # Unwrap pour atteindre BatchCryptoEnv sous les wrappers SB3
         real_env = get_underlying_batch_env(self.model.env)
 
+        # Calculate progress for curriculum lambda
+        progress = self.num_timesteps / self.total_timesteps
+
         # Appel direct (contourne le Wrapper Hell de SB3)
         if hasattr(real_env, 'set_smoothness_penalty'):
             real_env.set_smoothness_penalty(self.current_smooth)
             real_env.set_churn_penalty(self.current_churn)
+            # Sync progress for curriculum_lambda (AAAI 2024 Curriculum Learning)
+            if hasattr(real_env, 'set_progress'):
+                real_env.set_progress(progress)
             return
 
         # Fallback: DummyVecEnv path (CPU envs)

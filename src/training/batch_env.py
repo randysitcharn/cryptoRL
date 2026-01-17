@@ -116,6 +116,10 @@ class BatchCryptoEnv(VecEnv):
         self.observation_noise = observation_noise
         self.training = True  # Flag for observation noise (disable during eval)
 
+        # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
+        self.progress = 0.0           # Training progress [0, 1]
+        self.curriculum_lambda = 0.0  # Dynamic penalty weight
+
         # Load and preprocess data
         df = pd.read_parquet(parquet_path)
 
@@ -223,11 +227,7 @@ class BatchCryptoEnv(VecEnv):
         self._rew_pnl = torch.zeros(n, device=device)
         self._rew_churn = torch.zeros(n, device=device)
         self._rew_smooth = torch.zeros(n, device=device)
-
-        # Adaptive Profit-Gated Churn (2026-01-16)
-        # EMA tracker for cumulative PnL - gate opens only when profitable
-        self.pnl_ema = torch.zeros(n, device=device, dtype=torch.float32)
-        self.ema_alpha = 0.02  # Smoothing factor (slow adaptation)
+        self._rew_downside = torch.zeros(n, device=device)  # Downside risk tracking
 
         # OPTIMIZATION: Pre-allocate window offsets to avoid torch.arange in hot path
         self.window_offsets = torch.arange(self.window_size, device=device)
@@ -260,6 +260,10 @@ class BatchCryptoEnv(VecEnv):
             "avg_rew_pnl": self._rew_pnl.mean().item(),
             "avg_rew_churn": self._rew_churn.mean().item(),
             "avg_rew_smooth": self._rew_smooth.mean().item(),
+            "avg_rew_downside": self._rew_downside.mean().item(),
+            # Curriculum state
+            "curriculum_lambda": self.curriculum_lambda,
+            "progress": self.progress,
         }
 
     def _get_batch_windows(self, steps: torch.Tensor) -> torch.Tensor:
@@ -306,7 +310,12 @@ class BatchCryptoEnv(VecEnv):
         dones: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Vectorized Hybrid Log-Sortino reward calculation with Adaptive Profit-Gated Churn.
+        SOTA Reward: Curriculum-Based Risk & Cost Gating.
+
+        Based on: Moody & Saffell (Direct RL) + AAAI 2024 Curriculum Learning.
+
+        Formula:
+            reward = log_returns - curriculum_lambda * (churn_penalty + downside_risk)
 
         Args:
             step_returns: Simple returns (new_nav - old_nav) / old_nav. Shape: (n_envs,)
@@ -317,57 +326,59 @@ class BatchCryptoEnv(VecEnv):
             Rewards for all envs. Shape: (n_envs,)
         """
         SCALE = 100.0
+        TARGET_PNL = 0.005  # 0.5% threshold for gate
 
-        # 1. Log return (clamped to avoid log(0))
+        # ═══════════════════════════════════════════════════════════════════
+        # 1. BASE REWARD: Log Returns (always active)
+        # ═══════════════════════════════════════════════════════════════════
         safe_returns = torch.clamp(step_returns, min=-0.99)
         log_returns = torch.log1p(safe_returns) * SCALE
 
-        # 2. Downside penalty (quadratic, only for negative returns)
-        downside_mask = step_returns < 0
-        downside_penalties = torch.where(
-            downside_mask,
-            -(step_returns ** 2) * self.downside_coef * SCALE,
-            torch.zeros_like(step_returns)
-        )
+        # ═══════════════════════════════════════════════════════════════════
+        # 2. COMPONENT A: Churn Penalty with Instant Linear Gate
+        # ═══════════════════════════════════════════════════════════════════
+        # Gate: Only penalize churn when THIS step is profitable
+        gate = torch.clamp(step_returns / TARGET_PNL, min=0.0, max=1.0)
 
-        # 3. Upside bonus (quadratic, only for positive returns)
-        upside_mask = step_returns > 0
-        upside_bonuses = torch.where(
-            upside_mask,
-            (step_returns ** 2) * self.upside_coef * SCALE,
-            torch.zeros_like(step_returns)
-        )
-
-        # 4. Adaptive Profit-Gated Churn (2026-01-16, Fixed 2026-01-16)
-        # Update PnL EMA tracker (step_returns = step PnL as fraction)
-        self.pnl_ema = (1 - self.ema_alpha) * self.pnl_ema + self.ema_alpha * step_returns
-
-        # Linear Ratio Gate (replaces sigmoid to avoid gradient inversion)
-        # Target PnL threshold where full penalty applies (0.5% cumulative return)
-        target_pnl = 0.005
-        # Linear ramp: 0% penalty at PnL≤0, 100% penalty at PnL≥target_pnl
-        # This ensures: Net Reward = PnL × (1 - k) where k < 1, always increasing with PnL
-        churn_gate = torch.clamp(self.pnl_ema / target_pnl, min=0.0, max=1.0)
-
-        # Raw churn penalty (linear, aligned with commission)
+        # Raw churn cost (aligned with actual transaction fees)
         cost_rate = self.commission + self.slippage
-        raw_churn_penalty = position_deltas * cost_rate * self._current_churn_coef * SCALE
+        raw_churn = position_deltas * cost_rate * self._current_churn_coef * SCALE
 
-        # Apply gate: No penalty when unprofitable, full penalty when profitable
-        churn_penalties = -raw_churn_penalty * churn_gate
+        # Gated churn: No penalty if step_returns <= 0
+        churn_penalty = raw_churn * gate
 
-        # 5. Smoothness penalty (quadratic, regularization) - NOT gated
-        smoothness_penalties = -self._current_smooth_coef * (position_deltas ** 2) * SCALE
+        # ═══════════════════════════════════════════════════════════════════
+        # 3. COMPONENT B: Downside Risk (Soft Sortino)
+        # ═══════════════════════════════════════════════════════════════════
+        # Squared negative returns only (Sortino-style asymmetric risk)
+        negative_returns = torch.clamp(step_returns, max=0.0)
+        downside_risk = torch.square(negative_returns) * SCALE * 5.0
 
-        # 6. Store components for observability (BEFORE scaling)
-        self._rew_pnl = log_returns + downside_penalties + upside_bonuses
-        self._rew_churn = churn_penalties
-        self._rew_smooth = smoothness_penalties
+        # ═══════════════════════════════════════════════════════════════════
+        # 4. CURRICULUM AGGREGATION
+        # ═══════════════════════════════════════════════════════════════════
+        # Apply curriculum_lambda to BOTH penalties
+        total_penalty = self.curriculum_lambda * (churn_penalty + downside_risk)
 
-        # 7. Total reward
-        total = self._rew_pnl + self._rew_churn + self._rew_smooth
+        # ═══════════════════════════════════════════════════════════════════
+        # 5. SMOOTHNESS PENALTY (outside curriculum, always active)
+        # ═══════════════════════════════════════════════════════════════════
+        smoothness_penalty = self._current_smooth_coef * (position_deltas ** 2) * SCALE
 
-        return total * self.reward_scaling
+        # ═══════════════════════════════════════════════════════════════════
+        # 6. FINAL REWARD
+        # ═══════════════════════════════════════════════════════════════════
+        reward = log_returns - total_penalty - smoothness_penalty
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 7. OBSERVABILITY (TensorBoard metrics)
+        # ═══════════════════════════════════════════════════════════════════
+        self._rew_pnl = log_returns
+        self._rew_churn = -churn_penalty * self.curriculum_lambda
+        self._rew_downside = -downside_risk * self.curriculum_lambda
+        self._rew_smooth = -smoothness_penalty
+
+        return reward * self.reward_scaling
 
     def reset(self) -> Dict[str, np.ndarray]:
         """
@@ -409,9 +420,6 @@ class BatchCryptoEnv(VecEnv):
         # Reset drawdown tracking
         self.peak_navs.fill_(self.initial_balance)
         self.current_drawdowns.zero_()
-
-        # Reset PnL EMA tracker (Adaptive Profit-Gated Churn)
-        self.pnl_ema.zero_()
 
         return self._get_observations()
 
@@ -611,9 +619,6 @@ class BatchCryptoEnv(VecEnv):
         self.peak_navs[dones] = self.initial_balance
         self.current_drawdowns[dones] = 0.0
 
-        # Reset PnL EMA tracker for done envs (Adaptive Profit-Gated Churn)
-        self.pnl_ema[dones] = 0.0
-
     def _build_infos(
         self,
         dones: torch.Tensor,
@@ -699,6 +704,31 @@ class BatchCryptoEnv(VecEnv):
     def set_smoothness_penalty(self, value: float) -> None:
         """Direct setter for curriculum learning (bypasses wrapper issues)."""
         self._current_smooth_coef = value
+
+    def set_progress(self, progress: float) -> None:
+        """
+        Update training progress and curriculum lambda.
+
+        Curriculum Schedule (AAAI 2024 Curriculum Learning for HFT):
+          Phase 1 (0-10%):   lambda = 0.0  (Pure Exploration)
+          Phase 2 (10-30%):  lambda = 0.0 -> 0.4 (Reality Ramp)
+          Phase 3 (30-100%): lambda = 0.4 (Stability)
+
+        Args:
+            progress: Training progress as fraction [0, 1].
+        """
+        self.progress = max(0.0, min(1.0, progress))
+
+        if self.progress <= 0.10:
+            # Phase 1: Pure Exploration - no penalties
+            self.curriculum_lambda = 0.0
+        elif self.progress <= 0.30:
+            # Phase 2: Reality Ramp - linear 0.0 -> 0.4
+            phase_progress = (self.progress - 0.10) / 0.20
+            self.curriculum_lambda = 0.4 * phase_progress
+        else:
+            # Phase 3: Stability - fixed discipline
+            self.curriculum_lambda = 0.4
 
     def get_attr(self, attr_name: str, indices=None):
         """Get attribute from envs."""
