@@ -62,7 +62,7 @@ class TQCTrainingConfig:
     freeze_encoder: bool = True
 
     # --- TQC Hyperparameters ---
-    total_timesteps: int = 3_000_000  # 3M (réduit pour éviter overfitting)
+    total_timesteps: int = 90_000_000  # 90M steps
     learning_rate: float = 1e-4      # Réduit pour éviter mémorisation
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)

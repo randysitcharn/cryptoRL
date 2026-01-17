@@ -23,8 +23,6 @@ import gc
 import json
 import pickle
 import shutil
-import socket
-import subprocess
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -71,7 +69,7 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 34_000_000  # 34M steps
+    tqc_timesteps: int = 90_000_000  # 90M steps
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 1e-4      # Conservative for stability
@@ -246,22 +244,16 @@ class WFOPipeline:
         full_start = segment['train_start']
         full_end = segment['test_end']
 
-        # Use global pre-computed features if available
-        if hasattr(self, '_df_features_global') and self._df_features_global is not None:
-            # Convert integer positions to datetime using raw data's index
-            # This preserves alignment because features keep the original DatetimeIndex
-            start_time = df_raw.index[full_start]
-            end_time = df_raw.index[full_end - 1]  # -1 because .loc[] is inclusive
-            df_features = self._df_features_global.loc[start_time:end_time].copy()
-            print(f"  Using pre-computed features: {start_time} to {end_time} ({len(df_features)} rows)")
-        else:
-            # Fallback: compute features on-the-fly (legacy path)
-            buffer = 720
-            safe_start = max(0, full_start - buffer)
-            df_segment = df_raw.iloc[safe_start:full_end].copy()
-            print(f"  Raw segment: rows {safe_start} to {full_end} ({len(df_segment)} rows)")
-            print("  Applying feature engineering...")
-            df_features = self.feature_engineer.engineer_features(df_segment)
+        # Use global pre-computed features (always available - computed in run() or run_eval_only() methods)
+        assert hasattr(self, '_df_features_global') and self._df_features_global is not None, \
+            "Global features must be pre-computed. Features are computed in run() or run_eval_only() methods before processing segments."
+        
+        # Convert integer positions to datetime using raw data's index
+        # This preserves alignment because features keep the original DatetimeIndex
+        start_time = df_raw.index[full_start]
+        end_time = df_raw.index[full_end - 1]  # -1 because .loc[] is inclusive
+        df_features = self._df_features_global.loc[start_time:end_time].copy()
+        print(f"  Using pre-computed features: {start_time} to {end_time} ({len(df_features)} rows)")
 
         # 2. Split train/test (take from END to get most recent valid data)
         train_len = segment['train_end'] - segment['train_start']
@@ -907,6 +899,10 @@ class WFOPipeline:
         self._organize_artifacts(segment_id)
 
         # 7. Double Evaluation: Best Model + Last Model
+        # INTENTIONAL: Evaluate both models to compare performance:
+        # - 'best': Highest eval reward during training (may overfit to train data)
+        # - 'last': Final model state (may be more robust, less overfitted)
+        # This comparison helps identify overfitting and guides hyperparameter tuning.
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
         models_to_eval = [
             ('best', os.path.join(weights_dir, "tqc.zip")),
@@ -1224,47 +1220,6 @@ class WFOPipeline:
 
         print(f"  [Plot] Saved: {plot_path}")
         return plot_path
-
-    def _check_segment0_gate(self, metrics: Dict[str, Any], train_metrics: Dict[str, Any]) -> bool:
-        """
-        Check if segment 0 results are satisfactory to continue WFO.
-
-        Returns:
-            True if we should continue, False to stop.
-        """
-        print("\n" + "=" * 50)
-        print("SEGMENT 0 GATE - Quality Check")
-        print("=" * 50)
-
-        issues = []
-
-        # Training health checks
-        if train_metrics.get('avg_entropy', 0) < -20:
-            issues.append(f"Entropy too low: {train_metrics['avg_entropy']:.2f}")
-        if train_metrics.get('action_saturation', 0) > 0.98:
-            issues.append(f"Action saturation: {train_metrics['action_saturation']:.3f}")
-        if train_metrics.get('avg_churn_ratio', 0) > 0.3:
-            issues.append(f"Churn ratio: {train_metrics['avg_churn_ratio']:.3f}")
-
-        # Performance checks
-        if metrics['sharpe'] < -1:
-            issues.append(f"Sharpe too negative: {metrics['sharpe']:.2f}")
-        if metrics['pnl_pct'] < -30:
-            issues.append(f"Severe loss: {metrics['pnl_pct']:.2f}%")
-
-        if issues:
-            print("RESULT: BLOCKED")
-            print("\nIssues detected:")
-            for issue in issues:
-                print(f"  - {issue}")
-            print("\nWFO stopped. Fix hyperparameters before continuing.")
-            print("=" * 50)
-            return False
-        else:
-            print("RESULT: PASSED")
-            print("Segment 0 metrics are acceptable. Continuing WFO...")
-            print("=" * 50)
-            return True
 
     def save_results(self, metrics: Dict[str, Any]):
         """Append metrics to results CSV."""
