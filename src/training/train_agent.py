@@ -675,16 +675,41 @@ def train(
     print(f"      Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
     print(f"      Trainable parameters: {sum(p.numel() for p in model.policy.parameters() if p.requires_grad):,}")
 
-    # --- OPTIMIZATION: JIT Compilation (Phase 2) ---
-    # TEMPORARILY DISABLED: Causes state_dict keys mismatch during WFO loading/eval
-    # if torch.cuda.is_available() and hasattr(torch, "compile"):
-    #     print("\n[Optim] Enabling torch.compile() for TQC Policy...")
-    #     try:
-    #         model.policy = torch.compile(model.policy, mode="reduce-overhead")
-    #         print("[Optim] JIT Compilation ACTIVE (mode='reduce-overhead').")
-    #     except Exception as e:
-    #         print(f"[Optim] Compilation failed, falling back to eager mode: {e}")
-    # -----------------------------------------------
+    # ⚡ OPTIMIZATION: Torch Compile (Surgical + Warmup)
+    if torch.cuda.is_available() and os.name != 'nt':
+        print("\n  [ACCELERATOR] Enabling torch.compile(mode='reduce-overhead')...")
+        try:
+            # 1. Compile Heavy Modules (Surgical - avoids state_dict key issues)
+            # Compile the Transformer Encoder (Biggest gain)
+            model.policy.features_extractor = torch.compile(
+                model.policy.features_extractor, mode="reduce-overhead"
+            )
+
+            # Compile MLP Heads
+            model.policy.actor = torch.compile(model.policy.actor, mode="reduce-overhead")
+            model.policy.critic = torch.compile(model.policy.critic, mode="reduce-overhead")
+
+            # Compile Targets (Faster soft-updates)
+            model.policy.actor_target = torch.compile(model.policy.actor_target, mode="reduce-overhead")
+            model.policy.critic_target = torch.compile(model.policy.critic_target, mode="reduce-overhead")
+
+            # 2. JIT Warmup (Force compilation NOW, not at step 0)
+            print("  [ACCELERATOR] Triggering JIT Warmup (may take ~30s)...")
+            with torch.no_grad():
+                # Create dummy observation matching the Dict observation space
+                dummy_obs = {}
+                for key, space in model.observation_space.spaces.items():
+                    dummy_obs[key] = torch.randn(1, *space.shape, device=model.device)
+                # Run forward pass to build CUDA graphs
+                model.policy(dummy_obs)
+
+            print("  [SUCCESS] Policy compiled and warmed up. Ready for high-speed training.")
+
+        except Exception as e:
+            print(f"  [WARNING] torch.compile failed: {e}")
+            print("  [INFO] Falling back to standard Eager Execution.")
+    else:
+        print("  [INFO] torch.compile skipped (Not on Linux/CUDA).")
 
     # ==================== Training ====================
     print("\n[4/4] Starting training...")
