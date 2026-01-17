@@ -70,13 +70,13 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 30_000_000  # 30M steps
+    tqc_timesteps: int = 68_000_000  # 68M steps
 
     # TQC Hyperparameters (Gemini collab 2026-01-13)
     learning_rate: float = 1e-4      # Conservative for stability
     buffer_size: int = 2_500_000  # 2.5M replay buffer
-    n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
-    batch_size: int = 2048  # Large batch for GPU efficiency
+    n_envs: int = 4096  # GPU-optimized (power of 2 for BatchCryptoEnv)
+    batch_size: int = 4096  # Large batch for GPU efficiency
     gamma: float = 0.95    # Shorter horizon for faster learning
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
     churn_coef: float = 0.5    # Max target après curriculum (réduit)
