@@ -66,7 +66,7 @@ class TQCTrainingConfig:
     learning_rate: float = 1e-4      # Réduit pour éviter mémorisation
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
-    gamma: float = 0.99  # Horizon ~100h (increased for long-term strategy)
+    gamma: float = 0.95  # Shorter horizon for faster learning
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto"
     train_freq: int = 1
