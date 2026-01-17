@@ -296,30 +296,22 @@ class StepLoggingCallback(BaseCallback):
                 self.last_episode_info["max_drawdown"] = metrics["max_drawdown"]
 
                 # Log reward components (for observability)
-                if "avg_rew_pnl" in metrics:
-                    self.logger.record("rewards/pnl", metrics["avg_rew_pnl"])
-                    self.logger.record("rewards/churn_penalty", metrics["avg_rew_churn"])
-                    self.logger.record("rewards/smooth_penalty", metrics["avg_rew_smooth"])
-
-            if self.episode_rewards:
-                mean_reward = np.mean(self.episode_rewards[-10:])
-                mean_length = np.mean(self.episode_lengths[-10:])
-            else:
-                mean_reward = 0
-                mean_length = 0
+                # Note: get_global_metrics uses keys with '/' prefix (reward/pnl_component)
+                # but DetailTensorboardCallback already logs these via internal/reward/*
+                # We skip logging here to avoid duplication
 
             # Log to TensorBoard
-            self.logger.record("custom/mean_reward_10ep", mean_reward)
-            self.logger.record("custom/mean_length_10ep", mean_length)
+            # Note: mean_reward and mean_length are already logged by SB3 as
+            # rollout/ep_rew_mean and rollout/ep_len_mean, so we skip them here
 
             if self.last_episode_info:
                 if "nav" in self.last_episode_info:
                     self.logger.record("custom/nav", self.last_episode_info["nav"])
                 if "position" in self.last_episode_info:
                     self.logger.record("custom/position", self.last_episode_info["position"])
-
-            if self.episode_trades:
-                self.logger.record("custom/trades_per_episode", self.episode_trades[-1])
+                if "max_drawdown" in self.last_episode_info:
+                    # Log max_drawdown as percentage
+                    self.logger.record("custom/max_drawdown", self.last_episode_info["max_drawdown"] * 100)
 
             self.logger.dump(self.num_timesteps)
 
@@ -341,9 +333,15 @@ class StepLoggingCallback(BaseCallback):
             nav = self.last_episode_info.get("nav", 0)
             pos = self.last_episode_info.get("position", 0)
             max_dd = self.last_episode_info.get("max_drawdown", 0) * 100  # Convert to %
+            
+            # Calculate mean reward for display (from last 10 episodes if available)
+            if self.episode_rewards:
+                mean_reward_display = np.mean(self.episode_rewards[-10:])
+            else:
+                mean_reward_display = 0
 
             print(f"Step {self.num_timesteps:>7} | "
-                  f"Reward: {mean_reward:>8.2f} | "
+                  f"Reward: {mean_reward_display:>8.2f} | "
                   f"NAV: {nav:>10.2f} | "
                   f"Pos: {pos:>+5.2f} | "
                   f"DD: {max_dd:>5.1f}% | "
@@ -593,10 +591,11 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     Three-Phase Curriculum Learning with IPC Fault Tolerance.
     Refactored 2026-01-16 to fix multiprocessing crashes.
     """
+    # Modified by CryptoRL: reduced smooth_coef 0.02 -> 0.005 to unblock trading
     PHASES = [
         {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-        {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
-        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
+        {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.005)},
+        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.005, 0.005)},
     ]
 
     def __init__(self, total_timesteps: int, shared_smooth: Optional["Synchronized"] = None, verbose: int = 0):
