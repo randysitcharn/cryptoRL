@@ -12,6 +12,8 @@ Usage:
 import os
 import re
 import glob
+import zipfile
+import io
 from multiprocessing import Manager
 from typing import Optional, Tuple
 
@@ -37,6 +39,61 @@ from src.training.callbacks import (
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallback,
 )
+
+
+def clean_compiled_checkpoint(checkpoint_path: str) -> None:
+    """
+    Clean torch.compile artifacts from SB3 checkpoint.
+
+    torch.compile wraps modules and adds '_orig_mod.' prefix to state_dict keys.
+    This function removes that prefix to ensure checkpoint compatibility with
+    non-compiled models (e.g., during resume).
+
+    Args:
+        checkpoint_path: Path to the .zip checkpoint file
+    """
+    if not os.path.exists(checkpoint_path):
+        return
+
+    try:
+        # Read the zip file
+        with zipfile.ZipFile(checkpoint_path, 'r') as zf:
+            file_contents = {}
+            for name in zf.namelist():
+                file_contents[name] = zf.read(name)
+
+        # Process .pth files (state dicts)
+        modified = False
+        for name in list(file_contents.keys()):
+            if name.endswith('.pth'):
+                # Load state dict from bytes
+                buffer = io.BytesIO(file_contents[name])
+                state_dict = torch.load(buffer, map_location='cpu', weights_only=False)
+
+                # Check if cleaning is needed
+                needs_cleaning = any('_orig_mod.' in k for k in state_dict.keys())
+                if needs_cleaning:
+                    # Clean keys
+                    cleaned_dict = {}
+                    for key, value in state_dict.items():
+                        new_key = key.replace('_orig_mod.', '')
+                        cleaned_dict[new_key] = value
+
+                    # Save cleaned state dict back to bytes
+                    buffer = io.BytesIO()
+                    torch.save(cleaned_dict, buffer)
+                    file_contents[name] = buffer.getvalue()
+                    modified = True
+
+        # Write back if modified
+        if modified:
+            with zipfile.ZipFile(checkpoint_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for name, content in file_contents.items():
+                    zf.writestr(name, content)
+            print(f"  [CLEANUP] Removed torch.compile artifacts from {os.path.basename(checkpoint_path)}")
+
+    except Exception as e:
+        print(f"  [WARNING] Could not clean checkpoint {checkpoint_path}: {e}")
 
 
 class TrainingMetricsCallback(BaseCallback):
@@ -107,6 +164,9 @@ class RotatingCheckpointCallback(CheckpointCallback):
             step = self.num_timesteps
             current_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps.zip")
 
+            # Clean torch.compile artifacts from the checkpoint
+            clean_compiled_checkpoint(current_path)
+
             # Delete old checkpoint if it exists and is different from current
             if self.last_model_path and os.path.exists(self.last_model_path) and self.last_model_path != current_path:
                 try:
@@ -120,6 +180,34 @@ class RotatingCheckpointCallback(CheckpointCallback):
             self.last_model_path = current_path
 
         return result
+
+
+class BestModelCleanerCallback(BaseCallback):
+    """
+    Callback to clean torch.compile artifacts from best_model.zip.
+
+    EvalCallback saves best_model.zip internally, and we can't hook into that.
+    This callback periodically checks and cleans best_model.zip.
+    """
+
+    def __init__(self, checkpoint_dir: str, check_freq: int = 10000, verbose: int = 0):
+        super().__init__(verbose)
+        self.best_model_path = os.path.join(checkpoint_dir, "best_model.zip")
+        self.check_freq = check_freq
+        self.last_mtime: Optional[float] = None
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+
+        # Check if best_model.zip exists and was modified
+        if os.path.exists(self.best_model_path):
+            current_mtime = os.path.getmtime(self.best_model_path)
+            if self.last_mtime is None or current_mtime > self.last_mtime:
+                clean_compiled_checkpoint(self.best_model_path)
+                self.last_mtime = current_mtime
+
+        return True
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
@@ -450,6 +538,14 @@ def create_callbacks(
         )
         callbacks.append(eval_callback)
 
+        # Clean torch.compile artifacts from best_model.zip saved by EvalCallback
+        best_model_cleaner = BestModelCleanerCallback(
+            checkpoint_dir=config.checkpoint_dir,
+            check_freq=config.eval_freq,  # Check after each evaluation
+            verbose=0,
+        )
+        callbacks.append(best_model_cleaner)
+
         # Rotating checkpoint callback (keeps only last checkpoint to save disk space)
         checkpoint_callback = RotatingCheckpointCallback(
             save_freq=config.checkpoint_freq,
@@ -749,6 +845,7 @@ def train(
         print(f"[CRITICAL] Attempting internal emergency save to {emergency_path}...")
         try:
             model.save(emergency_path)
+            clean_compiled_checkpoint(emergency_path)
             print("[CRITICAL] Emergency save SUCCESS.")
         except Exception as save_err:
             print(f"[CRITICAL] Emergency save FAILED: {save_err}")
@@ -788,6 +885,7 @@ def train(
     print("=" * 70)
 
     model.save(config.save_path)
+    clean_compiled_checkpoint(config.save_path)
     print(f"\nModel saved to: {config.save_path}")
 
     print("\nArtifacts:")
