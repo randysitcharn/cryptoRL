@@ -676,7 +676,8 @@ def train(
     print(f"      Trainable parameters: {sum(p.numel() for p in model.policy.parameters() if p.requires_grad):,}")
 
     # ⚡ OPTIMIZATION: Torch Compile (Surgical + Warmup)
-    if torch.cuda.is_available() and os.name != 'nt':
+    # Skip torch.compile on resume to avoid state_dict key mismatch
+    if torch.cuda.is_available() and os.name != 'nt' and not is_resume:
         print("\n  [ACCELERATOR] Enabling torch.compile(mode='reduce-overhead')...")
         try:
             # 1. Compile Heavy Modules (Surgical - avoids state_dict key issues)
@@ -708,6 +709,8 @@ def train(
         except Exception as e:
             print(f"  [WARNING] torch.compile failed: {e}")
             print("  [INFO] Falling back to standard Eager Execution.")
+    elif is_resume:
+        print("  [INFO] torch.compile skipped (Resume mode - avoiding state_dict key mismatch).")
     else:
         print("  [INFO] torch.compile skipped (Not on Linux/CUDA).")
 
