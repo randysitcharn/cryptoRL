@@ -380,32 +380,34 @@ class DetailTensorboardCallback(BaseCallback):
         if self.locals.get("actions") is not None:
             self.all_actions.extend(np.abs(self.locals["actions"]).flatten())
 
+        # ═══════════════════════════════════════════════════════════════════
+        # DIRECT GPU METRIC POLLING (replaces info-based logging)
+        # ═══════════════════════════════════════════════════════════════════
+        # Unwrap to find BatchCryptoEnv under SB3 wrappers
+        real_env = get_underlying_batch_env(self.model.env)
+
+        if real_env is not None and hasattr(real_env, "get_global_metrics"):
+            metrics = real_env.get_global_metrics()
+            for key, value in metrics.items():
+                # Use record_mean for smoother TensorBoard curves
+                self.logger.record_mean(f"internal/{key}", value)
+
+            # Track for episode aggregation
+            if "reward/pnl_component" in metrics:
+                self.episode_log_returns.append(metrics["reward/pnl_component"])
+            if "reward/churn_cost" in metrics:
+                self.episode_churn_penalties.append(metrics["reward/churn_cost"])
+
+        # Episode end logging (from info dict - still needed for episode stats)
         if self.locals.get("infos"):
             info = self.locals["infos"][0]
-
-            # Log reward components
-            for key in ["rewards/log_return", "rewards/penalty_vol", "rewards/churn_penalty",
-                        "rewards/smoothness_penalty", "rewards/position_delta", "rewards/total_raw",
-                        "rewards/scaled"]:
-                if key in info:
-                    self.logger.record_mean(key, info[key])
-                    if key == "rewards/log_return":
-                        self.episode_log_returns.append(info[key])
-                    elif key == "rewards/churn_penalty":
-                        self.episode_churn_penalties.append(info[key])
-                    elif key == "rewards/position_delta":
-                        self.episode_position_deltas.append(info[key])
-
-            # At episode end, log aggregated stats
             if "episode" in info:
                 if self.episode_churn_penalties:
                     total_churn = sum(self.episode_churn_penalties)
                     total_log_ret = sum(self.episode_log_returns)
-                    total_delta = sum(self.episode_position_deltas)
 
                     self.logger.record("churn/episode_total_penalty", total_churn)
                     self.logger.record("churn/episode_total_log_return", total_log_ret)
-                    self.logger.record("churn/episode_total_position_delta", total_delta)
 
                     if abs(total_log_ret) > 1e-8:
                         ratio = abs(total_churn / total_log_ret)

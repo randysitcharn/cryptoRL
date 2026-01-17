@@ -119,6 +119,7 @@ class BatchCryptoEnv(VecEnv):
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
         self.progress = 0.0           # Training progress [0, 1]
         self.curriculum_lambda = 0.0  # Dynamic penalty weight
+        self.last_gate_mean = 0.0     # Mean gate opening for logging
 
         # Load and preprocess data
         df = pd.read_parquet(parquet_path)
@@ -246,24 +247,27 @@ class BatchCryptoEnv(VecEnv):
         Vectorized GPU metrics for logging (called by callbacks, not every step).
 
         Returns aggregated metrics computed entirely on GPU with minimal CPU transfer.
+        Designed for Direct GPU Metric Polling from DetailTensorboardCallback.
         """
         navs = self._get_navs()
         drawdowns = (self.peak_navs - navs) / torch.clamp(self.peak_navs, min=1.0)
 
         return {
+            # Portfolio metrics
             "portfolio_value": navs.mean().item(),
             "max_drawdown": drawdowns.max().item(),
             "price": self.prices[self.current_steps[0]].item(),
             "position_pct": self.position_pcts.mean().item(),
             "nav_std": navs.std().item(),
-            # Reward components (for observability)
-            "avg_rew_pnl": self._rew_pnl.mean().item(),
-            "avg_rew_churn": self._rew_churn.mean().item(),
-            "avg_rew_smooth": self._rew_smooth.mean().item(),
-            "avg_rew_downside": self._rew_downside.mean().item(),
-            # Curriculum state
-            "curriculum_lambda": self.curriculum_lambda,
-            "progress": self.progress,
+            # Reward components (Direct GPU Polling)
+            "reward/pnl_component": self._rew_pnl.mean().item(),
+            "reward/churn_cost": self._rew_churn.mean().item(),
+            "reward/downside_risk": self._rew_downside.mean().item(),
+            "reward/smoothness": self._rew_smooth.mean().item(),
+            # Curriculum state (AAAI 2024)
+            "curriculum/lambda": self.curriculum_lambda,
+            "curriculum/progress": self.progress,
+            "curriculum/gate_open": self.last_gate_mean,
         }
 
     def _get_batch_windows(self, steps: torch.Tensor) -> torch.Tensor:
@@ -339,6 +343,9 @@ class BatchCryptoEnv(VecEnv):
         # ═══════════════════════════════════════════════════════════════════
         # Gate: Only penalize churn when THIS step is profitable
         gate = torch.clamp(step_returns / TARGET_PNL, min=0.0, max=1.0)
+
+        # Store gate mean for logging (before applying to penalty)
+        self.last_gate_mean = gate.mean().item()
 
         # Raw churn cost (aligned with actual transaction fees)
         cost_rate = self.commission + self.slippage
