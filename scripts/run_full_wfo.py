@@ -26,6 +26,7 @@ import shutil
 import socket
 import subprocess
 import argparse
+from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Union
@@ -848,23 +849,51 @@ class WFOPipeline:
         print(f"Test:  rows {segment['test_start']} - {segment['test_end']}")
         print("=" * 70)
 
-        # 1. Preprocessing (Feature Engineering + Leak-Free Scaling)
-        train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+        # --- Define Paths ---
+        models_dir = os.path.join(self.config.models_dir, f"segment_{segment_id}")
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        data_dir = os.path.join(self.config.output_dir, f"segment_{segment_id}")
 
-        # 2. HMM Training (returns context_rows for env warmup)
-        train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, segment_id)
+        os.makedirs(models_dir, exist_ok=True)
+        os.makedirs(weights_dir, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
 
-        # 3. Save preprocessed data (with context buffer metadata)
-        train_path, test_path = self.save_segment_data(
-            train_df, test_df, scaler, segment_id, context_rows
-        )
+        hmm_path = os.path.join(models_dir, "hmm.pkl")
+        scaler_path = os.path.join(models_dir, "scaler.pkl")
+        train_path = os.path.join(data_dir, "train.parquet")
+        test_path = os.path.join(data_dir, "test.parquet")
+        metadata_path = os.path.join(data_dir, "metadata.json")
+        encoder_path = os.path.join(weights_dir, "encoder.pth")
 
-        # Cleanup dataframes
-        del train_df, test_df, hmm
-        gc.collect()
+        # --- 1. Preprocessing & HMM Logic (Smart Skip) ---
+        if os.path.exists(hmm_path) and os.path.exists(train_path) and os.path.exists(test_path) and os.path.exists(metadata_path):
+            print(f"[SKIP] Found existing HMM and processed data for Segment {segment_id}. Loading from disk...")
 
-        # 4. MAE Training
-        encoder_path = self.train_mae(train_path, segment_id)
+            # Load Metadata (context_rows)
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            context_rows = metadata.get('context_rows', 0)
+            print(f"   -> Loaded context_rows: {context_rows}")
+
+        else:
+            print(f"[EXEC] Processing data and training HMM for Segment {segment_id}...")
+            # Normal flow: Preprocess -> Train HMM -> Save
+            train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+            train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, segment_id)
+
+            # Save artifacts for future skips
+            self.save_segment_data(train_df, test_df, scaler, segment_id, context_rows)
+
+            # Cleanup dataframes
+            del train_df, test_df, hmm
+            gc.collect()
+
+        # --- 2. MAE Logic (Smart Skip) ---
+        if os.path.exists(encoder_path):
+            print(f"[SKIP] Found existing MAE encoder at {encoder_path}. Skipping MAE training.")
+        else:
+            print(f"[EXEC] Training MAE Foundation Model for Segment {segment_id}...")
+            encoder_path = self.train_mae(train_path, segment_id)
 
         # 5. TQC Training
         tqc_path, train_metrics = self.train_tqc(
