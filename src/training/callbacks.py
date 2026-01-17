@@ -638,8 +638,9 @@ class ThreePhaseCurriculumCallback(BaseCallback):
             except (ConnectionResetError, BrokenPipeError, FileNotFoundError, OSError):
                 # Fail gracefully. Do not kill the training run for a metric update.
                 pass
-        else:
-            self._update_envs()
+
+        # ALWAYS update env (for BatchCryptoEnv penalties + curriculum_lambda)
+        self._update_envs()
 
         self.logger.record("curriculum/smooth_coef", self.current_smooth)
         self.logger.record("curriculum/churn_coef", self.current_churn)
