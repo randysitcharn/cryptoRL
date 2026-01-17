@@ -532,16 +532,14 @@ class CurriculumFeesCallback(BaseCallback):
         self.current_fee = progress * self.target_fee_rate
         self.current_smooth = progress * self.target_smooth_coef
 
-        # Update via shared memory (SubprocVecEnv) or direct access (DummyVecEnv)
+        # Update via shared memory (SubprocVecEnv)
         if self.shared_fee is not None:
-            # Write to shared memory - subprocesses read this value
             self.shared_fee.value = self.current_fee
         if self.shared_smooth is not None:
             self.shared_smooth.value = self.current_smooth
 
-        # Fallback for DummyVecEnv (no shared memory)
-        if self.shared_fee is None:
-            self._update_envs()
+        # ALWAYS update envs (for BatchCryptoEnv direct access)
+        self._update_envs()
 
         self.logger.record("curriculum/fee_rate", self.current_fee)
         self.logger.record("curriculum/smooth_coef", self.current_smooth)
