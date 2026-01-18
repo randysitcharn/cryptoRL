@@ -629,8 +629,8 @@ class WFOPipeline:
             baseline_vol=baseline_vol,
         )
 
-        # Load agent
-        model = TQC.load(tqc_path)
+        # Load agent (must use CUDA - encoder uses float16 which fails on CPU)
+        model = TQC.load(tqc_path, device='cuda')
 
         # Run evaluation
         obs, _ = env.reset()

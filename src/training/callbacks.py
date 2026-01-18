@@ -14,7 +14,7 @@ import time
 import numpy as np
 from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 from stable_baselines3.common.vec_env import VecEnv
 
 if TYPE_CHECKING:
@@ -746,3 +746,86 @@ class OverfittingGuardCallback(BaseCallback):
                 return False  # Stop training
 
         return True
+
+
+# ============================================================================
+# Evaluation Callback with Observation Noise Management
+# ============================================================================
+
+class EvalCallbackWithNoiseControl(EvalCallback):
+    """
+    Wrapper around EvalCallback that automatically disables observation noise
+    in BatchCryptoEnv during evaluation and re-enables it after.
+
+    This ensures that evaluation metrics are not affected by observation noise,
+    which should only be active during training for regularization.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """
+        Initialize the callback with noise control.
+
+        All arguments are passed to EvalCallback.
+        """
+        super().__init__(*args, **kwargs)
+        self._training_env_has_noise = False
+        self._eval_env_has_noise = False
+        self._last_eval_step = -1
+
+    def _on_step(self) -> bool:
+        """
+        Override to manage observation noise before/after evaluation.
+        """
+        # Check if evaluation will occur (EvalCallback logic)
+        will_eval = (self.eval_freq > 0 and 
+                     self.n_calls % self.eval_freq == 0 and 
+                     self.n_calls != self._last_eval_step)
+        
+        if will_eval:
+            # Before evaluation: disable noise in training env if it's BatchCryptoEnv
+            train_env = self._get_batch_env(self.training_env)
+            if train_env is not None and hasattr(train_env, 'set_training_mode'):
+                self._training_env_has_noise = train_env.training
+                train_env.set_training_mode(False)
+                if self.verbose > 0:
+                    print(f"  [Noise Control] Disabled observation noise in training env for evaluation")
+
+            # Check eval environment (should already be False, but ensure it)
+            eval_env = self._get_batch_env(self.eval_env)
+            if eval_env is not None and hasattr(eval_env, 'set_training_mode'):
+                self._eval_env_has_noise = eval_env.training
+                eval_env.set_training_mode(False)
+                if self.verbose > 0:
+                    print(f"  [Noise Control] Disabled observation noise in eval env")
+
+        # Call parent evaluation (this will trigger evaluation if needed)
+        result = super()._on_step()
+
+        # After evaluation: re-enable noise in training env
+        if will_eval:
+            train_env = self._get_batch_env(self.training_env)
+            if train_env is not None and hasattr(train_env, 'set_training_mode'):
+                train_env.set_training_mode(self._training_env_has_noise)
+                if self.verbose > 0 and self._training_env_has_noise:
+                    print(f"  [Noise Control] Re-enabled observation noise in training env")
+
+            # Restore eval env state (should stay False, but restore original)
+            eval_env = self._get_batch_env(self.eval_env)
+            if eval_env is not None and hasattr(eval_env, 'set_training_mode'):
+                eval_env.set_training_mode(self._eval_env_has_noise)
+            
+            self._last_eval_step = self.n_calls
+
+        return result
+
+    def _get_batch_env(self, env):
+        """
+        Unwrap environment to find BatchCryptoEnv instance.
+
+        Args:
+            env: Environment (potentially wrapped).
+
+        Returns:
+            BatchCryptoEnv instance if found, None otherwise.
+        """
+        return get_underlying_batch_env(env)

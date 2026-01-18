@@ -21,6 +21,7 @@ from sb3_contrib import TQC
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from src.training.callbacks import EvalCallbackWithNoiseControl
 import torch
 import numpy as np
 from functools import partial
@@ -487,7 +488,16 @@ def create_callbacks(
 
     # Evaluation callback (only if eval_env is provided)
     if eval_env is not None:
-        eval_callback = EvalCallback(
+        # Disable observation noise in eval environment if it's BatchCryptoEnv
+        from src.training.callbacks import get_underlying_batch_env
+        eval_batch_env = get_underlying_batch_env(eval_env)
+        if eval_batch_env is not None and hasattr(eval_batch_env, 'set_training_mode'):
+            eval_batch_env.set_training_mode(False)
+            if config.verbose > 0:
+                print("      [Noise Control] Disabled observation noise in eval environment")
+
+        # Use EvalCallbackWithNoiseControl to manage noise in training env during eval
+        eval_callback = EvalCallbackWithNoiseControl(
             eval_env,
             best_model_save_path=config.checkpoint_dir,
             log_path="logs/",

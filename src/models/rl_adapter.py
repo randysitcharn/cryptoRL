@@ -245,7 +245,9 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
 
         # 1. Encode market data using pretrained MAE encoder
         # Output: (batch, seq_len, d_model) = (B, 64, 128)
-        if self._use_amp:
+        # Note: Use AMP only if enabled AND tensor is actually on CUDA
+        use_amp_now = self._use_amp and market_obs.is_cuda
+        if use_amp_now:
             # Use autocast for mixed precision inference
             with torch.amp.autocast('cuda'):
                 encoded = self.mae.encode(market_obs.half())
