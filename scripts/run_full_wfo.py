@@ -605,6 +605,8 @@ class WFOPipeline:
             print(f"  [WARNING] train_path not provided. Using default baseline_vol: {baseline_vol:.5f}")
 
         # Create test environment
+        # NOTE: max_leverage=1.0 disables volatility scaling for evaluation
+        # This prevents the "stuck in cash" bug where portfolio returns collapse to 0
         env = CryptoTradingEnv(
             parquet_path=test_path,
             window_size=self.config.window_size,
@@ -613,7 +615,7 @@ class WFOPipeline:
             random_start=False,
             target_volatility=self.config.target_volatility,
             vol_window=self.config.vol_window,
-            max_leverage=self.config.max_leverage,
+            max_leverage=1.0,  # Disable vol scaling (was: self.config.max_leverage)
             price_column='BTC_Close',
         )
 
