@@ -78,7 +78,7 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
         "policy": "MlpPolicy",
         "learning_rate": linear_schedule(5e-5),  # Scheduler linéaire décroissant
         "buffer_size": 50_000,    # Plus petit pour recycler plus vite
-        "batch_size": 128,        # Plus petit = plus de bruit régularisateur
+        "batch_size": 512,        # Increased for better GPU utilization
         "ent_coef": 0.05,         # FIXE (auto fait exploser le Transformer)
         "gamma": 0.99,
         "tau": 0.005,

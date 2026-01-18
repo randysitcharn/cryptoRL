@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 test_vol_scaling.py - Proof of Correctness for Volatility Scaling
 
-Verifies that the CryptoTradingEnv correctly handles:
+Verifies that the BatchCryptoEnv correctly handles:
 1. Implicit Rebalancing Costs: Fees ARE charged when vol_scalar changes
    even if the agent's raw action remains constant
 2. No Lookahead Bias: Volatility calculation uses only past data
@@ -18,6 +19,8 @@ Author: Quantitative Audit
 import numpy as np
 import sys
 import os
+import tempfile
+import pandas as pd
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -232,7 +235,7 @@ def test_no_lookahead_bias():
 
 def test_with_real_env():
     """
-    Integration test with the actual CryptoTradingEnv.
+    Integration test with the actual BatchCryptoEnv.
     Requires data/processed_data.parquet to exist.
     """
     print("\n" + "=" * 70)
@@ -240,10 +243,9 @@ def test_with_real_env():
     print("=" * 70)
 
     try:
-        from src.training.env import CryptoTradingEnv
-        import pandas as pd
+        from src.training.batch_env import BatchCryptoEnv
     except ImportError as e:
-        print(f"\n[WARN]  SKIP: Could not import CryptoTradingEnv: {e}")
+        print(f"\n[WARN]  SKIP: Could not import BatchCryptoEnv: {e}")
         return None
 
     # Check if data exists
@@ -263,10 +265,13 @@ def test_with_real_env():
         return None
 
     # Create env with vol scaling
-    env = CryptoTradingEnv(
+    env = BatchCryptoEnv(
         parquet_path=data_path,
+        n_envs=1,
+        device='cpu',
         price_column=price_col,
         window_size=64,
+        episode_length=200,
         random_start=False,
         target_volatility=0.05,
         vol_window=24,
@@ -274,7 +279,7 @@ def test_with_real_env():
         action_discretization=0.1,
     )
 
-    obs, info = env.reset()
+    obs, info = env.gym_reset()
     print(f"\nEnvironment initialized:")
     print(f"  Initial NAV: ${info['nav']:,.2f}")
     print(f"  Target Vol: {env.target_volatility}")
@@ -288,7 +293,7 @@ def test_with_real_env():
     print("\nRunning 100 steps with constant raw_action=1.0...")
 
     for step in range(100):
-        obs, reward, done, truncated, info = env.step(constant_action)
+        obs, reward, done, truncated, info = env.gym_step(constant_action)
 
         vol_scalar = info['vol/vol_scalar']
 

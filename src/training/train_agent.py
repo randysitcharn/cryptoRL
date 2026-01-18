@@ -12,26 +12,157 @@ Usage:
 import os
 import re
 import glob
+import zipfile
+import io
+from typing import Optional, Tuple
 
 from sb3_contrib import TQC
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from src.training.callbacks import EvalCallbackWithNoiseControl
 import torch
-
-# CUDA Optimization: Auto-tune convolutions for repeated input sizes
-torch.backends.cudnn.benchmark = True
+import numpy as np
 
 from src.config import DEVICE, SEED
+from src.utils.hardware import HardwareManager
 from src.models.rl_adapter import FoundationFeatureExtractor
-from src.training.env import CryptoTradingEnv
-from src.training.wrappers import RiskManagementWrapper
+from src.training.batch_env import BatchCryptoEnv
 from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
     StepLoggingCallback,
     DetailTensorboardCallback,
     CurriculumFeesCallback,
+    ThreePhaseCurriculumCallback,
+    OverfittingGuardCallback,
 )
+
+
+def clean_compiled_checkpoint(checkpoint_path: str) -> None:
+    """
+    Clean torch.compile artifacts from SB3 checkpoint.
+
+    torch.compile wraps modules and adds '_orig_mod.' prefix to state_dict keys.
+    This function removes that prefix to ensure checkpoint compatibility with
+    non-compiled models (e.g., during resume).
+
+    Args:
+        checkpoint_path: Path to the .zip checkpoint file
+    """
+    if not os.path.exists(checkpoint_path):
+        return
+
+    try:
+        # Read the zip file
+        with zipfile.ZipFile(checkpoint_path, 'r') as zf:
+            file_contents = {}
+            for name in zf.namelist():
+                file_contents[name] = zf.read(name)
+
+        # Process .pth files (state dicts)
+        modified = False
+        for name in list(file_contents.keys()):
+            if name.endswith('.pth'):
+                # Load state dict from bytes
+                buffer = io.BytesIO(file_contents[name])
+                state_dict = torch.load(buffer, map_location='cpu', weights_only=False)
+
+                # Check if cleaning is needed
+                needs_cleaning = any('_orig_mod.' in k for k in state_dict.keys())
+                if needs_cleaning:
+                    # Clean keys
+                    cleaned_dict = {}
+                    for key, value in state_dict.items():
+                        new_key = key.replace('_orig_mod.', '')
+                        cleaned_dict[new_key] = value
+
+                    # Save cleaned state dict back to bytes
+                    buffer = io.BytesIO()
+                    torch.save(cleaned_dict, buffer)
+                    file_contents[name] = buffer.getvalue()
+                    modified = True
+
+        # Write back if modified
+        if modified:
+            with zipfile.ZipFile(checkpoint_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for name, content in file_contents.items():
+                    zf.writestr(name, content)
+            print(f"  [CLEANUP] Removed torch.compile artifacts from {os.path.basename(checkpoint_path)}")
+
+    except Exception as e:
+        print(f"  [WARNING] Could not clean checkpoint {checkpoint_path}: {e}")
+
+
+class RotatingCheckpointCallback(CheckpointCallback):
+    """
+    Checkpoint callback that keeps only the last saved checkpoint (disk optimization).
+
+    Inherits from CheckpointCallback but deletes the previous checkpoint after
+    saving a new one. This prevents disk space from filling up during long
+    training runs.
+
+    Args:
+        save_freq: Save frequency in timesteps.
+        save_path: Directory to save checkpoints.
+        name_prefix: Prefix for checkpoint files.
+        verbose: Verbosity level.
+    """
+
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", verbose: int = 0):
+        super().__init__(save_freq, save_path, name_prefix, verbose)
+        self.last_model_path: Optional[str] = None
+
+    def _on_step(self) -> bool:
+        # Call parent to save the model
+        result = super()._on_step()
+
+        # Check if a save happened on this step
+        if self.n_calls % self.save_freq == 0:
+            step = self.num_timesteps
+            current_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps.zip")
+
+            # Clean torch.compile artifacts from the checkpoint
+            clean_compiled_checkpoint(current_path)
+
+            # Delete old checkpoint if it exists and is different from current
+            if self.last_model_path and os.path.exists(self.last_model_path) and self.last_model_path != current_path:
+                try:
+                    os.remove(self.last_model_path)
+                    if self.verbose > 0:
+                        print(f"  [Disk Opt] Deleted old checkpoint: {os.path.basename(self.last_model_path)}")
+                except OSError as e:
+                    print(f"  [Warning] Could not delete {self.last_model_path}: {e}")
+
+            # Update tracker for next iteration
+            self.last_model_path = current_path
+
+        return result
+
+
+class BestModelCleanerCallback(BaseCallback):
+    """
+    Callback to clean torch.compile artifacts from best_model.zip.
+
+    EvalCallback saves best_model.zip internally, and we can't hook into that.
+    This callback periodically checks and cleans best_model.zip.
+    """
+
+    def __init__(self, checkpoint_dir: str, check_freq: int = 10000, verbose: int = 0):
+        super().__init__(verbose)
+        self.best_model_path = os.path.join(checkpoint_dir, "best_model.zip")
+        self.check_freq = check_freq
+        self.last_mtime: Optional[float] = None
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+
+        # Check if best_model.zip exists and was modified
+        if os.path.exists(self.best_model_path):
+            current_mtime = os.path.getmtime(self.best_model_path)
+            if self.last_mtime is None or current_mtime > self.last_mtime:
+                clean_compiled_checkpoint(self.best_model_path)
+                self.last_mtime = current_mtime
+
+        return True
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
@@ -103,15 +234,18 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
     )
 
 
-def create_environments(config: TrainingConfig):
+def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: bool = True):
     """
-    Create training and evaluation environments.
+    Create training and evaluation environments using BatchCryptoEnv.
 
     Args:
         config: Training configuration.
+        n_envs: Number of parallel training environments.
+        use_batch_env: Deprecated, always uses BatchCryptoEnv (kept for backward compatibility).
 
     Returns:
-        Tuple of (train_vec_env, eval_vec_env).
+        Tuple of (train_vec_env, eval_vec_env, None, None, None).
+        Last three values are None (kept for backward compatibility).
     """
     # Curriculum Learning: start with 0 fees/smoothness if enabled
     if config.use_curriculum:
@@ -121,77 +255,82 @@ def create_environments(config: TrainingConfig):
         initial_commission = config.commission
         initial_smooth = config.smooth_coef
 
-    # Create training environment (full training dataset)
-    train_env = CryptoTradingEnv(
+    # ==================== Training Environment ====================
+    # GPU-Vectorized Batch Environment
+    # All envs run in a single process using PyTorch tensors on GPU
+    print(f"      [BatchEnv] Creating {n_envs} GPU-vectorized environments (BatchCryptoEnv)...")
+
+    train_vec_env = BatchCryptoEnv(
         parquet_path=config.data_path,
+        n_envs=n_envs,
+        device=str(DEVICE),
         window_size=config.window_size,
-        commission=initial_commission,
         episode_length=config.episode_length,
+        initial_balance=10_000.0,
+        commission=initial_commission,
+        slippage=0.0001,
         reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
         churn_coef=config.churn_coef,
         smooth_coef=initial_smooth,
-        random_start=True,
         target_volatility=config.target_volatility,
         vol_window=config.vol_window,
         max_leverage=config.max_leverage,
+        price_column='BTC_Close',
+        observation_noise=config.observation_noise,  # Anti-overfitting
     )
 
-    # Create eval environment (separate eval dataset, 1 month)
-    # Note: Eval env uses target values (no curriculum) for consistent evaluation
-    val_env = CryptoTradingEnv(
-        parquet_path=config.eval_data_path,
-        window_size=config.window_size,
-        commission=config.commission,
-        episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
-        reward_scaling=config.reward_scaling,
-        downside_coef=config.downside_coef,
-        upside_coef=config.upside_coef,
-        action_discretization=config.action_discretization,
-        churn_coef=config.churn_coef,
-        smooth_coef=config.smooth_coef,
-        random_start=False,  # Sequential for evaluation
-        target_volatility=config.target_volatility,
-        vol_window=config.vol_window,
-        max_leverage=config.max_leverage,
-    )
-
-    # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
-    # Train env: NO CB (agent learns from mistakes)
-    # Eval env: CB active at configured threshold (monitoring only)
-    if config.use_risk_management:
-        # Only wrap eval env with circuit breaker
-        val_env = RiskManagementWrapper(
-            val_env,
-            vol_window=config.risk_vol_window,
-            vol_threshold=config.risk_vol_threshold,
-            max_drawdown=config.risk_max_drawdown,
-            cooldown_steps=config.risk_cooldown,
-            augment_obs=config.risk_augment_obs,
+    # ==================== Eval Environment (optional) ====================
+    # Note: eval_data_path=None in WFO mode to prevent data leakage
+    if config.eval_data_path is not None:
+        # Note: Eval env uses target values (no curriculum) for consistent evaluation
+        # Use BatchCryptoEnv with small n_envs for evaluation
+        eval_vec_env = BatchCryptoEnv(
+            parquet_path=config.eval_data_path,
+            n_envs=min(n_envs, 32),  # Smaller for evaluation
+            device=str(DEVICE),
+            window_size=config.window_size,
+            episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
+            initial_balance=10_000.0,
+            commission=config.commission,
+            slippage=0.0001,
+            reward_scaling=config.reward_scaling,
+            downside_coef=config.downside_coef,
+            upside_coef=config.upside_coef,
+            action_discretization=config.action_discretization,
+            churn_coef=config.churn_coef,
+            smooth_coef=config.smooth_coef,
+            target_volatility=config.target_volatility,
+            vol_window=config.vol_window,
+            max_leverage=config.max_leverage,
+            price_column='BTC_Close',
+            random_start=False,  # Sequential for evaluation
+            observation_noise=0.0,  # No noise for evaluation
         )
-        # Calibrate baseline volatility
-        val_env.calibrate_baseline(n_steps=2000)
+    else:
+        # WFO mode: no eval env to prevent data leakage
+        eval_vec_env = None
+        print("      [WFO Mode] Eval environment disabled (eval_data_path=None)")
 
-    # Wrap in Monitor for episode tracking
-    train_env_monitored = Monitor(train_env)
-    val_env_monitored = Monitor(val_env)
-
-    # Vectorize for SB3
-    train_vec_env = DummyVecEnv([lambda: train_env_monitored])
-    eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
-
-    return train_vec_env, eval_vec_env
+    return train_vec_env, eval_vec_env, None, None, None
 
 
-def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTensorboardCallback]:
+def create_callbacks(
+    config: TrainingConfig,
+    eval_env,
+    shared_fee=None,
+    shared_smooth=None,
+) -> tuple[list, DetailTensorboardCallback]:
     """
     Create training callbacks.
 
     Args:
         config: Training configuration.
-        eval_env: Evaluation environment.
+        eval_env: Evaluation environment (None in WFO mode).
+        shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
+        shared_smooth: Shared memory Value for curriculum smooth_coef (SubprocVecEnv).
 
     Returns:
         Tuple of (callbacks_list, detail_callback).
@@ -204,50 +343,104 @@ def create_callbacks(config: TrainingConfig, eval_env) -> tuple[list, DetailTens
 
     # Note: Gradient clipping is now handled by ClippedAdamW optimizer
 
-    # Evaluation callback
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=config.checkpoint_dir,
-        log_path="logs/",
-        eval_freq=config.eval_freq,
-        deterministic=True,
-        render=False,
-        verbose=1,
-    )
-    callbacks.append(eval_callback)
+    # Evaluation callback (only if eval_env is provided)
+    if eval_env is not None:
+        # Disable observation noise in eval environment if it's BatchCryptoEnv
+        from src.training.callbacks import get_underlying_batch_env
+        eval_batch_env = get_underlying_batch_env(eval_env)
+        if eval_batch_env is not None and hasattr(eval_batch_env, 'set_training_mode'):
+            eval_batch_env.set_training_mode(False)
+            if config.verbose > 0:
+                print("      [Noise Control] Disabled observation noise in eval environment")
 
-    # Checkpoint callback
-    checkpoint_callback = CheckpointCallback(
-        save_freq=config.checkpoint_freq,
-        save_path=config.checkpoint_dir,
-        name_prefix="tqc_foundation",
-        verbose=1,
-    )
-    callbacks.append(checkpoint_callback)
+        # Use EvalCallbackWithNoiseControl to manage noise in training env during eval
+        eval_callback = EvalCallbackWithNoiseControl(
+            eval_env,
+            best_model_save_path=config.checkpoint_dir,
+            log_path="logs/",
+            eval_freq=config.eval_freq,
+            deterministic=True,
+            render=False,
+            verbose=1,
+        )
+        callbacks.append(eval_callback)
+
+        # Clean torch.compile artifacts from best_model.zip saved by EvalCallback
+        best_model_cleaner = BestModelCleanerCallback(
+            checkpoint_dir=config.checkpoint_dir,
+            check_freq=config.eval_freq,  # Check after each evaluation
+            verbose=0,
+        )
+        callbacks.append(best_model_cleaner)
+
+        # Rotating checkpoint callback (keeps only last checkpoint to save disk space)
+        checkpoint_callback = RotatingCheckpointCallback(
+            save_freq=config.checkpoint_freq,
+            save_path=config.checkpoint_dir,
+            name_prefix="tqc_foundation",
+            verbose=1,
+        )
+        callbacks.append(checkpoint_callback)
+    else:
+        # WFO mode: no EvalCallback, use safety checkpoint with rotation
+        print("      [WFO Mode] EvalCallback disabled.")
+        print("      [WFO Mode] Portfolio metrics logged via StepLoggingCallback (custom/nav, custom/position, custom/max_drawdown)")
+
+        # Safety checkpoint with disk rotation (keeps only last checkpoint)
+        n_envs = getattr(config, 'n_envs', 1) or 1
+        safety_freq = max(1000, 100_000 // n_envs)
+        safety_checkpoint = RotatingCheckpointCallback(
+            save_freq=safety_freq,
+            save_path=config.checkpoint_dir,
+            name_prefix="tqc_wfo_safety",
+            verbose=1,
+        )
+        callbacks.append(safety_checkpoint)
+        print(f"      [WFO Mode] RotatingCheckpointCallback enabled (freq={safety_freq}, keeps last only)")
 
     # Detail Tensorboard callback for reward components
     detail_callback = DetailTensorboardCallback(verbose=0)
     callbacks.append(detail_callback)
 
-    # Curriculum Learning callback
+    # Curriculum Learning callback (3-Phase: Discovery → Discipline → Refinement)
+    # Phases calibrées dans callbacks.py pour ratio |PnL|/|Penalties| ≈ 1.0
     if config.use_curriculum:
-        curriculum_callback = CurriculumFeesCallback(
-            target_fee_rate=config.commission,
-            target_smooth_coef=config.smooth_coef,
-            warmup_steps=config.curriculum_warmup_steps,
+        curriculum_callback = ThreePhaseCurriculumCallback(
+            total_timesteps=config.total_timesteps,
+            shared_smooth=shared_smooth,
             verbose=1
         )
         callbacks.append(curriculum_callback)
 
+    # Overfitting guard - DISABLED (OOS Sharpe 4.75 shows model generalizes well)
+    # overfitting_guard = OverfittingGuardCallback(
+    #     nav_threshold=5.0,
+    #     initial_nav=10_000.0,
+    #     check_freq=25_600,  # Check every ~25k steps
+    #     verbose=1
+    # )
+    # callbacks.append(overfitting_guard)
+
     return callbacks, detail_callback
 
 
-def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
+def train(
+    config: TrainingConfig = None,
+    hw_overrides: dict = None,
+    use_batch_env: bool = False,
+    resume_path: str = None
+) -> tuple[TQC, dict]:
     """
     Train TQC agent with Foundation Model feature extractor.
 
     Args:
         config: Training configuration (uses default if None).
+        hw_overrides: Optional dict to override hardware auto-config
+                      (e.g., {"n_envs": 4, "batch_size": 512})
+        use_batch_env: If True, use BatchCryptoEnv (GPU-vectorized) instead of SubprocVecEnv.
+                       This runs all envs in a single process using GPU tensors (10-50x speedup).
+        resume_path: Path to checkpoint to resume from (e.g., tqc_last.zip).
+                     If provided, loads model and continues TensorBoard steps.
 
     Returns:
         Tuple of (Trained TQC model, training metrics dict).
@@ -259,6 +452,39 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print("TQC + Foundation Model Training")
     print("=" * 70)
 
+    # ==================== Hardware Auto-Detection ====================
+    print("\n[0/4] Detecting hardware and computing optimal config...")
+    import logging
+    hw_logger = logging.getLogger("hardware")
+    hw_logger.setLevel(logging.INFO)
+    if not hw_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("      %(message)s"))
+        hw_logger.addHandler(handler)
+
+    hw_manager = HardwareManager(logger=hw_logger)
+
+    # Build overrides from config + explicit hw_overrides
+    # Priority: hw_overrides > config attributes > auto-detected
+    overrides = {}
+    if hasattr(config, 'n_envs') and config.n_envs is not None:
+        overrides['n_envs'] = config.n_envs
+    if hasattr(config, 'batch_size') and config.batch_size is not None:
+        overrides['batch_size'] = config.batch_size
+    if hasattr(config, 'buffer_size') and config.buffer_size is not None:
+        overrides['buffer_size'] = config.buffer_size
+    if hw_overrides:
+        overrides.update(hw_overrides)
+
+    adaptive_config = hw_manager.get_adaptive_config(user_overrides=overrides)
+    hw_manager.apply_optimizations(adaptive_config)
+    hw_manager.log_summary(adaptive_config)
+
+    # Apply adaptive config back to training config
+    n_envs = adaptive_config.n_envs
+    config.batch_size = adaptive_config.batch_size
+    config.buffer_size = adaptive_config.buffer_size
+
     # Create directories
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     os.makedirs(config.tensorboard_log, exist_ok=True)
@@ -266,10 +492,19 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
 
     # ==================== Environment Setup ====================
     print("\n[1/4] Creating environments...")
-    train_env, eval_env = create_environments(config)
+    train_env, eval_env, shared_fee, shared_smooth, manager = create_environments(
+        config, n_envs=n_envs, use_batch_env=use_batch_env
+    )
 
-    obs_shape = train_env.observation_space.shape
-    print(f"      Observation space: {obs_shape}")
+    obs_space = train_env.observation_space
+    # Handle Dict observation space (market + position)
+    if hasattr(obs_space, 'spaces'):
+        market_shape = obs_space["market"].shape
+        pos_shape = obs_space["position"].shape
+        print(f"      Observation space: Dict(market={market_shape}, position={pos_shape})")
+    else:
+        market_shape = obs_space.shape
+        print(f"      Observation space: {market_shape}")
     print(f"      Action space: {train_env.action_space.shape}")
     print(f"      Device: {DEVICE}")
     print(f"      Volatility Scaling Active: Target={config.target_volatility}, Window={config.vol_window}")
@@ -281,20 +516,24 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"      Encoder: {config.encoder_path}")
     print(f"      Frozen: {config.freeze_encoder}")
     print(f"      Net arch: {config.net_arch}")
-    print(f"      features_dim: {obs_shape[0]} * {config.d_model} = {obs_shape[0] * config.d_model}")
+    print(f"      features_dim: {market_shape[0]} * {config.d_model} + 1(pos) = {market_shape[0] * config.d_model + 1}")
     print(f"      gSDE: {config.use_sde} (sample_freq={config.sde_sample_freq})")
 
     # ==================== Model Creation ====================
     # Use custom name for TensorBoard if provided
     tb_log_name = config.name if config.name else "TQC"
 
-    if config.load_model_path:
-        # ========== LIGHTWEIGHT RESUME MODE ==========
-        print(f"\n[3/4] Loading model from {config.load_model_path}...")
-        print("      Mode: Lightweight Resume (no buffer)")
+    # Determine resume path: explicit resume_path takes precedence
+    effective_resume_path = resume_path if resume_path and os.path.exists(resume_path) else config.load_model_path
+    is_resume = effective_resume_path is not None
+
+    if effective_resume_path:
+        # ========== RESUME MODE ==========
+        print(f"\n[3/4] 🔄 RESUMING training from {effective_resume_path}...")
+        print("      Mode: Resume (continuing TensorBoard steps)")
 
         model = TQC.load(
-            config.load_model_path,
+            effective_resume_path,
             env=train_env,
             device=DEVICE,
             tensorboard_log=config.tensorboard_log,
@@ -331,7 +570,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
         print("\n[3/4] Creating TQC model...")
 
         model = TQC(
-            policy="MlpPolicy",
+            policy="MultiInputPolicy",  # Dict obs space (market + position)
             env=train_env,
             learning_rate=linear_schedule(config.learning_rate),
             buffer_size=config.buffer_size,
@@ -355,6 +594,45 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"      Total parameters: {sum(p.numel() for p in model.policy.parameters()):,}")
     print(f"      Trainable parameters: {sum(p.numel() for p in model.policy.parameters() if p.requires_grad):,}")
 
+    # ⚡ OPTIMIZATION: Torch Compile (Surgical + Warmup)
+    # Skip torch.compile on resume to avoid state_dict key mismatch
+    if torch.cuda.is_available() and os.name != 'nt' and not is_resume:
+        print("\n  [ACCELERATOR] Enabling torch.compile(mode='reduce-overhead')...")
+        try:
+            # 1. Compile Heavy Modules (Surgical - avoids state_dict key issues)
+            # Compile the Transformer Encoder (Biggest gain)
+            model.policy.features_extractor = torch.compile(
+                model.policy.features_extractor, mode="reduce-overhead"
+            )
+
+            # Compile MLP Heads
+            model.policy.actor = torch.compile(model.policy.actor, mode="reduce-overhead")
+            model.policy.critic = torch.compile(model.policy.critic, mode="reduce-overhead")
+
+            # Compile Targets (Faster soft-updates)
+            model.policy.actor_target = torch.compile(model.policy.actor_target, mode="reduce-overhead")
+            model.policy.critic_target = torch.compile(model.policy.critic_target, mode="reduce-overhead")
+
+            # 2. JIT Warmup (Force compilation NOW, not at step 0)
+            print("  [ACCELERATOR] Triggering JIT Warmup (may take ~30s)...")
+            with torch.no_grad():
+                # Create dummy observation matching the Dict observation space
+                dummy_obs = {}
+                for key, space in model.observation_space.spaces.items():
+                    dummy_obs[key] = torch.randn(1, *space.shape, device=model.device)
+                # Run forward pass to build CUDA graphs
+                model.policy(dummy_obs)
+
+            print("  [SUCCESS] Policy compiled and warmed up. Ready for high-speed training.")
+
+        except Exception as e:
+            print(f"  [WARNING] torch.compile failed: {e}")
+            print("  [INFO] Falling back to standard Eager Execution.")
+    elif is_resume:
+        print("  [INFO] torch.compile skipped (Resume mode - avoiding state_dict key mismatch).")
+    else:
+        print("  [INFO] torch.compile skipped (Not on Linux/CUDA).")
+
     # ==================== Training ====================
     print("\n[4/4] Starting training...")
     print(f"      Total timesteps: {config.total_timesteps:,}")
@@ -362,17 +640,55 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print(f"      Checkpoint frequency: {config.checkpoint_freq:,}")
     print("\n" + "=" * 70)
 
-    callbacks, detail_callback = create_callbacks(config, eval_env)
-
-    # reset_num_timesteps=False continues TensorBoard from previous run
-    is_resume = config.load_model_path is not None
-    model.learn(
-        total_timesteps=config.total_timesteps,
-        callback=callbacks,
-        tb_log_name=tb_log_name,
-        progress_bar=True,
-        reset_num_timesteps=not is_resume,  # False for resume, True for fresh
+    callbacks, detail_callback = create_callbacks(
+        config, eval_env, shared_fee=shared_fee, shared_smooth=shared_smooth
     )
+
+    # Note: is_resume was set earlier in Model Creation section
+    # reset_num_timesteps=False continues TensorBoard from previous run
+
+    # ==================== Initialize Curriculum State (Gemini safeguard) ====================
+    # Prevents "First Step" lag where shared values might be uninitialized
+    if shared_smooth is not None:
+        shared_smooth.value = 0.0
+    if shared_fee is not None:
+        shared_fee.value = 0.0
+
+    try:
+        model.learn(
+            total_timesteps=config.total_timesteps,
+            callback=callbacks,
+            tb_log_name=tb_log_name,
+            progress_bar=True,
+            reset_num_timesteps=not is_resume,  # False for resume, True for fresh
+        )
+    except Exception as e:
+        print(f"\n[CRITICAL] Exception during training: {e}")
+        emergency_path = os.path.join(config.checkpoint_dir, "emergency_save_internal.zip")
+        print(f"[CRITICAL] Attempting internal emergency save to {emergency_path}...")
+        try:
+            model.save(emergency_path)
+            clean_compiled_checkpoint(emergency_path)
+            print("[CRITICAL] Emergency save SUCCESS.")
+        except Exception as save_err:
+            print(f"[CRITICAL] Emergency save FAILED: {save_err}")
+        raise e  # Re-raise to stop the script properly
+    finally:
+        # ==================== Cleanup Resources ====================
+        print("\n[Cleanup] Closing environments...")
+        if train_env is not None:
+            train_env.close()
+
+        # Fix for 'NoneType' object has no attribute 'close' on eval_env
+        if eval_env is not None:
+            eval_env.close()
+
+        if manager is not None:
+            try:
+                manager.shutdown()
+                print("      Manager shutdown complete.")
+            except Exception:
+                pass
 
     # ==================== Capture Training Metrics ====================
     training_metrics = detail_callback.get_training_metrics()
@@ -392,6 +708,7 @@ def train(config: TrainingConfig = None) -> tuple[TQC, dict]:
     print("=" * 70)
 
     model.save(config.save_path)
+    clean_compiled_checkpoint(config.save_path)
     print(f"\nModel saved to: {config.save_path}")
 
     print("\nArtifacts:")
@@ -424,12 +741,20 @@ if __name__ == "__main__":
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 256)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: auto-detect from VRAM)")
     parser.add_argument("--gamma", type=float, default=None, help="Discount factor (default: 0.99)")
     parser.add_argument("--load-model", type=str, default=None,
                         help="Path to .zip model to resume training from (Lightweight mode: no buffer)")
     parser.add_argument("--load-latest", action="store_true",
                         help="Auto-select latest checkpoint from checkpoint_dir")
+    # Hardware override arguments
+    parser.add_argument("--n-envs", type=int, default=None,
+                        help="Number of parallel envs (default: auto-detect from CPU cores)")
+    parser.add_argument("--buffer-size", type=int, default=None,
+                        help="Replay buffer size (default: auto-detect from RAM)")
+    # GPU-Vectorized Environment (BatchCryptoEnv)
+    parser.add_argument("--use-batch-env", action="store_true",
+                        help="Use GPU-vectorized BatchCryptoEnv (10-50x speedup vs SubprocVecEnv)")
 
     args = parser.parse_args()
 
@@ -465,6 +790,11 @@ if __name__ == "__main__":
         config.load_model_path = args.load_model
     if args.load_latest:
         config.load_latest = True
+    # Hardware overrides (will be used by HardwareManager)
+    if args.n_envs is not None:
+        config.n_envs = args.n_envs
+    if args.buffer_size is not None:
+        config.buffer_size = args.buffer_size
 
     # Resolve --load-latest to actual checkpoint path
     if config.load_latest:
@@ -475,4 +805,4 @@ if __name__ == "__main__":
         else:
             print(f"[Warning] No checkpoints found in {config.checkpoint_dir}")
 
-    train(config)
+    train(config, use_batch_env=args.use_batch_env)

@@ -7,29 +7,35 @@ for TQC (Truncated Quantile Critics) agents in Stable Baselines3.
 
 The encoder weights are frozen by default to preserve the learned
 market representations during initial RL training.
+
+Architecture (updated for Dict observation space):
+- Input: Dict {"market": (B, 64, 43), "position": (B, 1)}
+- Market → Transformer Encoder → Flatten (8192)
+- Concat(market_features, position) → Linear → LayerNorm → LeakyReLU
+- Output: (B, features_dim)
 """
 
 import torch
 import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from typing import Optional
+from typing import Optional, Dict
 
 from src.models.foundation import CryptoMAE
 
 
 class FoundationFeatureExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor using a pre-trained CryptoMAE encoder.
+    Feature extractor using a pre-trained CryptoMAE encoder with position injection.
 
-    Loads a pre-trained Masked Auto-Encoder and uses its encoder
-    to transform observations into rich feature representations
-    for the RL policy network.
+    Accepts Dict observation space with:
+    - "market": (seq_len, n_features) market data
+    - "position": (1,) current position
 
     Architecture:
-    - Input: (batch, seq_len, n_features) from environment
-    - Encoder: Pre-trained CryptoMAE encoder
-    - Output: Flattened (batch, seq_len * d_model) for policy
+    - Market data → Encoder → Flatten (8192)
+    - Concat with position (8193)
+    - Linear projection with LeakyReLU (no Tanh to avoid vanishing gradients)
 
     The encoder is frozen by default to prevent "breaking" the
     pre-trained representations during early RL training.
@@ -37,7 +43,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
 
     def __init__(
         self,
-        observation_space: spaces.Box,
+        observation_space: spaces.Dict,
         encoder_path: str = "weights/pretrained_encoder.pth",
         d_model: int = 128,
         n_heads: int = 4,
@@ -45,13 +51,13 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         dim_feedforward: Optional[int] = None,
         dropout: float = 0.1,
         freeze_encoder: bool = True,
-        features_dim: int = 512  # Safety Projector: reduce from 8192 to stabilize Q-values
+        features_dim: int = 512
     ):
         """
         Initialize the Foundation Feature Extractor.
 
         Args:
-            observation_space: Gym observation space (seq_len, n_features).
+            observation_space: Dict observation space with "market" and "position".
             encoder_path: Path to pretrained encoder weights.
             d_model: Transformer model dimension (must match pretrained).
             n_heads: Number of attention heads (must match pretrained).
@@ -59,16 +65,27 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             dim_feedforward: FFN dimension (default: 4 * d_model).
             dropout: Dropout rate.
             freeze_encoder: If True, freeze encoder weights.
-            features_dim: Output dimension (default: 512 for Q-value stability).
+            features_dim: Output dimension (default: 512).
         """
-        # Extract dimensions from observation space
-        # Shape: (window_size, n_features)
-        self.window_size = observation_space.shape[0]
-        self.n_features = observation_space.shape[1]
+        # Validate observation space type
+        assert isinstance(observation_space, spaces.Dict), \
+            f"Expected spaces.Dict, got {type(observation_space)}"
+        assert "market" in observation_space.spaces, "Missing 'market' in observation space"
+        assert "position" in observation_space.spaces, "Missing 'position' in observation space"
+
+        # Extract dimensions from market observation
+        market_space = observation_space["market"]
+        self.window_size = market_space.shape[0]  # 64
+        self.n_features = market_space.shape[1]   # 43
         self.d_model = d_model
 
-        # Flatten dimension from encoder output
-        self.flatten_dim = self.window_size * d_model  # 64 * 128 = 8192
+        # Position dimension
+        position_space = observation_space["position"]
+        self.position_dim = position_space.shape[0]  # 1
+
+        # Flatten dimension from encoder output + position
+        self.market_flatten_dim = self.window_size * d_model  # 64 * 128 = 8192
+        self.total_input_dim = self.market_flatten_dim + self.position_dim  # 8193
 
         # Initialize parent class with features_dim
         super().__init__(observation_space, features_dim)
@@ -102,16 +119,18 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             self.mae.encoder = self.mae.encoder.half()
             print("[FoundationFeatureExtractor] Encoder converted to float16 for faster inference")
 
-        # Safety Projector: compress + stabilize + bound output for Q-value stability
-        # Architecture: Flatten(8192) → LayerNorm → Linear(512) → LayerNorm → Tanh
-        self.output_projection = nn.Sequential(
-            nn.Flatten(),                                    # (B, 64, 128) → (B, 8192)
-            nn.LayerNorm(self.flatten_dim),                  # Stabilize input variance
-            nn.Linear(self.flatten_dim, features_dim),       # 8192 → 512 (16x compression)
-            nn.LayerNorm(features_dim),                      # Stabilize after projection
-            nn.Tanh()                                        # Bound output to [-1, 1]
+        # Fusion Projector: market features + position → features_dim
+        # Architecture: Concat(market_flat, position) → Linear → LayerNorm → LeakyReLU
+        # NO TANH to avoid vanishing gradient with TQC's internal Tanh
+        self.market_flatten = nn.Flatten()  # (B, 64, 128) → (B, 8192)
+        self.market_layernorm = nn.LayerNorm(self.market_flatten_dim)
+
+        self.fusion_projection = nn.Sequential(
+            nn.Linear(self.total_input_dim, features_dim),  # 8193 → 512
+            nn.LayerNorm(features_dim),
+            nn.LeakyReLU(negative_slope=0.01)  # LeakyReLU instead of Tanh
         )
-        print(f"[FoundationFeatureExtractor] Safety Projector: {self.flatten_dim} → {features_dim} (Tanh bounded)")
+        print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} → {features_dim} (LeakyReLU, position-aware)")
 
     def _load_pretrained_weights(self, encoder_path: str) -> None:
         """
@@ -208,48 +227,71 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         """Return whether the encoder is frozen."""
         return self._is_frozen
 
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+    def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass through the pretrained encoder.
+        Forward pass through the pretrained encoder with position fusion.
 
         Args:
-            observations: Input tensor of shape (batch, seq_len, n_features).
+            observations: Dict with:
+                - "market": (batch, seq_len, n_features) market data
+                - "position": (batch, 1) current position
 
         Returns:
             Feature tensor of shape (batch, features_dim).
         """
-        # 1. Encode observations using pretrained MAE encoder
-        # Output: (batch, seq_len, d_model)
-        if self._use_amp:
+        # Extract market data and position from dict
+        market_obs = observations["market"]    # (B, 64, 43)
+        position = observations["position"]    # (B, 1)
+
+        # 1. Encode market data using pretrained MAE encoder
+        # Output: (batch, seq_len, d_model) = (B, 64, 128)
+        # Note: Use AMP only if enabled AND tensor is actually on CUDA
+        use_amp_now = self._use_amp and market_obs.is_cuda
+        if use_amp_now:
             # Use autocast for mixed precision inference
             with torch.amp.autocast('cuda'):
-                encoded = self.mae.encode(observations.half())
-            encoded = encoded.float()  # Convert back to float32 for output projection
+                encoded = self.mae.encode(market_obs.half())
+            encoded = encoded.float()  # Convert back to float32 for fusion
         else:
-            encoded = self.mae.encode(observations)
+            encoded = self.mae.encode(market_obs.float())
 
-        # 2. Output projection: flatten (+ optional linear)
-        # Output: (batch, features_dim)
-        features = self.output_projection(encoded)
+        # 2. Flatten and normalize market features
+        market_flat = self.market_flatten(encoded)  # (B, 8192)
+        market_flat = self.market_layernorm(market_flat)
+
+        # 3. Concatenate market features with position
+        # Position tells the agent where it currently is (critical for learning to hold!)
+        combined = torch.cat([market_flat, position], dim=1)  # (B, 8193)
+
+        # 4. Fusion projection with LeakyReLU (no Tanh!)
+        features = self.fusion_projection(combined)  # (B, 512)
 
         return features
 
 
 if __name__ == "__main__":
-    # Test the feature extractor
+    # Test the feature extractor with Dict observation space
     from gymnasium import spaces
     import numpy as np
 
-    # Simulate observation space: (64 timesteps, 35 features)
+    # Simulate Dict observation space
     seq_len = 64
     n_features = 35
 
-    obs_space = spaces.Box(
-        low=-np.inf,
-        high=np.inf,
-        shape=(seq_len, n_features),
-        dtype=np.float32
-    )
+    obs_space = spaces.Dict({
+        "market": spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(seq_len, n_features),
+            dtype=np.float32
+        ),
+        "position": spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(1,),
+            dtype=np.float32
+        )
+    })
 
     # Create feature extractor (will warn if weights not found)
     extractor = FoundationFeatureExtractor(
@@ -258,18 +300,33 @@ if __name__ == "__main__":
         freeze_encoder=True
     )
 
-    # Test forward pass
+    # Test forward pass with dict observation
     batch_size = 4
-    dummy_obs = torch.randn(batch_size, seq_len, n_features)
+    dummy_obs = {
+        "market": torch.randn(batch_size, seq_len, n_features),
+        "position": torch.randn(batch_size, 1).clamp(-1, 1)  # Position in [-1, 1]
+    }
 
     features = extractor(dummy_obs)
 
-    print(f"\nInput shape:  {dummy_obs.shape}")
+    print(f"\nMarket input shape:  {dummy_obs['market'].shape}")
+    print(f"Position input shape: {dummy_obs['position'].shape}")
     print(f"Output shape: {features.shape}")
     print(f"features_dim: {extractor.features_dim}")
     print(f"Encoder frozen: {extractor.is_frozen}")
+    print(f"Total input dim (market+position): {extractor.total_input_dim}")
 
-    # Verify output dimension (Safety Projector default: 512)
+    # Verify output dimension
     expected_dim = 512
     assert features.shape == (batch_size, expected_dim), f"Shape mismatch! Expected {(batch_size, expected_dim)}"
+
+    # Verify position is being used (sanity check)
+    dummy_obs2 = {
+        "market": dummy_obs["market"].clone(),
+        "position": torch.ones(batch_size, 1)  # Different position
+    }
+    features2 = extractor(dummy_obs2)
+    assert not torch.allclose(features, features2), "Position should affect output!"
+
     print("\n[OK] FoundationFeatureExtractor test passed!")
+    print("[OK] Position injection verified (different position = different output)")

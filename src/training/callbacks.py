@@ -10,10 +10,15 @@ Provides all training-related callbacks:
 """
 
 import os
+import time
 import numpy as np
+from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 from stable_baselines3.common.vec_env import VecEnv
+
+if TYPE_CHECKING:
+    from multiprocessing.sharedctypes import Synchronized
 
 
 # ============================================================================
@@ -44,6 +49,76 @@ def get_next_run_dir(base_dir: str, prefix: str = "run") -> str:
 
     next_num = max(existing, default=0) + 1
     return os.path.join(base_dir, f"{prefix}_{next_num}")
+
+
+def get_underlying_batch_env(env):
+    """
+    Unwrap récursif pour trouver BatchCryptoEnv sous les wrappers SB3.
+
+    SB3 peut wrapper les VecEnv dans VecMonitor, VecNormalize, etc.
+    Ces wrappers ne forwardent pas correctement set_attr pour les envs GPU.
+
+    Args:
+        env: L'environnement (potentiellement wrappé)
+
+    Returns:
+        L'instance BatchCryptoEnv sous-jacente, ou l'env original si non trouvé
+    """
+    depth = 0
+    while depth < 20:
+        # Cible atteinte (méthode spécifique BatchCryptoEnv)
+        if hasattr(env, 'set_smoothness_penalty'):
+            return env
+        # Wrapper VecEnv (ex: VecMonitor, VecNormalize)
+        elif hasattr(env, 'venv'):
+            env = env.venv
+        # Wrapper Gym standard
+        elif hasattr(env, 'env'):
+            env = env.env
+        else:
+            break
+        depth += 1
+    return env
+
+
+# ============================================================================
+# Checkpoint Callbacks
+# ============================================================================
+
+class RotatingCheckpointCallback(CheckpointCallback):
+    """
+    Checkpoint callback that keeps the last N checkpoints to prevent data loss.
+    Refactored 2026-01-16 to fix aggressive deletion bug.
+    """
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", verbose: int = 0, keep_last: int = 2):
+        super().__init__(save_freq, save_path, name_prefix, verbose)
+        self.keep_last = keep_last
+        self.saved_checkpoints = []  # List to track paths
+
+    def _on_step(self) -> bool:
+        # Call parent to save
+        result = super()._on_step()
+
+        # Logic matches CheckpointCallback naming convention
+        if self.n_calls % self.save_freq == 0:
+            step = self.num_timesteps
+            current_path = os.path.join(self.save_path, f"{self.name_prefix}_{step}_steps.zip")
+
+            # Track new file if it exists
+            if os.path.exists(current_path):
+                self.saved_checkpoints.append(current_path)
+
+                # Prune oldest if we exceed limit
+                while len(self.saved_checkpoints) > self.keep_last:
+                    to_remove = self.saved_checkpoints.pop(0)
+                    try:
+                        if os.path.exists(to_remove):
+                            os.remove(to_remove)
+                            if self.verbose > 0:
+                                print(f"  [Disk Opt] Pruned old checkpoint: {os.path.basename(to_remove)}")
+                    except OSError as e:
+                        print(f"  [Warning] Failed to prune {to_remove}: {e}")
+        return result
 
 
 # ============================================================================
@@ -116,24 +191,46 @@ class TensorBoardStepCallback(BaseCallback):
                 if rewards is not None and len(rewards) > 0:
                     self.writer.add_scalar("rollout/reward", float(rewards[0]), step)
 
-            # Log environment info
+            # Log environment metrics (OPTIMIZED: use get_global_metrics for BatchCryptoEnv)
+            env = self.training_env
+            if hasattr(env, 'get_global_metrics'):
+                # BatchCryptoEnv path - direct GPU access
+                metrics = env.get_global_metrics()
+                self.writer.add_scalar("env/portfolio_value", metrics['portfolio_value'], step)
+                self.writer.add_scalar("env/price", metrics['price'], step)
+                self.writer.add_scalar("env/max_drawdown", metrics['max_drawdown'] * 100, step)
+
+                # Reward components (for observability)
+                if 'avg_rew_pnl' in metrics:
+                    self.writer.add_scalar("rewards/pnl", metrics['avg_rew_pnl'], step)
+                    self.writer.add_scalar("rewards/churn_penalty", metrics['avg_rew_churn'], step)
+                    self.writer.add_scalar("rewards/smooth_penalty", metrics['avg_rew_smooth'], step)
+            else:
+                # Fallback for SubprocVecEnv/DummyVecEnv - read from infos
+                if 'infos' in self.locals:
+                    infos = self.locals['infos']
+                    if infos is not None and len(infos) > 0:
+                        info = infos[0]
+                        if info is not None and isinstance(info, dict):
+                            if 'portfolio_value' in info:
+                                self.writer.add_scalar("env/portfolio_value", info['portfolio_value'], step)
+                            if 'price' in info:
+                                self.writer.add_scalar("env/price", info['price'], step)
+                            if 'max_drawdown' in info:
+                                self.writer.add_scalar("env/max_drawdown", info['max_drawdown'] * 100, step)
+
+            # Log episode info (still from infos - only present on done)
             if 'infos' in self.locals:
                 infos = self.locals['infos']
-                if infos is not None and len(infos) > 0:
-                    info = infos[0]
-                    if info is not None and isinstance(info, dict):
-                        if 'portfolio_value' in info:
-                            self.writer.add_scalar("env/portfolio_value", info['portfolio_value'], step)
-                        if 'price' in info:
-                            self.writer.add_scalar("env/price", info['price'], step)
-                        if 'max_drawdown' in info:
-                            self.writer.add_scalar("env/max_drawdown", info['max_drawdown'] * 100, step)
-                        if 'episode' in info:
+                if infos is not None:
+                    for info in infos:
+                        if info and 'episode' in info:
                             ep_info = info['episode']
                             if 'r' in ep_info:
                                 self.writer.add_scalar("rollout/ep_rew_mean", ep_info['r'], step)
                             if 'l' in ep_info:
                                 self.writer.add_scalar("rollout/ep_len_mean", ep_info['l'], step)
+                            break  # Only log first episode
 
             # Log training metrics
             if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
@@ -168,59 +265,87 @@ class StepLoggingCallback(BaseCallback):
         self.episode_lengths = []
         self.episode_trades = []
         self.last_episode_info = {}
+        # FPS tracking
+        self.last_time = None
+        self.last_step = 0
+
+    def _init_callback(self) -> None:
+        """Initialize FPS tracking at callback start."""
+        self.last_time = time.time()
+        self.last_step = 0
 
     def _on_step(self) -> bool:
-        # Collect episode info if available
+        # Collect episode info if available (only on done)
         if self.locals.get("infos"):
             for info in self.locals["infos"]:
-                if "episode" in info:
+                if info and "episode" in info:
                     ep_reward = info["episode"]["r"]
                     ep_length = info["episode"]["l"]
                     self.episode_rewards.append(ep_reward)
                     self.episode_lengths.append(ep_length)
-                    if "total_trades" in info:
-                        self.episode_trades.append(info["total_trades"])
                     self.last_episode_info = {"reward": ep_reward, "length": ep_length}
-
-                if "nav" in info:
-                    self.last_episode_info["nav"] = info["nav"]
-                if "position_pct" in info:
-                    self.last_episode_info["position"] = info["position_pct"]
 
         # Log every log_freq steps
         if self.num_timesteps % self.log_freq == 0:
-            if self.episode_rewards:
-                mean_reward = np.mean(self.episode_rewards[-10:])
-                mean_length = np.mean(self.episode_lengths[-10:])
-            else:
-                mean_reward = 0
-                mean_length = 0
+            # Get metrics from env (OPTIMIZED: use get_global_metrics for BatchCryptoEnv)
+            env = self.training_env
+            if hasattr(env, 'get_global_metrics'):
+                metrics = env.get_global_metrics()
+                self.last_episode_info["nav"] = metrics["portfolio_value"]
+                self.last_episode_info["position"] = metrics["position_pct"]
+                self.last_episode_info["max_drawdown"] = metrics["max_drawdown"]
+
+                # Log reward components (for observability)
+                # Note: get_global_metrics uses keys with '/' prefix (reward/pnl_component)
+                # but DetailTensorboardCallback already logs these via internal/reward/*
+                # We skip logging here to avoid duplication
 
             # Log to TensorBoard
-            self.logger.record("custom/mean_reward_10ep", mean_reward)
-            self.logger.record("custom/mean_length_10ep", mean_length)
+            # Note: mean_reward and mean_length are already logged by SB3 as
+            # rollout/ep_rew_mean and rollout/ep_len_mean, so we skip them here
 
             if self.last_episode_info:
                 if "nav" in self.last_episode_info:
                     self.logger.record("custom/nav", self.last_episode_info["nav"])
                 if "position" in self.last_episode_info:
                     self.logger.record("custom/position", self.last_episode_info["position"])
-
-            if self.episode_trades:
-                self.logger.record("custom/trades_per_episode", self.episode_trades[-1])
+                if "max_drawdown" in self.last_episode_info:
+                    # Log max_drawdown as percentage
+                    self.logger.record("custom/max_drawdown", self.last_episode_info["max_drawdown"] * 100)
 
             self.logger.dump(self.num_timesteps)
 
+            # Calculate FPS manually (fixes FPS=0 bug with BatchCryptoEnv)
+            current_time = time.time()
+            if self.last_time is not None:
+                dt = current_time - self.last_time
+                if dt > 0:
+                    fps = (self.num_timesteps - self.last_step) / dt
+                    self.logger.record("time/fps_live", fps)
+                else:
+                    fps = 0
+            else:
+                fps = 0
+            self.last_time = current_time
+            self.last_step = self.num_timesteps
+
             # Console log
-            fps = self.model.logger.name_to_value.get("time/fps", 0)
             nav = self.last_episode_info.get("nav", 0)
             pos = self.last_episode_info.get("position", 0)
+            max_dd = self.last_episode_info.get("max_drawdown", 0) * 100  # Convert to %
+            
+            # Calculate mean reward for display (from last 10 episodes if available)
+            if self.episode_rewards:
+                mean_reward_display = np.mean(self.episode_rewards[-10:])
+            else:
+                mean_reward_display = 0
 
             print(f"Step {self.num_timesteps:>7} | "
-                  f"Reward: {mean_reward:>8.2f} | "
+                  f"Reward: {mean_reward_display:>8.2f} | "
                   f"NAV: {nav:>10.2f} | "
                   f"Pos: {pos:>+5.2f} | "
-                  f"FPS: {fps:>5.0f}")
+                  f"DD: {max_dd:>5.1f}% | "
+                  f"FPS: {fps:>7.0f}")
 
         return True
 
@@ -253,32 +378,34 @@ class DetailTensorboardCallback(BaseCallback):
         if self.locals.get("actions") is not None:
             self.all_actions.extend(np.abs(self.locals["actions"]).flatten())
 
+        # ═══════════════════════════════════════════════════════════════════
+        # DIRECT GPU METRIC POLLING (replaces info-based logging)
+        # ═══════════════════════════════════════════════════════════════════
+        # Unwrap to find BatchCryptoEnv under SB3 wrappers
+        real_env = get_underlying_batch_env(self.model.env)
+
+        if real_env is not None and hasattr(real_env, "get_global_metrics"):
+            metrics = real_env.get_global_metrics()
+            for key, value in metrics.items():
+                # Use record_mean for smoother TensorBoard curves
+                self.logger.record_mean(f"internal/{key}", value)
+
+            # Track for episode aggregation
+            if "reward/pnl_component" in metrics:
+                self.episode_log_returns.append(metrics["reward/pnl_component"])
+            if "reward/churn_cost" in metrics:
+                self.episode_churn_penalties.append(metrics["reward/churn_cost"])
+
+        # Episode end logging (from info dict - still needed for episode stats)
         if self.locals.get("infos"):
             info = self.locals["infos"][0]
-
-            # Log reward components
-            for key in ["rewards/log_return", "rewards/penalty_vol", "rewards/churn_penalty",
-                        "rewards/smoothness_penalty", "rewards/position_delta", "rewards/total_raw",
-                        "rewards/scaled"]:
-                if key in info:
-                    self.logger.record_mean(key, info[key])
-                    if key == "rewards/log_return":
-                        self.episode_log_returns.append(info[key])
-                    elif key == "rewards/churn_penalty":
-                        self.episode_churn_penalties.append(info[key])
-                    elif key == "rewards/position_delta":
-                        self.episode_position_deltas.append(info[key])
-
-            # At episode end, log aggregated stats
             if "episode" in info:
                 if self.episode_churn_penalties:
                     total_churn = sum(self.episode_churn_penalties)
                     total_log_ret = sum(self.episode_log_returns)
-                    total_delta = sum(self.episode_position_deltas)
 
                     self.logger.record("churn/episode_total_penalty", total_churn)
                     self.logger.record("churn/episode_total_log_return", total_log_ret)
-                    self.logger.record("churn/episode_total_position_delta", total_delta)
 
                     if abs(total_log_ret) > 1e-8:
                         ratio = abs(total_churn / total_log_ret)
@@ -357,10 +484,14 @@ class CurriculumFeesCallback(BaseCallback):
     This callback implements a curriculum learning strategy where transaction costs
     and smoothness penalties start at 0 and gradually increase to their target values.
 
+    Supports both DummyVecEnv (direct env access) and SubprocVecEnv (shared memory).
+
     Args:
         target_fee_rate: Target commission fee (e.g., 0.0006 = 0.06%).
         target_smooth_coef: Target smoothness penalty coefficient.
         warmup_steps: Number of steps to reach target values.
+        shared_fee: Shared memory Value for fee (SubprocVecEnv).
+        shared_smooth: Shared memory Value for smooth_coef (SubprocVecEnv).
         verbose: Verbosity level.
 
     Example:
@@ -376,12 +507,18 @@ class CurriculumFeesCallback(BaseCallback):
         target_fee_rate: float = 0.0006,
         target_smooth_coef: float = 1.0,
         warmup_steps: int = 50_000,
+        shared_fee: Optional["Synchronized"] = None,
+        shared_smooth: Optional["Synchronized"] = None,
         verbose: int = 0
     ):
         super().__init__(verbose)
         self.target_fee_rate = target_fee_rate
         self.target_smooth_coef = target_smooth_coef
         self.warmup_steps = warmup_steps
+
+        # Shared memory for SubprocVecEnv compatibility
+        self.shared_fee = shared_fee
+        self.shared_smooth = shared_smooth
 
         self.current_fee = 0.0
         self.current_smooth = 0.0
@@ -393,6 +530,13 @@ class CurriculumFeesCallback(BaseCallback):
         self.current_fee = progress * self.target_fee_rate
         self.current_smooth = progress * self.target_smooth_coef
 
+        # Update via shared memory (SubprocVecEnv)
+        if self.shared_fee is not None:
+            self.shared_fee.value = self.current_fee
+        if self.shared_smooth is not None:
+            self.shared_smooth.value = self.current_smooth
+
+        # ALWAYS update envs (for BatchCryptoEnv direct access)
         self._update_envs()
 
         self.logger.record("curriculum/fee_rate", self.current_fee)
@@ -440,3 +584,248 @@ class CurriculumFeesCallback(BaseCallback):
             print(f"  target_fee_rate: {self.target_fee_rate:.6f}")
             print(f"  target_smooth_coef: {self.target_smooth_coef:.2f}")
             print(f"  warmup_steps: {self.warmup_steps:,}")
+
+
+class ThreePhaseCurriculumCallback(BaseCallback):
+    """
+    Three-Phase Curriculum Learning with IPC Fault Tolerance.
+    Refactored 2026-01-16 to fix multiprocessing crashes.
+    """
+    # Modified by CryptoRL: reduced smooth_coef 0.02 -> 0.005 to unblock trading
+    PHASES = [
+        {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
+        {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.005)},
+        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.005, 0.005)},
+    ]
+
+    def __init__(self, total_timesteps: int, shared_smooth: Optional["Synchronized"] = None, verbose: int = 0):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.shared_smooth = shared_smooth
+        self.current_smooth = 0.0
+        self.current_churn = 0.0
+        self._phase = 1
+
+    def _on_step(self) -> bool:
+        progress = self.num_timesteps / self.total_timesteps
+
+        # Locate Phase
+        phase_cfg = self.PHASES[-1]
+        for i, p in enumerate(self.PHASES):
+            if progress <= p['end_progress']:
+                phase_cfg = p
+                self._phase = i + 1
+                break
+
+        # Interpolate
+        prev_end = 0.0 if self._phase == 1 else self.PHASES[self._phase - 2]['end_progress']
+        phase_progress = (progress - prev_end) / (phase_cfg['end_progress'] - prev_end)
+        phase_progress = max(0.0, min(1.0, phase_progress))
+
+        c_start, c_end = phase_cfg['churn']
+        s_start, s_end = phase_cfg['smooth']
+
+        self.current_churn = c_start + (c_end - c_start) * phase_progress
+        self.current_smooth = s_start + (s_end - s_start) * phase_progress
+
+        # Apply Logic with IPC Safety Net
+        if self.shared_smooth is not None:
+            try:
+                self.shared_smooth.value = self.current_smooth
+            except (ConnectionResetError, BrokenPipeError, FileNotFoundError, OSError):
+                # Fail gracefully. Do not kill the training run for a metric update.
+                pass
+
+        # ALWAYS update env (for BatchCryptoEnv penalties + curriculum_lambda)
+        self._update_envs()
+
+        self.logger.record("curriculum/smooth_coef", self.current_smooth)
+        self.logger.record("curriculum/churn_coef", self.current_churn)
+        self.logger.record("curriculum/phase", self._phase)
+        self.logger.record("curriculum/progress", progress)
+
+        # Log curriculum_lambda from env if available
+        real_env = get_underlying_batch_env(self.model.env)
+        if hasattr(real_env, 'curriculum_lambda'):
+            self.logger.record("curriculum/lambda", real_env.curriculum_lambda)
+
+        return True
+
+    def _update_envs(self):
+        """Update penalties on all environments (unwrap for BatchCryptoEnv)."""
+        # Unwrap pour atteindre BatchCryptoEnv sous les wrappers SB3
+        real_env = get_underlying_batch_env(self.model.env)
+
+        # Calculate progress for curriculum lambda
+        progress = self.num_timesteps / self.total_timesteps
+
+        # Appel direct (contourne le Wrapper Hell de SB3)
+        if hasattr(real_env, 'set_smoothness_penalty'):
+            real_env.set_smoothness_penalty(self.current_smooth)
+            real_env.set_churn_penalty(self.current_churn)
+            # Sync progress for curriculum_lambda (AAAI 2024 Curriculum Learning)
+            if hasattr(real_env, 'set_progress'):
+                real_env.set_progress(progress)
+            return
+
+        # Fallback: DummyVecEnv path (CPU envs)
+        if isinstance(self.model.env, VecEnv) and hasattr(self.model.env, 'envs'):
+            for i in range(self.model.env.num_envs):
+                base_env = self.model.env.envs[i]
+                while hasattr(base_env, 'env'):
+                    base_env = base_env.env
+                if hasattr(base_env, 'set_smooth_coef'):
+                    base_env.set_smooth_coef(self.current_smooth)
+                if hasattr(base_env, 'set_churn_coef'):
+                    base_env.set_churn_coef(self.current_churn)
+
+    def _on_training_start(self) -> None:
+        if self.verbose > 0:
+            print(f"\n[3-Phase Curriculum] Configuration (IPC-safe):")
+            for i, phase in enumerate(self.PHASES):
+                pct = int(phase['end_progress'] * 100)
+                churn_str = f"{phase['churn'][0]:.2f}→{phase['churn'][1]:.2f}"
+                smooth_str = f"{phase['smooth'][0]:.4f}→{phase['smooth'][1]:.4f}"
+                print(f"  Phase {i+1} (0-{pct}%): churn={churn_str}, smooth={smooth_str}")
+
+
+# ============================================================================
+# Overfitting Guard Callback
+# ============================================================================
+
+class OverfittingGuardCallback(BaseCallback):
+    """
+    Early stopping if training shows signs of overfitting.
+
+    Triggers abort if NAV exceeds threshold (e.g., 5x initial = +400%).
+    Such returns are unrealistic and indicate memorization of training data.
+    """
+
+    def __init__(
+        self,
+        nav_threshold: float = 5.0,  # 5x = +400%
+        initial_nav: float = 10_000.0,
+        check_freq: int = 25_600,
+        verbose: int = 1
+    ):
+        """
+        Args:
+            nav_threshold: Multiplier of initial NAV to trigger stop (5.0 = +400%).
+            initial_nav: Starting portfolio value.
+            check_freq: How often to check (in timesteps).
+            verbose: Verbosity level.
+        """
+        super().__init__(verbose)
+        self.nav_threshold = nav_threshold
+        self.initial_nav = initial_nav
+        self.check_freq = check_freq
+        self.max_nav_seen = initial_nav
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.check_freq != 0:
+            return True
+
+        # Get current NAV from env
+        env = self.training_env
+        if hasattr(env, 'get_global_metrics'):
+            metrics = env.get_global_metrics()
+            current_nav = metrics.get("portfolio_value", self.initial_nav)
+            self.max_nav_seen = max(self.max_nav_seen, current_nav)
+
+            # Check threshold
+            if self.max_nav_seen > self.initial_nav * self.nav_threshold:
+                ratio = self.max_nav_seen / self.initial_nav
+                print("\n" + "=" * 60)
+                print("  EARLY STOPPING: Potential Overfitting Detected!")
+                print("=" * 60)
+                print(f"  Max NAV seen: {self.max_nav_seen:,.0f}")
+                print(f"  Ratio vs initial: {ratio:.1f}x (+{(ratio-1)*100:.0f}%)")
+                print(f"  Threshold: {self.nav_threshold}x")
+                print("  Such returns are unrealistic - likely memorization.")
+                print("=" * 60 + "\n")
+                return False  # Stop training
+
+        return True
+
+
+# ============================================================================
+# Evaluation Callback with Observation Noise Management
+# ============================================================================
+
+class EvalCallbackWithNoiseControl(EvalCallback):
+    """
+    Wrapper around EvalCallback that automatically disables observation noise
+    in BatchCryptoEnv during evaluation and re-enables it after.
+
+    This ensures that evaluation metrics are not affected by observation noise,
+    which should only be active during training for regularization.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """
+        Initialize the callback with noise control.
+
+        All arguments are passed to EvalCallback.
+        """
+        super().__init__(*args, **kwargs)
+        self._training_env_has_noise = False
+        self._eval_env_has_noise = False
+        self._last_eval_step = -1
+
+    def _on_step(self) -> bool:
+        """
+        Override to manage observation noise before/after evaluation.
+        """
+        # Check if evaluation will occur (EvalCallback logic)
+        will_eval = (self.eval_freq > 0 and 
+                     self.n_calls % self.eval_freq == 0 and 
+                     self.n_calls != self._last_eval_step)
+        
+        if will_eval:
+            # Before evaluation: disable noise in training env if it's BatchCryptoEnv
+            train_env = self._get_batch_env(self.training_env)
+            if train_env is not None and hasattr(train_env, 'set_training_mode'):
+                self._training_env_has_noise = train_env.training
+                train_env.set_training_mode(False)
+                if self.verbose > 0:
+                    print(f"  [Noise Control] Disabled observation noise in training env for evaluation")
+
+            # Check eval environment (should already be False, but ensure it)
+            eval_env = self._get_batch_env(self.eval_env)
+            if eval_env is not None and hasattr(eval_env, 'set_training_mode'):
+                self._eval_env_has_noise = eval_env.training
+                eval_env.set_training_mode(False)
+                if self.verbose > 0:
+                    print(f"  [Noise Control] Disabled observation noise in eval env")
+
+        # Call parent evaluation (this will trigger evaluation if needed)
+        result = super()._on_step()
+
+        # After evaluation: re-enable noise in training env
+        if will_eval:
+            train_env = self._get_batch_env(self.training_env)
+            if train_env is not None and hasattr(train_env, 'set_training_mode'):
+                train_env.set_training_mode(self._training_env_has_noise)
+                if self.verbose > 0 and self._training_env_has_noise:
+                    print(f"  [Noise Control] Re-enabled observation noise in training env")
+
+            # Restore eval env state (should stay False, but restore original)
+            eval_env = self._get_batch_env(self.eval_env)
+            if eval_env is not None and hasattr(eval_env, 'set_training_mode'):
+                eval_env.set_training_mode(self._eval_env_has_noise)
+            
+            self._last_eval_step = self.n_calls
+
+        return result
+
+    def _get_batch_env(self, env):
+        """
+        Unwrap environment to find BatchCryptoEnv instance.
+
+        Args:
+            env: Environment (potentially wrapped).
+
+        Returns:
+            BatchCryptoEnv instance if found, None otherwise.
+        """
+        return get_underlying_batch_env(env)

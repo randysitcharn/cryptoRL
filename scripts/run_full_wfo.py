@@ -23,9 +23,8 @@ import gc
 import json
 import pickle
 import shutil
-import socket
-import subprocess
 import argparse
+from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Union
@@ -51,29 +50,39 @@ class WFOConfig:
     """Walk-Forward Optimization configuration."""
 
     # Data
-    raw_data_path: str = "data/raw_training_data.parquet"
+    raw_data_path: str = "data/raw_historical/multi_asset_historical.csv"
+
+    # GPU Acceleration
+    use_batch_env: bool = True  # Use BatchCryptoEnv for GPU-accelerated training (default ON)
+    resume: bool = False  # Resume TQC training from tqc_last.zip
     output_dir: str = "data/wfo"
     models_dir: str = "models/wfo"
     weights_dir: str = "weights/wfo"
     results_path: str = "results/wfo_results.csv"
 
     # WFO Parameters
-    train_months: int = 12
+    train_months: int = 18
     test_months: int = 3
     step_months: int = 3  # Rolling step
     hours_per_month: int = 720  # 30 days * 24 hours
+    window_size: int = 64  # Observation window for transformer encoder
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 150_000
+    tqc_timesteps: int = 90_000_000  # 90M steps
 
-    # TQC Hyperparameters (aggressive regularization)
-    learning_rate: float = 9e-5
-    batch_size: int = 512  # Balanced batch size
-    gamma: float = 0.95
+    # TQC Hyperparameters (Gemini collab 2026-01-13)
+    learning_rate: float = 1e-4      # Conservative for stability
+    buffer_size: int = 2_500_000  # 2.5M replay buffer
+    n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
+    batch_size: int = 2048  # Large batch for GPU efficiency
+    gamma: float = 0.95    # Shorter horizon for faster learning
     ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
-    churn_coef: float = 0.0  # Disabled: smooth_coef handles position smoothing
-    smooth_coef: float = 0.07  # Smoothness penalty
+    churn_coef: float = 0.5    # Max target après curriculum (réduit)
+    smooth_coef: float = 1e-5  # Très bas (curriculum monte à 0.00005 max)
+
+    # Regularization (anti-overfitting)
+    observation_noise: float = 0.01  # 1% Gaussian noise on market observations
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol
@@ -140,6 +149,46 @@ class WFOPipeline:
         os.makedirs(config.weights_dir, exist_ok=True)
         os.makedirs(os.path.dirname(config.results_path), exist_ok=True)
 
+    def _load_raw_data(self, path: str) -> pd.DataFrame:
+        """
+        Smart loader for raw data files (CSV or Parquet).
+
+        Handles:
+        - CSV: Auto-parses dates, sets DatetimeIndex
+        - Parquet: Direct load
+
+        Args:
+            path: Path to data file (.csv or .parquet)
+
+        Returns:
+            DataFrame with sorted DatetimeIndex
+        """
+        if path.endswith('.csv'):
+            print(f"  [INFO] Detected CSV input. Auto-parsing dates...")
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+
+            # Safety check: ensure DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                # Try to find a date/timestamp column
+                date_cols = [c for c in df.columns if c.lower() in ('date', 'timestamp', 'datetime', 'time')]
+                if date_cols:
+                    df[date_cols[0]] = pd.to_datetime(df[date_cols[0]])
+                    df.set_index(date_cols[0], inplace=True)
+                    print(f"  [INFO] Set '{date_cols[0]}' as DatetimeIndex")
+                else:
+                    raise ValueError(f"Could not find DatetimeIndex. Index type: {type(df.index)}")
+        else:
+            df = pd.read_parquet(path)
+
+        # Ensure sorted index (required for WFO slicing)
+        df.sort_index(inplace=True)
+
+        # Final validation
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError(f"Data must have DatetimeIndex, got {type(df.index)}")
+
+        return df
+
     def calculate_segments(self, total_rows: int) -> List[Dict[str, int]]:
         """
         Calculate segment boundaries for rolling WFO.
@@ -191,40 +240,32 @@ class WFOPipeline:
         segment_id = segment['id']
         print(f"\n[Segment {segment_id}] Preprocessing...")
 
-        # 1. Extract full segment (train + test) from raw data
+        # 1. Extract full segment from pre-computed features (P1 optimization)
         full_start = segment['train_start']
         full_end = segment['test_end']
 
-        # Add buffer for rolling calculations (720h = 30 days max window)
-        buffer = 720
-        safe_start = max(0, full_start - buffer)
+        # Use global pre-computed features (always available - computed in run() or run_eval_only() methods)
+        assert hasattr(self, '_df_features_global') and self._df_features_global is not None, \
+            "Global features must be pre-computed. Features are computed in run() or run_eval_only() methods before processing segments."
+        
+        # Convert integer positions to datetime using raw data's index
+        # This preserves alignment because features keep the original DatetimeIndex
+        start_time = df_raw.index[full_start]
+        end_time = df_raw.index[full_end - 1]  # -1 because .loc[] is inclusive
+        df_features = self._df_features_global.loc[start_time:end_time].copy()
+        print(f"  Using pre-computed features: {start_time} to {end_time} ({len(df_features)} rows)")
 
-        df_segment = df_raw.iloc[safe_start:full_end].copy()
-        print(f"  Raw segment: rows {safe_start} to {full_end} ({len(df_segment)} rows)")
-
-        # 2. Feature Engineering on full segment
-        print("  Applying feature engineering...")
-        df_features = self.feature_engineer.engineer_features(df_segment)
-
-        # 3. Adjust indices after feature engineering (NaN dropped)
-        # Find the offset caused by dropna
-        offset = full_start - safe_start
-        actual_train_start = max(0, offset - (len(df_segment) - len(df_features)))
-
-        # Calculate relative indices
+        # 2. Split train/test (take from END to get most recent valid data)
         train_len = segment['train_end'] - segment['train_start']
         test_len = segment['test_end'] - segment['test_start']
-
-        # Split into train and test
-        # After feature engineering, we need to find where train/test boundaries are
         total_needed = train_len + test_len
+
         if len(df_features) < total_needed:
-            print(f"  [WARNING] Not enough data after feature engineering: {len(df_features)} < {total_needed}")
-            # Use what we have
+            print(f"  [WARNING] Not enough data: {len(df_features)} < {total_needed}")
             train_df = df_features.iloc[:train_len].copy()
             test_df = df_features.iloc[train_len:].copy()
         else:
-            # Take from the end to ensure we have the most recent data
+            # CRITICAL: Take from the END to match fallback behavior
             train_df = df_features.iloc[-total_needed:-test_len].copy()
             test_df = df_features.iloc[-test_len:].copy()
 
@@ -397,6 +438,9 @@ class WFOPipeline:
         config.tensorboard_log = "logs/wfo/mae/"
         config.run_name = f"segment_{segment_id}"
 
+        # DEBUG: Verify d_model alignment
+        print(f"  DEBUG: Starting MAE Training with d_model={config.d_model}")
+
         # Train
         model, best_loss = train(config, from_scratch=True)
 
@@ -413,15 +457,25 @@ class WFOPipeline:
         self,
         train_path: str,
         encoder_path: str,
-        segment_id: int
+        segment_id: int,
+        use_batch_env: bool = False,
+        resume: bool = False
     ) -> tuple[str, Dict[str, Any]]:
         """
         Train TQC agent on segment train data.
 
+        Args:
+            train_path: Path to train data parquet.
+            encoder_path: Path to encoder weights.
+            segment_id: Segment identifier.
+            use_batch_env: If True, use GPU-accelerated BatchCryptoEnv.
+            resume: If True, resume from tqc_last.zip (continues TensorBoard steps).
+
         Returns:
             Tuple of (path to saved agent, training metrics dict).
         """
-        print(f"\n[Segment {segment_id}] Training TQC...")
+        env_type = "BatchCryptoEnv (GPU)" if use_batch_env else "SubprocVecEnv (CPU)"
+        print(f"\n[Segment {segment_id}] Training TQC with {env_type}...")
 
         # Import here to avoid circular imports
         import torch
@@ -433,14 +487,19 @@ class WFOPipeline:
         config.encoder_path = encoder_path
         config.total_timesteps = self.config.tqc_timesteps
         config.learning_rate = self.config.learning_rate
-        config.batch_size = self.config.batch_size
+        config.buffer_size = self.config.buffer_size  # 2.5M replay buffer
+        # batch_size, n_envs: Auto-detected by HardwareManager
         config.gamma = self.config.gamma
         config.ent_coef = self.config.ent_coef
         config.churn_coef = self.config.churn_coef
         config.smooth_coef = self.config.smooth_coef
+        config.observation_noise = self.config.observation_noise  # Anti-overfitting
         config.target_volatility = self.config.target_volatility
         config.vol_window = self.config.vol_window
         config.max_leverage = self.config.max_leverage
+
+        # 3-Phase Curriculum: Discovery → Discipline → Refinement (Gemini 2026-01-13)
+        config.use_curriculum = True
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
@@ -449,22 +508,58 @@ class WFOPipeline:
         config.tensorboard_log = f"logs/wfo/segment_{segment_id}/"
         config.name = f"WFO_seg{segment_id}"
 
-        # We don't have separate eval data in WFO mode
-        # Use train data for eval (not ideal but necessary)
-        config.eval_data_path = train_path
+        # NOTE: eval_data_path set to None to disable EvalCallback (WFO mode).
+        # This prevents data leakage and crashes from mismatched eval environments.
+        # Safety CheckpointCallback saves every 100k steps instead.
+        config.eval_data_path = None  # WFO mode: disable EvalCallback
 
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.tensorboard_log, exist_ok=True)
 
         # Train - now returns (model, train_metrics)
-        model, train_metrics = train(config)
+        # Pass n_envs and batch_size overrides for GPU-optimized parallelism
+        hw_overrides = {
+            'n_envs': self.config.n_envs,
+            'batch_size': self.config.batch_size
+        } if use_batch_env else None
 
-        print(f"  TQC trained. Saved: {config.save_path}")
+        # Resume logic: use tqc_last.zip if --resume flag is set
+        resume_path = None
+        if resume:
+            tqc_last_path = os.path.join(weights_dir, "tqc_last.zip")
+            if os.path.exists(tqc_last_path):
+                resume_path = tqc_last_path
+                print(f"  🔄 RESUME MODE: Loading from {tqc_last_path}")
+            else:
+                print(f"  ⚠️ Resume requested but {tqc_last_path} not found. Starting fresh.")
 
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
+        model = None
+        try:
+            model, train_metrics = train(
+                config,
+                hw_overrides=hw_overrides,
+                use_batch_env=use_batch_env,
+                resume_path=resume_path
+            )
+            print(f"  TQC trained. Saved: {config.save_path}")
+
+        except KeyboardInterrupt:
+            print("\n[WFO] User interrupted training.")
+            sys.exit(0)
+
+        except Exception as e:
+            print(f"\n[CRITICAL WFO FAILURE] Segment training crashed: {e}")
+            print(f"[INFO] Check 'emergency_save_internal.zip' in {weights_dir} (saved by train_agent.py).")
+            # Do NOT attempt to save model here (it is likely None).
+            # We re-raise to stop the WFO pipeline immediately.
+            raise e
+
+        finally:
+            # Cleanup regardless of success/failure
+            if 'model' in locals() and model is not None:
+                del model
+            torch.cuda.empty_cache()
+            gc.collect()
 
         return config.save_path, train_metrics
 
@@ -496,9 +591,9 @@ class WFOPipeline:
         print(f"\n[Segment {segment_id}] Evaluating (skipping {context_rows} warmup rows)...")
 
         import torch
+        from collections import deque
         from sb3_contrib import TQC
-        from src.training.env import CryptoTradingEnv
-        from src.training.wrappers import RiskManagementWrapper
+        from src.training.batch_env import BatchCryptoEnv
 
         # Calculate baseline_vol from TRAIN data (avoids data leakage)
         if train_path and os.path.exists(train_path):
@@ -509,60 +604,96 @@ class WFOPipeline:
             baseline_vol = 0.01  # Conservative fallback
             print(f"  [WARNING] train_path not provided. Using default baseline_vol: {baseline_vol:.5f}")
 
-        # Create test environment
-        env = CryptoTradingEnv(
+        # Calculate episode length from test data (full episode)
+        test_df = pd.read_parquet(test_path)
+        test_episode_length = len(test_df) - self.config.window_size - 1
+
+        # Create test environment using BatchCryptoEnv with n_envs=1
+        # NOTE: max_leverage=1.0 disables volatility scaling for evaluation
+        # This prevents the "stuck in cash" bug where portfolio returns collapse to 0
+        env = BatchCryptoEnv(
             parquet_path=test_path,
-            window_size=64,
+            n_envs=1,  # Single env for Gymnasium-compatible evaluation
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            window_size=self.config.window_size,
+            episode_length=test_episode_length,  # Full episode
             commission=0.0004,  # churn_analysis.yaml
-            episode_length=None,  # Full episode
-            random_start=False,
+            slippage=0.0001,
             target_volatility=self.config.target_volatility,
             vol_window=self.config.vol_window,
-            max_leverage=self.config.max_leverage,
+            max_leverage=1.0,  # Disable vol scaling (was: self.config.max_leverage)
+            price_column='BTC_Close',
+            random_start=False,  # Sequential start for evaluation
         )
 
-        # Wrap with Risk Management (Circuit Breaker)
-        # baseline_vol computed from TRAIN data to avoid data leakage
-        env = RiskManagementWrapper(
-            env,
-            vol_window=24,
-            vol_threshold=3.0,
-            max_drawdown=0.10,  # 10% drawdown trigger
-            cooldown_steps=12,
-            augment_obs=False,
-            baseline_vol=baseline_vol,
-        )
+        # Circuit Breaker state (inline implementation)
+        cb_vol_window = 24
+        cb_vol_threshold = 3.0
+        cb_max_drawdown = 0.10
+        cb_cooldown_steps = 12
+        cb_nav_history = deque(maxlen=cb_vol_window + 1)
+        cb_peak_nav = 10000.0
+        cb_cooldown_remaining = 0
+        circuit_breaker_count = 0
 
-        # Load agent
-        model = TQC.load(tqc_path)
+        # Load agent (must use CUDA - encoder uses float16 which fails on CPU)
+        model = TQC.load(tqc_path, device='cuda')
 
-        # Run evaluation
-        obs, _ = env.reset()
+        # Run evaluation using Gymnasium-compatible interface
+        obs, info = env.gym_reset()
         done = False
         total_reward = 0
         rewards = []
         navs = []
-        circuit_breaker_count = 0
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
+            # Circuit Breaker: force HOLD if in cooldown
+            if cb_cooldown_remaining > 0:
+                action = np.array([0.0])
+                cb_cooldown_remaining -= 1
+            else:
+                action, _ = model.predict(obs, deterministic=True)
+
+            obs, reward, terminated, truncated, info = env.gym_step(action)
             done = terminated or truncated
+
+            # Track NAV for circuit breaker
+            nav = info.get('nav', 10000.0)
+            cb_nav_history.append(nav)
+            cb_peak_nav = max(cb_peak_nav, nav)
+            current_drawdown = (cb_peak_nav - nav) / cb_peak_nav
+
+            # Calculate rolling volatility
+            rolling_vol = 0.0
+            if len(cb_nav_history) > 1:
+                nav_array = np.array(cb_nav_history)
+                returns = np.diff(np.log(nav_array))
+                rolling_vol = np.std(returns) if len(returns) > 1 else 0.0
+
+            # Check circuit breaker triggers
+            if cb_cooldown_remaining == 0:
+                vol_trigger = rolling_vol > (baseline_vol * cb_vol_threshold)
+                dd_trigger = current_drawdown > cb_max_drawdown
+                if vol_trigger or dd_trigger:
+                    cb_cooldown_remaining = cb_cooldown_steps
+                    circuit_breaker_count += 1
 
             total_reward += reward
             rewards.append(reward)
-            if 'nav' in info:
-                navs.append(info['nav'])
-            if info.get('circuit_breaker'):
-                circuit_breaker_count += 1
+            navs.append(nav)
 
         # Calculate metrics - SKIP context_rows (warmup period)
         all_rewards = np.array(rewards)
         all_navs = np.array(navs) if navs else np.array([10000])
 
-        # Skip warmup rows for metrics calculation
-        rewards = all_rewards[context_rows:] if len(all_rewards) > context_rows else all_rewards
-        navs = all_navs[context_rows:] if len(all_navs) > context_rows else all_navs
+        # Skip warmup rows for metrics calculation (with safety check)
+        if len(all_rewards) <= context_rows:
+            print(f"  [WARNING] Test data ({len(all_rewards)}) shorter than warmup ({context_rows}). Using full data.")
+            rewards = all_rewards
+            navs = all_navs
+        else:
+            rewards = all_rewards[context_rows:]
+            navs = all_navs[context_rows:]
 
         print(f"  Total steps: {len(all_rewards)}, Metrics computed on: {len(rewards)} steps")
 
@@ -587,6 +718,61 @@ class WFOPipeline:
         # Number of trades (total from env, not split by warmup)
         total_trades = info.get('total_trades', 0)
 
+        # ==================== BENCHMARK: Buy & Hold ====================
+        # Load price series for same period
+        test_df = pd.read_parquet(test_path)
+        prices = test_df['BTC_Close'].values
+
+        # Align with agent evaluation period (skip warmup, match length)
+        # Agent starts at window_size, then we skip context_rows
+        price_start_idx = self.config.window_size + context_rows
+        price_end_idx = price_start_idx + len(navs)
+        if price_end_idx > len(prices):
+            price_end_idx = len(prices)
+
+        bnh_prices = prices[price_start_idx:price_end_idx]
+
+        if len(bnh_prices) > 1:
+            # B&H Return
+            bnh_return = (bnh_prices[-1] - bnh_prices[0]) / bnh_prices[0]
+            bnh_pct = bnh_return * 100
+
+            # B&H NAV (normalized to 10,000 like agent)
+            bnh_navs = (bnh_prices / bnh_prices[0]) * 10000
+
+            # Alpha = Agent PnL - B&H PnL
+            alpha = pnl_pct - bnh_pct
+
+            # Market Regime
+            if bnh_return > 0.15:
+                market_regime = "BULLISH 🟢"
+            elif bnh_return < -0.15:
+                market_regime = "BEARISH 🔴"
+            else:
+                market_regime = "RANGING ⚪"
+
+            # Correlation (agent returns vs market returns)
+            if len(navs) > 10:
+                agent_returns = np.diff(navs) / navs[:-1]
+                market_returns = np.diff(bnh_prices) / bnh_prices[:-1]
+                min_len = min(len(agent_returns), len(market_returns))
+                if min_len > 10:
+                    correlation = np.corrcoef(agent_returns[:min_len], market_returns[:min_len])[0, 1]
+                else:
+                    correlation = 0.0
+            else:
+                correlation = 0.0
+        else:
+            bnh_pct = 0.0
+            bnh_navs = np.array([10000])
+            alpha = pnl_pct
+            market_regime = "UNKNOWN"
+            correlation = 0.0
+
+        print(f"    B&H Return: {bnh_pct:+.2f}%")
+        print(f"    Alpha: {alpha:+.2f}%")
+        print(f"    Market: {market_regime}")
+
         metrics = {
             'segment_id': segment_id,
             'total_reward': float(rewards.sum()),  # Sum of actual test period
@@ -599,6 +785,12 @@ class WFOPipeline:
             'final_nav': navs[-1] if len(navs) > 0 else 10000,
             'test_rows': len(rewards),
             'context_rows': context_rows,
+            # Benchmark metrics
+            'bnh_pct': bnh_pct,
+            'bnh_navs': bnh_navs,  # For plotting overlay
+            'alpha': alpha,
+            'market_regime': market_regime,
+            'correlation': correlation,
         }
 
         # Merge training diagnostics if provided
@@ -656,10 +848,18 @@ class WFOPipeline:
     def run_segment(
         self,
         df_raw: pd.DataFrame,
-        segment: Dict[str, int]
+        segment: Dict[str, int],
+        use_batch_env: bool = False,
+        resume: bool = False
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Run full WFO pipeline for a single segment.
+
+        Args:
+            df_raw: Raw DataFrame with OHLCV data.
+            segment: Segment boundaries dict.
+            use_batch_env: If True, use GPU-accelerated BatchCryptoEnv for TQC.
+            resume: If True, resume TQC training from tqc_last.zip.
 
         Returns:
             Tuple of (metrics dict, train_metrics dict) for this segment.
@@ -671,63 +871,157 @@ class WFOPipeline:
         print(f"Test:  rows {segment['test_start']} - {segment['test_end']}")
         print("=" * 70)
 
-        # 1. Preprocessing (Feature Engineering + Leak-Free Scaling)
-        train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+        # --- Define Paths ---
+        models_dir = os.path.join(self.config.models_dir, f"segment_{segment_id}")
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        data_dir = os.path.join(self.config.output_dir, f"segment_{segment_id}")
 
-        # 2. HMM Training (returns context_rows for env warmup)
-        train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, segment_id)
+        os.makedirs(models_dir, exist_ok=True)
+        os.makedirs(weights_dir, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
 
-        # 3. Save preprocessed data (with context buffer metadata)
-        train_path, test_path = self.save_segment_data(
-            train_df, test_df, scaler, segment_id, context_rows
-        )
+        hmm_path = os.path.join(models_dir, "hmm.pkl")
+        scaler_path = os.path.join(models_dir, "scaler.pkl")
+        train_path = os.path.join(data_dir, "train.parquet")
+        test_path = os.path.join(data_dir, "test.parquet")
+        metadata_path = os.path.join(data_dir, "metadata.json")
+        encoder_path = os.path.join(weights_dir, "encoder.pth")
 
-        # Cleanup dataframes
-        del train_df, test_df, hmm
-        gc.collect()
+        # --- 1. Preprocessing & HMM Logic (Smart Skip) ---
+        if os.path.exists(hmm_path) and os.path.exists(train_path) and os.path.exists(test_path) and os.path.exists(metadata_path):
+            print(f"[SKIP] Found existing HMM and processed data for Segment {segment_id}. Loading from disk...")
 
-        # 4. MAE Training
-        encoder_path = self.train_mae(train_path, segment_id)
+            # Load Metadata (context_rows)
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            context_rows = metadata.get('context_rows', 0)
+            print(f"   -> Loaded context_rows: {context_rows}")
+
+        else:
+            print(f"[EXEC] Processing data and training HMM for Segment {segment_id}...")
+            # Normal flow: Preprocess -> Train HMM -> Save
+            train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+            train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, segment_id)
+
+            # Save artifacts for future skips
+            self.save_segment_data(train_df, test_df, scaler, segment_id, context_rows)
+
+            # Cleanup dataframes
+            del train_df, test_df, hmm
+            gc.collect()
+
+        # --- 2. MAE Logic (Smart Skip) ---
+        if os.path.exists(encoder_path):
+            print(f"[SKIP] Found existing MAE encoder at {encoder_path}. Skipping MAE training.")
+        else:
+            print(f"[EXEC] Training MAE Foundation Model for Segment {segment_id}...")
+            encoder_path = self.train_mae(train_path, segment_id)
 
         # 5. TQC Training
-        tqc_path, train_metrics = self.train_tqc(train_path, encoder_path, segment_id)
-
-        # 6. Evaluation (skip context_rows in metrics)
-        metrics, navs = self.evaluate_segment(
-            test_path, encoder_path, tqc_path, segment_id,
-            context_rows=context_rows,
-            train_metrics=train_metrics,
-            train_path=train_path
+        tqc_path, train_metrics = self.train_tqc(
+            train_path, encoder_path, segment_id,
+            use_batch_env=use_batch_env,
+            resume=resume
         )
 
-        # 7. Teacher Report - Hyperparameter Hints
-        self._print_teacher_report(train_metrics, segment_id)
+        # 6. Organize Artifacts (Swap & Archive) - BEFORE evaluation
+        # This ensures tqc.zip=Best and tqc_last.zip=Last exist on disk
+        self._organize_artifacts(segment_id)
 
-        # 8. Generate diagnostic plots (PNG for visual analysis)
-        plot_path = self.generate_segment_plots(segment_id, navs, metrics, train_metrics)
-        metrics['plot_path'] = plot_path
+        # 7. Double Evaluation: Best Model + Last Model
+        # INTENTIONAL: Evaluate both models to compare performance:
+        # - 'best': Highest eval reward during training (may overfit to train data)
+        # - 'last': Final model state (may be more robust, less overfitted)
+        # This comparison helps identify overfitting and guides hyperparameter tuning.
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        models_to_eval = [
+            ('best', os.path.join(weights_dir, "tqc.zip")),
+            ('last', os.path.join(weights_dir, "tqc_last.zip"))
+        ]
 
-        return metrics, train_metrics
+        best_metrics = None
+        for model_type, model_path in models_to_eval:
+            if not os.path.exists(model_path):
+                print(f"  [SKIP] {model_type} model not found: {model_path}")
+                continue
 
-    def _cleanup_segment(self, segment_id: int) -> int:
+            print(f"\n  [EVAL] Evaluating {model_type.upper()} model: {model_path}")
+
+            # Evaluate
+            metrics, navs = self.evaluate_segment(
+                test_path, encoder_path, model_path, segment_id,
+                context_rows=context_rows,
+                train_metrics=train_metrics,
+                train_path=train_path
+            )
+
+            # Tag results
+            metrics['model_type'] = model_type
+
+            # Generate diagnostic plots with prefix
+            plot_path = self.generate_segment_plots(
+                segment_id, navs, metrics, train_metrics, prefix=f"{model_type}_"
+            )
+            metrics['plot_path'] = plot_path
+
+            # Save results
+            self.save_results(metrics)
+
+            # Keep best_metrics for return value and teacher report
+            if model_type == 'best':
+                best_metrics = metrics
+
+        # 8. Teacher Report - Hyperparameter Hints (based on best model)
+        if best_metrics:
+            self._print_teacher_report(train_metrics, segment_id)
+
+        return best_metrics if best_metrics else metrics, train_metrics
+
+    def _organize_artifacts(self, segment_id: int) -> int:
         """
-        Clean up intermediate files after segment results are saved.
+        Organize model artifacts with Swap & Archive logic.
 
-        Removes redundant checkpoints while keeping essential files
-        (tqc.zip, encoder.pth, train.parquet) for evaluation.
+        Called AFTER training, BEFORE evaluation to ensure both models exist.
+
+        Artifact Strategy:
+        - tqc.zip: BEST model (highest eval reward) - used for evaluation
+        - tqc_last.zip: LAST model (end of training) - used for resume/extend
 
         Args:
-            segment_id: ID of the segment to clean up
+            segment_id: ID of the segment to organize
 
         Returns:
-            Total bytes freed
+            Total bytes freed from cleanup
         """
         import shutil
 
         freed_bytes = 0
-        segment_weights_dir = self.config.model_dir / f"segment_{segment_id}"
+        segment_weights_dir = Path(self.config.models_dir) / f"segment_{segment_id}"
 
-        # 1. Remove checkpoints/ directory (largest, redundant with tqc.zip)
+        # === SWAP & ARCHIVE LOGIC ===
+        tqc_path = segment_weights_dir / "tqc.zip"
+        tqc_last_path = segment_weights_dir / "tqc_last.zip"
+        best_model_path = segment_weights_dir / "best_model.zip"
+
+        # Step A: Archive Last (tqc.zip -> tqc_last.zip)
+        if tqc_path.exists():
+            tqc_path.rename(tqc_last_path)
+            print(f"  [ARCHIVE] tqc.zip -> tqc_last.zip (Resume point)")
+
+        # Step B: Promote Best or Fallback
+        if best_model_path.exists():
+            # Promote best_model.zip to tqc.zip
+            best_model_path.rename(tqc_path)
+            print(f"  🏆 Optimization: 'tqc.zip' is now the BEST model (Eval). "
+                  f"Last state archived as 'tqc_last.zip' (Resume).")
+        elif tqc_last_path.exists():
+            # Fallback: copy tqc_last.zip back to tqc.zip
+            shutil.copy2(tqc_last_path, tqc_path)
+            print(f"  ⚠️ No best_model found. 'tqc.zip' remains the LAST model.")
+
+        # === CLEANUP INTERMEDIATE FILES ===
+
+        # 1. Remove checkpoints/ directory (intermediate periodic saves)
         checkpoints_dir = segment_weights_dir / "checkpoints"
         if checkpoints_dir.exists():
             size = sum(f.stat().st_size for f in checkpoints_dir.rglob('*') if f.is_file())
@@ -735,15 +1029,7 @@ class WFOPipeline:
             freed_bytes += size
             print(f"  [CLEANUP] Removed checkpoints/: {size / 1024 / 1024:.1f} MB")
 
-        # 2. Remove best_model.zip (redundant with tqc.zip)
-        best_model = segment_weights_dir / "best_model.zip"
-        if best_model.exists():
-            size = best_model.stat().st_size
-            best_model.unlink()
-            freed_bytes += size
-            print(f"  [CLEANUP] Removed best_model.zip: {size / 1024 / 1024:.1f} MB")
-
-        # 3. Remove mae_full.pth (encoder.pth is sufficient for inference)
+        # 2. Remove mae_full.pth (encoder.pth is sufficient for inference)
         mae_full = segment_weights_dir / "mae_full.pth"
         if mae_full.exists():
             size = mae_full.stat().st_size
@@ -802,10 +1088,18 @@ class WFOPipeline:
         segment_id: int,
         navs: np.ndarray,
         metrics: Dict[str, Any],
-        train_metrics: Dict[str, Any]
+        train_metrics: Dict[str, Any],
+        prefix: str = ""
     ) -> str:
         """
         Generate diagnostic plots for a segment and save as PNG.
+
+        Args:
+            segment_id: Segment identifier.
+            navs: NAV history array.
+            metrics: Evaluation metrics dict.
+            train_metrics: Training metrics dict.
+            prefix: Filename prefix (e.g., "best_" or "last_").
 
         Returns:
             Path to the generated PNG file.
@@ -817,11 +1111,24 @@ class WFOPipeline:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         fig.suptitle(f"Segment {segment_id} - Diagnostic Report", fontsize=14)
 
-        # 1. NAV Curve
+        # 1. NAV Curve with B&H Benchmark Overlay
         ax1 = axes[0, 0]
-        ax1.plot(navs, color='blue', linewidth=1)
-        ax1.axhline(y=10000, color='gray', linestyle='--', alpha=0.5)
-        ax1.set_title(f"NAV Curve (Final: {navs[-1]:.0f}, PnL: {metrics['pnl_pct']:+.2f}%)")
+        ax1.plot(navs, color='blue', linewidth=1.5, label='Agent')
+
+        # Overlay B&H benchmark if available
+        bnh_navs = metrics.get('bnh_navs')
+        if bnh_navs is not None and len(bnh_navs) > 1:
+            # Align lengths (in case of mismatch)
+            plot_len = min(len(navs), len(bnh_navs))
+            ax1.plot(bnh_navs[:plot_len], color='gray', linestyle='--', linewidth=1, label='B&H', alpha=0.7)
+            ax1.legend(loc='upper left')
+
+        ax1.axhline(y=10000, color='black', linestyle=':', alpha=0.3)
+
+        # Title with Alpha
+        alpha = metrics.get('alpha', 0)
+        alpha_color = 'green' if alpha > 0 else 'red'
+        ax1.set_title(f"NAV vs B&H (Alpha: {alpha:+.2f}%)", color=alpha_color)
         ax1.set_xlabel("Step")
         ax1.set_ylabel("NAV")
         ax1.grid(True, alpha=0.3)
@@ -846,51 +1153,90 @@ class WFOPipeline:
         # 3. Key Metrics Text
         ax3 = axes[1, 0]
         ax3.axis('off')
+
+        # Extract benchmark metrics
+        bnh_pct = metrics.get('bnh_pct', 0)
+        alpha = metrics.get('alpha', 0)
+        market_regime = metrics.get('market_regime', 'UNKNOWN')
+        correlation = metrics.get('correlation', 0)
+
         text = f"""
-    EVALUATION METRICS
-    ==================
-    Sharpe Ratio: {metrics['sharpe']:.2f}
+    MARKET CONTEXT
+    ==============
+    Market: {market_regime}
+    B&H Return: {bnh_pct:+.2f}%
+    Correlation: {correlation:.2f}
+
+    AGENT PERFORMANCE
+    =================
     PnL: {metrics['pnl_pct']:+.2f}%
-    Max Drawdown: {metrics['max_drawdown']:.2f}%
-    Total Trades: {metrics['total_trades']}
+    Alpha: {alpha:+.2f}%
+    Sharpe: {metrics['sharpe']:.2f}
+    Max DD: {metrics['max_drawdown']:.2f}%
+    Trades: {metrics['total_trades']}
 
-    TRAINING DIAGNOSTICS
-    ====================
-    Action Saturation: {train_metrics.get('action_saturation', 0):.3f}
-    Avg Entropy: {train_metrics.get('avg_entropy', 0):.4f}
-    Avg Critic Loss: {train_metrics.get('avg_critic_loss', 0):.4f}
-    Churn Ratio: {train_metrics.get('avg_churn_ratio', 0):.3f}
+    TRAINING HEALTH
+    ===============
+    Entropy: {train_metrics.get('avg_entropy', 0):.2f}
+    Churn: {train_metrics.get('avg_churn_ratio', 0):.3f}
         """
-        ax3.text(0.1, 0.5, text, fontsize=10, family='monospace', va='center')
+        ax3.text(0.05, 0.5, text, fontsize=9, family='monospace', va='center')
 
-        # 4. Pass/Fail Summary
+        # 4. Pass/Fail Summary with Alpha Context
         ax4 = axes[1, 1]
         ax4.axis('off')
 
         issues = []
+        positives = []
+
+        # Training health checks
         if train_metrics.get('avg_entropy', 0) < -20:
             issues.append("OVERFITTING (entropy < -20)")
         if train_metrics.get('action_saturation', 0) > 0.98:
             issues.append("SATURATION (action_sat > 0.98)")
         if train_metrics.get('avg_churn_ratio', 0) > 0.3:
             issues.append("HIGH CHURN (ratio > 0.3)")
-        if metrics['sharpe'] < 0:
-            issues.append("NEGATIVE SHARPE")
+
+        # Performance checks (relative to benchmark)
+        if alpha > 5:
+            positives.append(f"STRONG ALPHA (+{alpha:.1f}%)")
+        elif alpha > 0:
+            positives.append(f"POSITIVE ALPHA (+{alpha:.1f}%)")
+        elif alpha < -10:
+            issues.append(f"UNDERPERFORM B&H ({alpha:.1f}%)")
+
+        if metrics['sharpe'] > 1:
+            positives.append(f"GOOD SHARPE ({metrics['sharpe']:.2f})")
+        elif metrics['sharpe'] < -1:
+            issues.append(f"BAD SHARPE ({metrics['sharpe']:.2f})")
+
         if metrics['pnl_pct'] < -20:
             issues.append("SEVERE LOSS (> 20%)")
 
-        if issues:
+        # Determine overall status
+        if len(issues) >= 2 or (len(issues) == 1 and alpha < -5):
             status = "FAIL"
             color = 'red'
-            detail = "\n".join(f"  - {issue}" for issue in issues)
-        else:
+        elif len(positives) >= 2 or alpha > 5:
             status = "PASS"
             color = 'green'
-            detail = "  All metrics within acceptable range"
+        else:
+            status = "MIXED"
+            color = 'orange'
 
-        ax4.text(0.5, 0.6, status, fontsize=40, ha='center', va='center',
+        # Build detail text
+        detail_lines = []
+        if positives:
+            detail_lines.extend([f"  ✓ {p}" for p in positives[:2]])
+        if issues:
+            detail_lines.extend([f"  ✗ {i}" for i in issues[:2]])
+        if not detail_lines:
+            detail_lines.append("  Neutral performance")
+        detail = "\n".join(detail_lines)
+
+        ax4.text(0.5, 0.65, status, fontsize=36, ha='center', va='center',
                  color=color, fontweight='bold')
-        ax4.text(0.5, 0.3, detail, fontsize=10, ha='center', va='center',
+        ax4.text(0.5, 0.3, detail, fontsize=9, ha='center', va='center',
                  family='monospace')
 
         plt.tight_layout()
@@ -898,53 +1244,12 @@ class WFOPipeline:
         # Save
         plot_dir = "results/plots"
         os.makedirs(plot_dir, exist_ok=True)
-        plot_path = os.path.join(plot_dir, f"segment_{segment_id}_report.png")
+        plot_path = os.path.join(plot_dir, f"segment_{segment_id}_{prefix}report.png")
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
         print(f"  [Plot] Saved: {plot_path}")
         return plot_path
-
-    def _check_segment0_gate(self, metrics: Dict[str, Any], train_metrics: Dict[str, Any]) -> bool:
-        """
-        Check if segment 0 results are satisfactory to continue WFO.
-
-        Returns:
-            True if we should continue, False to stop.
-        """
-        print("\n" + "=" * 50)
-        print("SEGMENT 0 GATE - Quality Check")
-        print("=" * 50)
-
-        issues = []
-
-        # Training health checks
-        if train_metrics.get('avg_entropy', 0) < -20:
-            issues.append(f"Entropy too low: {train_metrics['avg_entropy']:.2f}")
-        if train_metrics.get('action_saturation', 0) > 0.98:
-            issues.append(f"Action saturation: {train_metrics['action_saturation']:.3f}")
-        if train_metrics.get('avg_churn_ratio', 0) > 0.3:
-            issues.append(f"Churn ratio: {train_metrics['avg_churn_ratio']:.3f}")
-
-        # Performance checks
-        if metrics['sharpe'] < -1:
-            issues.append(f"Sharpe too negative: {metrics['sharpe']:.2f}")
-        if metrics['pnl_pct'] < -30:
-            issues.append(f"Severe loss: {metrics['pnl_pct']:.2f}%")
-
-        if issues:
-            print("RESULT: BLOCKED")
-            print("\nIssues detected:")
-            for issue in issues:
-                print(f"  - {issue}")
-            print("\nWFO stopped. Fix hyperparameters before continuing.")
-            print("=" * 50)
-            return False
-        else:
-            print("RESULT: PASSED")
-            print("Segment 0 metrics are acceptable. Continuing WFO...")
-            print("=" * 50)
-            return True
 
     def save_results(self, metrics: Dict[str, Any]):
         """Append metrics to results CSV."""
@@ -962,19 +1267,16 @@ class WFOPipeline:
         print(f"\nResults saved to: {self.config.results_path}")
 
     def _setup_logging(self):
-        """Clear old logs. TensorBoard must be started manually to avoid race conditions."""
-        import time
+        """Setup logging directory. Does NOT delete existing logs (parallel execution support)."""
+        # NOTE: We intentionally do NOT delete logs here.
+        # Parallel GPU runs would delete each other's logs.
+        # User should manually clean logs/wfo if needed.
 
-        # 1. Kill any TensorBoard watching logs/wfo to avoid race conditions
-        subprocess.run(["pkill", "-f", "tensorboard.*logs/wfo"], capture_output=True)
-        time.sleep(0.5)
-
-        # 2. Clear logs directory
         logs_dir = "logs/wfo"
-        if os.path.exists(logs_dir):
-            shutil.rmtree(logs_dir)
-            print(f"  Cleared old logs: {logs_dir}")
+        # if os.path.exists(logs_dir):
+        #     shutil.rmtree(logs_dir)  # DISABLED: breaks parallel execution
         os.makedirs(logs_dir, exist_ok=True)
+        print(f"  [INFO] Appending to logs dir: {logs_dir}")
 
         print("  TensorBoard: start manually with 'tensorboard --logdir logs/wfo --port 8081'")
 
@@ -1003,11 +1305,17 @@ class WFOPipeline:
         print(f"  Test: {self.config.test_months} months ({self.config.test_rows} rows)")
         print(f"  Step: {self.config.step_months} months ({self.config.step_rows} rows)")
         print(f"  Volatility Scaling: Target={self.config.target_volatility}, Window={self.config.vol_window}")
+        print(f"  GPU Acceleration: {'BatchCryptoEnv' if self.config.use_batch_env else 'SubprocVecEnv (CPU)'}")
 
         # Load raw data
         print(f"\nLoading raw data: {self.config.raw_data_path}")
-        df_raw = pd.read_parquet(self.config.raw_data_path)
+        df_raw = self._load_raw_data(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
+
+        # Pre-calculate features globally (P1 optimization: ~20-30% speedup)
+        print("\n[OPTIMIZATION] Pre-calculating features globally (once)...")
+        self._df_features_global = self.feature_engineer.engineer_features(df_raw)
+        print(f"  Features shape: {self._df_features_global.shape}")
 
         # Calculate segments
         segments = self.calculate_segments(len(df_raw))
@@ -1025,12 +1333,13 @@ class WFOPipeline:
         all_metrics = []
         for segment in segments:
             try:
-                metrics, train_metrics = self.run_segment(df_raw, segment)
+                metrics, train_metrics = self.run_segment(
+                    df_raw, segment,
+                    use_batch_env=self.config.use_batch_env,
+                    resume=self.config.resume
+                )
                 all_metrics.append(metrics)
-                self.save_results(metrics)
-
-                # Cleanup intermediate files to free disk space
-                self._cleanup_segment(segment['id'])
+                # Note: save_results is now called inside run_segment for each model type
 
                 # GATE: Disabled - let WFO run all segments regardless of segment 0 performance
                 # if segment['id'] == 0:
@@ -1038,11 +1347,34 @@ class WFOPipeline:
                 #         print("\n[WFO] Stopped at segment 0 gate.")
                 #         break
 
+            except KeyboardInterrupt:
+                print("\n[USER] Interrupted by user (Ctrl+C).")
+                sys.exit(0)
             except Exception as e:
-                print(f"\n[ERROR] Segment {segment['id']} failed: {e}")
+                error_msg = str(e).lower()
+
+                # Log the error with full traceback
+                print(f"\n[FATAL] Segment {segment['id']} failed: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
+
+                # OOM = Fail Fast (no point retrying)
+                if isinstance(e, MemoryError) or "out of memory" in error_msg:
+                    print("[FATAL] OOM detected. Stopping WFO to prevent cascading failures.")
+                    sys.exit(1)
+
+                # Numerical instability (NaN/Inf) = Fail Fast (model is corrupted)
+                if "nan" in error_msg or "inf" in error_msg or "numerical" in error_msg:
+                    print("[FATAL] Numerical instability detected. Model is corrupted.")
+                    sys.exit(1)
+
+                # FAIL FAST: Stop WFO on ANY training error (do not burn GPU credits)
+                print("\n" + "=" * 50)
+                print("[POLICY] FAIL-FAST: Stopping WFO on training error.")
+                print("         Fix the issue before restarting.")
+                print("         Use --segment N to resume from segment N.")
+                print("=" * 50)
+                sys.exit(1)
 
             # Force garbage collection between segments
             gc.collect()
@@ -1081,8 +1413,13 @@ class WFOPipeline:
 
         # Load raw data
         print(f"\nLoading raw data: {self.config.raw_data_path}")
-        df_raw = pd.read_parquet(self.config.raw_data_path)
+        df_raw = self._load_raw_data(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
+
+        # Pre-calculate features globally (P1 optimization)
+        print("\n[OPTIMIZATION] Pre-calculating features globally (once)...")
+        self._df_features_global = self.feature_engineer.engineer_features(df_raw)
+        print(f"  Features shape: {self._df_features_global.shape}")
 
         # Calculate all segments to get their boundaries
         all_segments = self.calculate_segments(len(df_raw))
@@ -1116,35 +1453,48 @@ class WFOPipeline:
                 del train_df, test_df, hmm
                 gc.collect()
 
-                # 4. Check if TQC model exists
-                tqc_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "tqc.zip")
-                encoder_path = os.path.join(self.config.weights_dir, f"segment_{seg_id}", "encoder.pth")
+                # 4. Check encoder exists
+                weights_dir = os.path.join(self.config.weights_dir, f"segment_{seg_id}")
+                encoder_path = os.path.join(weights_dir, "encoder.pth")
 
-                if not os.path.exists(tqc_path):
-                    print(f"  [ERROR] TQC model not found: {tqc_path}")
-                    continue
                 if not os.path.exists(encoder_path):
                     print(f"  [ERROR] Encoder not found: {encoder_path}")
                     continue
 
-                print(f"  Using existing models: {tqc_path}")
+                # 5. Evaluate both Best and Last models (like run_segment)
+                models_to_eval = [
+                    ('best', os.path.join(weights_dir, "tqc.zip")),
+                    ('last', os.path.join(weights_dir, "tqc_last.zip"))
+                ]
 
-                # 5. Evaluate
-                metrics, navs = self.evaluate_segment(
-                    test_path, encoder_path, tqc_path, seg_id,
-                    context_rows=context_rows,
-                    train_metrics={},  # No training metrics in eval-only mode
-                    train_path=train_path
-                )
+                for model_type, tqc_path in models_to_eval:
+                    if not os.path.exists(tqc_path):
+                        print(f"  [SKIP] {model_type.upper()} model not found: {tqc_path}")
+                        continue
 
-                all_metrics.append(metrics)
-                self.save_results(metrics)
+                    print(f"\n  --- Evaluating {model_type.upper()} model ---")
+                    print(f"  Using: {tqc_path}")
 
-                # Generate plots (with minimal train_metrics)
-                self.generate_segment_plots(seg_id, navs, metrics, {
-                    'action_saturation': 0, 'avg_entropy': 0,
-                    'avg_critic_loss': 0, 'avg_churn_ratio': 0
-                })
+                    metrics, navs = self.evaluate_segment(
+                        test_path, encoder_path, tqc_path, seg_id,
+                        context_rows=context_rows,
+                        train_metrics={},  # No training metrics in eval-only mode
+                        train_path=train_path
+                    )
+
+                    # Tag metrics with model type
+                    metrics['model_type'] = model_type
+
+                    all_metrics.append(metrics)
+                    self.save_results(metrics)
+
+                    # Generate plots (with minimal train_metrics)
+                    prefix = f"{model_type}_" if model_type != 'best' else ""
+                    self.generate_segment_plots(
+                        seg_id, navs, metrics,
+                        {'action_saturation': 0, 'avg_entropy': 0, 'avg_critic_loss': 0, 'avg_churn_ratio': 0},
+                        prefix=prefix
+                    )
 
             except Exception as e:
                 print(f"\n[ERROR] Segment {seg_id} failed: {e}")
@@ -1194,6 +1544,10 @@ def main():
                         help="Re-run evaluation only (skip MAE/TQC training)")
     parser.add_argument("--eval-segments", type=str, default=None,
                         help="Comma-separated segment IDs to evaluate (e.g., '0,1,2')")
+    parser.add_argument("--no-batch-env", action="store_true",
+                        help="Disable GPU-accelerated BatchCryptoEnv (Force CPU mode)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from tqc_last.zip (continues TensorBoard steps)")
 
     args = parser.parse_args()
 
@@ -1205,6 +1559,18 @@ def main():
     config.train_months = args.train_months
     config.test_months = args.test_months
     config.step_months = args.step_months
+    # Default to GPU (True) unless explicitly disabled via CLI
+    # This prevents accidental CPU runs which are 100x slower
+    if args.no_batch_env:
+        print("[WARNING] GPU Acceleration DISABLED via --no-batch-env flag")
+        config.use_batch_env = False
+    else:
+        config.use_batch_env = True
+
+    # Resume mode: continue from tqc_last.zip
+    if args.resume:
+        print("[INFO] RESUME MODE: Will continue from tqc_last.zip (TensorBoard continues)")
+        config.resume = True
 
     # Create pipeline
     pipeline = WFOPipeline(config)

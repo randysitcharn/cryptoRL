@@ -38,35 +38,39 @@ class TQCTrainingConfig:
     episode_length: int = 2048
     eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
 
-    # Reward function
-    reward_scaling: float = 30.0
+    # Reward function (x100 SCALE applied in env.py)
+    reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
+    # TODO: Monitor for risk paralysis (0 trades). Decrease to 2.0 if needed.
     downside_coef: float = 10.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    churn_coef: float = 1.0  # Anti-churn penalty
-    smooth_coef: float = 0.1  # Smoothness penalty
+    churn_coef: float = 0.5       # Max target après curriculum (réduit)
+    smooth_coef: float = 1e-5     # Très bas par défaut (curriculum monte à 0.001 max)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol
     vol_window: int = 24
     max_leverage: float = 2.0
 
+    # Regularization (anti-overfitting)
+    observation_noise: float = 0.01  # 1% Gaussian noise on market observations
+
     # --- Foundation Model ---
-    d_model: int = 128
+    d_model: int = 256  # Increased capacity for complex patterns
     n_heads: int = 4
     n_layers: int = 2
     freeze_encoder: bool = True
 
     # --- TQC Hyperparameters ---
-    total_timesteps: int = 150_000
-    learning_rate: float = 9e-5
-    buffer_size: int = 200_000
-    batch_size: int = 1024
-    gamma: float = 0.95
+    total_timesteps: int = 90_000_000  # 90M steps
+    learning_rate: float = 3e-4      # Standard TQC (avec gradient_steps=2 → UTD=2.0)
+    buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
+    batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
+    gamma: float = 0.95  # Shorter horizon for faster learning
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto"
     train_freq: int = 1
-    gradient_steps: int = 1
+    gradient_steps: int = 2
     top_quantiles_to_drop: int = 2
     n_critics: int = 2
     n_quantiles: int = 25
@@ -100,6 +104,10 @@ class TQCTrainingConfig:
     risk_max_drawdown: float = 0.10
     risk_cooldown: int = 12
     risk_augment_obs: bool = False
+
+    # --- Parallelization (P0 Optimization) ---
+    n_envs: Optional[int] = None  # Auto-detect from CPU cores (HardwareManager)
+                                  # Set to 1 to disable (use DummyVecEnv)
 
 
 # =============================================================================
@@ -159,7 +167,7 @@ class FoundationTrainingConfig:
     train_ratio: float = 0.8
 
     # --- Model Architecture ---
-    d_model: int = 128
+    d_model: int = 256  # Updated to match TQC d_model
     n_heads: int = 4
     n_layers: int = 2
     dropout: float = 0.1

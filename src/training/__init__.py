@@ -3,17 +3,17 @@
 training - Training module for cryptoRL.
 
 Provides:
-- CryptoTradingEnv: Gymnasium environment for trading
+- BatchCryptoEnv: GPU-vectorized Gymnasium environment for trading
 - Callbacks: TensorBoard, logging, curriculum learning
 - Training functions: train_agent, train_foundation
 """
 
-# Core environment (no heavy dependencies)
-from src.training.env import CryptoTradingEnv
+# Core environment
+from src.training.batch_env import BatchCryptoEnv
 
 __all__ = [
     # Environment
-    "CryptoTradingEnv",
+    "BatchCryptoEnv",
     # Training functions (lazy loaded)
     "train_agent",
     "train_foundation",

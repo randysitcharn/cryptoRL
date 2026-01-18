@@ -33,6 +33,10 @@ class FeatureEngineer:
     # Actifs pour Volume relatif
     VOLUME_ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
 
+    # FFD d-values: Empty cache forces ADF test per segment for optimal regime adaptation
+    # Fixed d=0.30 was suboptimal across different time periods (2017-2025)
+    FFD_D_OPTIMAL_CACHE = {}
+
     def __init__(
         self,
         ffd_window: int = 100,
@@ -263,16 +267,18 @@ class FeatureEngineer:
 
             series = df[close_col].dropna()
 
-            # Appliquer log() pour normaliser l'amplitude
-            # FFD sur log(price) donne des valeurs ~[-0.1, +0.1] au lieu de [428, 4584]
-            log_series = np.log(series)
-
-            # Trouver le d optimal sur log(price)
-            d_opt, p_value = self.find_min_d(log_series)
-            self.optimal_d[asset] = d_opt
-            self.adf_results[asset] = {'d': d_opt, 'p_value': p_value}
-
-            print(f"  {asset}: d_optimal = {d_opt:.2f}, ADF p-value = {p_value:.4f}")
+            # Check cache first, otherwise run ADF test
+            if asset in self.FFD_D_OPTIMAL_CACHE:
+                d_opt = self.FFD_D_OPTIMAL_CACHE[asset]
+                self.optimal_d[asset] = d_opt
+                self.adf_results[asset] = {'d': d_opt, 'p_value': 0.0}
+                print(f"  {asset}: d_optimal = {d_opt:.2f} (cached)")
+            else:
+                # Run ADF test to find optimal d for this segment
+                d_opt, p_val = self.find_min_d(np.log(series))
+                self.optimal_d[asset] = d_opt
+                self.adf_results[asset] = {'d': d_opt, 'p_value': p_val}
+                print(f"  {asset}: d_optimal = {d_opt:.2f} (ADF p={p_val:.4f})")
 
             # Appliquer FFD sur log(price)
             df[f"{asset}_Fracdiff"] = self._ffd(np.log(df[close_col]), d_opt)
