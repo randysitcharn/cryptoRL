@@ -28,8 +28,8 @@ class DeadZoneWrapper(gym.ActionWrapper):
         threshold: Actions with |action| < threshold are set to 0.
 
     Example:
-        >>> env = CryptoTradingEnv(...)
-        >>> env = DeadZoneWrapper(env, threshold=0.1)
+        >>> env = BatchCryptoEnv(n_envs=1, ...)
+        >>> # Use with gym_step/gym_reset for single env mode
         >>> # Actions in [-0.1, 0.1] become 0.0
     """
 

@@ -63,14 +63,14 @@ class TQCTrainingConfig:
 
     # --- TQC Hyperparameters ---
     total_timesteps: int = 90_000_000  # 90M steps
-    learning_rate: float = 1e-4      # Réduit pour éviter mémorisation
+    learning_rate: float = 3e-4      # Standard TQC (avec gradient_steps=2 → UTD=2.0)
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
     gamma: float = 0.95  # Shorter horizon for faster learning
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto"
     train_freq: int = 1
-    gradient_steps: int = 1
+    gradient_steps: int = 2
     top_quantiles_to_drop: int = 2
     n_critics: int = 2
     n_quantiles: int = 25

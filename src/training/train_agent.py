@@ -14,24 +14,18 @@ import re
 import glob
 import zipfile
 import io
-from multiprocessing import Manager
 from typing import Optional, Tuple
 
 from sb3_contrib import TQC
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from src.training.callbacks import EvalCallbackWithNoiseControl
 import torch
 import numpy as np
-from functools import partial
 
 from src.config import DEVICE, SEED
 from src.utils.hardware import HardwareManager
 from src.models.rl_adapter import FoundationFeatureExtractor
-from src.training.env import CryptoTradingEnv
 from src.training.batch_env import BatchCryptoEnv
-from src.training.wrappers import RiskManagementWrapper
 from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
     StepLoggingCallback,
@@ -240,224 +234,87 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
     )
 
 
-def _make_train_env(
-    parquet_path: str,
-    window_size: int,
-    commission: float,
-    episode_length: int,
-    reward_scaling: float,
-    downside_coef: float,
-    upside_coef: float,
-    action_discretization: int,
-    churn_coef: float,
-    smooth_coef: float,
-    target_volatility: float,
-    vol_window: int,
-    max_leverage: float,
-    price_column: str,
-    seed: int,
-    shared_fee=None,
-    shared_smooth=None,
-):
+def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: bool = True):
     """
-    Factory function for creating training environments (SubprocVecEnv compatible).
-
-    Must be at module level (not nested) to be picklable for multiprocessing.
-    Each subprocess will call this to create its own environment instance.
-
-    Args:
-        shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
-        shared_smooth: Shared memory Value for curriculum smooth_coef (SubprocVecEnv).
-    """
-    env = CryptoTradingEnv(
-        parquet_path=parquet_path,
-        window_size=window_size,
-        commission=commission,
-        episode_length=episode_length,
-        reward_scaling=reward_scaling,
-        downside_coef=downside_coef,
-        upside_coef=upside_coef,
-        action_discretization=action_discretization,
-        churn_coef=churn_coef,
-        smooth_coef=smooth_coef,
-        random_start=True,  # Always random for training
-        target_volatility=target_volatility,
-        vol_window=vol_window,
-        max_leverage=max_leverage,
-        price_column=price_column,
-        shared_fee=shared_fee,
-        shared_smooth=shared_smooth,
-    )
-    # Set seed for reproducibility across parallel envs
-    env.reset(seed=seed)
-    return Monitor(env)
-
-
-def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: bool = False):
-    """
-    Create training and evaluation environments.
+    Create training and evaluation environments using BatchCryptoEnv.
 
     Args:
         config: Training configuration.
-        n_envs: Number of parallel training environments (P0 optimization).
-                Use n_envs > 1 for SubprocVecEnv parallelization (2-4x speedup).
-                Now compatible with curriculum learning via shared memory.
-        use_batch_env: If True, use BatchCryptoEnv (GPU-vectorized) instead of SubprocVecEnv.
-                       This runs all envs in a single process using GPU tensors (10-50x speedup).
+        n_envs: Number of parallel training environments.
+        use_batch_env: Deprecated, always uses BatchCryptoEnv (kept for backward compatibility).
 
     Returns:
-        Tuple of (train_vec_env, eval_vec_env, shared_fee, shared_smooth, manager).
-        shared_fee, shared_smooth, and manager are None if not using curriculum with SubprocVecEnv.
+        Tuple of (train_vec_env, eval_vec_env, None, None, None).
+        Last three values are None (kept for backward compatibility).
     """
-    from src.config import SEED
-
-    # Shared memory for curriculum learning with SubprocVecEnv
-    shared_fee = None
-    shared_smooth = None
-    manager = None  # Track Manager for proper cleanup (Gemini recommendation)
-
     # Curriculum Learning: start with 0 fees/smoothness if enabled
     if config.use_curriculum:
         initial_commission = 0.0
         initial_smooth = 0.0
-        # Create shared memory for SubprocVecEnv curriculum communication
-        # Use Manager().Value() instead of Value() because it's picklable
-        if n_envs > 1:
-            manager = Manager()
-            shared_fee = manager.Value('d', 0.0)
-            shared_smooth = manager.Value('d', 0.0)
-            print("      [P0+Curriculum] Using Manager shared memory for curriculum with SubprocVecEnv")
     else:
         initial_commission = config.commission
         initial_smooth = config.smooth_coef
 
-    # ==================== Training Environment(s) ====================
-    if use_batch_env:
-        # GPU-Vectorized Batch Environment (Gemini recommendation)
-        # All envs run in a single process using PyTorch tensors on GPU
-        # Eliminates IPC overhead, achieves 10-50x speedup vs SubprocVecEnv
-        print(f"      [BatchEnv] Creating {n_envs} GPU-vectorized environments (BatchCryptoEnv)...")
+    # ==================== Training Environment ====================
+    # GPU-Vectorized Batch Environment
+    # All envs run in a single process using PyTorch tensors on GPU
+    print(f"      [BatchEnv] Creating {n_envs} GPU-vectorized environments (BatchCryptoEnv)...")
 
-        train_vec_env = BatchCryptoEnv(
-            parquet_path=config.data_path,
-            n_envs=n_envs,
+    train_vec_env = BatchCryptoEnv(
+        parquet_path=config.data_path,
+        n_envs=n_envs,
+        device=str(DEVICE),
+        window_size=config.window_size,
+        episode_length=config.episode_length,
+        initial_balance=10_000.0,
+        commission=initial_commission,
+        slippage=0.0001,
+        reward_scaling=config.reward_scaling,
+        downside_coef=config.downside_coef,
+        upside_coef=config.upside_coef,
+        action_discretization=config.action_discretization,
+        churn_coef=config.churn_coef,
+        smooth_coef=initial_smooth,
+        target_volatility=config.target_volatility,
+        vol_window=config.vol_window,
+        max_leverage=config.max_leverage,
+        price_column='BTC_Close',
+        observation_noise=config.observation_noise,  # Anti-overfitting
+    )
+
+    # ==================== Eval Environment (optional) ====================
+    # Note: eval_data_path=None in WFO mode to prevent data leakage
+    if config.eval_data_path is not None:
+        # Note: Eval env uses target values (no curriculum) for consistent evaluation
+        # Use BatchCryptoEnv with small n_envs for evaluation
+        eval_vec_env = BatchCryptoEnv(
+            parquet_path=config.eval_data_path,
+            n_envs=min(n_envs, 32),  # Smaller for evaluation
             device=str(DEVICE),
             window_size=config.window_size,
-            episode_length=config.episode_length,
+            episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
             initial_balance=10_000.0,
-            commission=initial_commission,
+            commission=config.commission,
             slippage=0.0001,
             reward_scaling=config.reward_scaling,
             downside_coef=config.downside_coef,
             upside_coef=config.upside_coef,
             action_discretization=config.action_discretization,
             churn_coef=config.churn_coef,
-            smooth_coef=initial_smooth,
-            target_volatility=config.target_volatility,
-            vol_window=config.vol_window,
-            max_leverage=config.max_leverage,
-            price_column='BTC_Close',
-            observation_noise=config.observation_noise,  # Anti-overfitting
-        )
-        # Note: Curriculum updates use env.set_attr() for BatchCryptoEnv
-
-    elif n_envs > 1:
-        # P0 Optimization: SubprocVecEnv for true parallelization
-        # Each subprocess creates its own environment independently
-        print(f"      [P0] Creating {n_envs} parallel training environments (SubprocVecEnv)...")
-
-        env_fns = [
-            partial(
-                _make_train_env,
-                parquet_path=config.data_path,
-                window_size=config.window_size,
-                commission=initial_commission,
-                episode_length=config.episode_length,
-                reward_scaling=config.reward_scaling,
-                downside_coef=config.downside_coef,
-                upside_coef=config.upside_coef,
-                action_discretization=config.action_discretization,
-                churn_coef=config.churn_coef,
-                smooth_coef=initial_smooth,
-                target_volatility=config.target_volatility,
-                vol_window=config.vol_window,
-                max_leverage=config.max_leverage,
-                price_column='BTC_Close',
-                seed=SEED + i,  # Different seed per env for diversity
-                shared_fee=shared_fee,
-                shared_smooth=shared_smooth,
-            )
-            for i in range(n_envs)
-        ]
-        train_vec_env = SubprocVecEnv(env_fns, start_method='spawn')
-    else:
-        # Single environment (DummyVecEnv) - legacy path
-        train_env = CryptoTradingEnv(
-            parquet_path=config.data_path,
-            window_size=config.window_size,
-            commission=initial_commission,
-            episode_length=config.episode_length,
-            reward_scaling=config.reward_scaling,
-            downside_coef=config.downside_coef,
-            upside_coef=config.upside_coef,
-            action_discretization=config.action_discretization,
-            churn_coef=config.churn_coef,
-            smooth_coef=initial_smooth,
-            random_start=True,
-            target_volatility=config.target_volatility,
-            vol_window=config.vol_window,
-            max_leverage=config.max_leverage,
-            price_column='BTC_Close',
-        )
-        train_env_monitored = Monitor(train_env)
-        train_vec_env = DummyVecEnv([lambda: train_env_monitored])
-
-    # ==================== Eval Environment (optional) ====================
-    # Note: eval_data_path=None in WFO mode to prevent data leakage
-    if config.eval_data_path is not None:
-        # Note: Eval env uses target values (no curriculum) for consistent evaluation
-        val_env = CryptoTradingEnv(
-            parquet_path=config.eval_data_path,
-            window_size=config.window_size,
-            commission=config.commission,
-            episode_length=config.eval_episode_length,  # 720h = 1 month for faster eval
-            reward_scaling=config.reward_scaling,
-            downside_coef=config.downside_coef,
-            upside_coef=config.upside_coef,
-            action_discretization=config.action_discretization,
-            churn_coef=config.churn_coef,
             smooth_coef=config.smooth_coef,
-            random_start=False,  # Sequential for evaluation
             target_volatility=config.target_volatility,
             vol_window=config.vol_window,
             max_leverage=config.max_leverage,
             price_column='BTC_Close',
+            random_start=False,  # Sequential for evaluation
+            observation_noise=0.0,  # No noise for evaluation
         )
-
-        # Wrap with Risk Management (Circuit Breaker) - ASYMMETRIC
-        # Train env: NO CB (agent learns from mistakes)
-        # Eval env: CB active at configured threshold (monitoring only)
-        if config.use_risk_management:
-            # Only wrap eval env with circuit breaker
-            val_env = RiskManagementWrapper(
-                val_env,
-                vol_window=config.risk_vol_window,
-                vol_threshold=config.risk_vol_threshold,
-                max_drawdown=config.risk_max_drawdown,
-                cooldown_steps=config.risk_cooldown,
-                augment_obs=config.risk_augment_obs,
-            )
-            # Calibrate baseline volatility
-            val_env.calibrate_baseline(n_steps=2000)
-
-        val_env_monitored = Monitor(val_env)
-        eval_vec_env = DummyVecEnv([lambda: val_env_monitored])
     else:
         # WFO mode: no eval env to prevent data leakage
         eval_vec_env = None
         print("      [WFO Mode] Eval environment disabled (eval_data_path=None)")
 
-    return train_vec_env, eval_vec_env, shared_fee, shared_smooth, manager
+    return train_vec_env, eval_vec_env, None, None, None
 
 
 def create_callbacks(

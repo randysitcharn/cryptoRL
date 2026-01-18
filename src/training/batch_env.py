@@ -45,7 +45,7 @@ class BatchCryptoEnv(VecEnv):
         self,
         parquet_path: str = "data/processed_data.parquet",
         price_column: str = "close",
-        n_envs: int = 1024,
+        n_envs: int = 512,
         device: str = "cuda",
         # Environment params
         window_size: int = 64,
@@ -69,6 +69,8 @@ class BatchCryptoEnv(VecEnv):
         end_idx: Optional[int] = None,
         # Regularization (anti-overfitting)
         observation_noise: float = 0.0,  # 0 = disabled by default
+        # Episode start mode
+        random_start: bool = True,  # If False, start at beginning (for evaluation)
     ):
         """
         Initialize the batch environment.
@@ -114,6 +116,7 @@ class BatchCryptoEnv(VecEnv):
         self.vol_window = vol_window
         self.max_leverage = max_leverage
         self.observation_noise = observation_noise
+        self.random_start = random_start
         self.training = True  # Flag for observation noise (disable during eval)
 
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
@@ -398,10 +401,15 @@ class BatchCryptoEnv(VecEnv):
         min_start = self.window_size
         max_start = self.n_steps - self.episode_length - 1
 
-        # Random starts for each env
-        self.episode_starts = torch.randint(
-            min_start, max_start, (n,), device=self.device
-        )
+        if self.random_start and max_start > min_start:
+            # Random starts for each env (training mode)
+            self.episode_starts = torch.randint(
+                min_start, max_start, (n,), device=self.device
+            )
+        else:
+            # Sequential start at beginning (evaluation mode)
+            self.episode_starts = torch.full((n,), min_start, dtype=torch.long, device=self.device)
+
         self.current_steps = self.episode_starts.clone()
         self.episode_ends = self.episode_starts + self.episode_length
 
@@ -482,10 +490,14 @@ class BatchCryptoEnv(VecEnv):
         # Use previous step return for vol update (need at least one step)
         old_navs = self._get_navs()
 
-        # 3. Apply volatility scaling
-        vol = torch.clamp(torch.sqrt(self.ema_vars), min=1e-6)
+        # 3. Apply volatility scaling with Volatility Floor (prevents Cash Trap)
+        # Min vol corresponds to the inverse of max leverage (e.g., 0.05 / 5.0 = 0.01)
+        # This ensures stable scaling when agent is in cash (vol = 0)
+        min_vol = self.target_volatility / self.max_leverage
+        current_vol = torch.sqrt(self.ema_vars)
+        clipped_vol = torch.clamp(current_vol, min=min_vol)
         self.vol_scalars = torch.clamp(
-            self.target_volatility / vol,
+            self.target_volatility / clipped_vol,
             min=0.1,
             max=self.max_leverage
         )
@@ -677,6 +689,99 @@ class BatchCryptoEnv(VecEnv):
         position = np.array([self.position_pcts[idx].item()], dtype=np.float32)
         return {"market": market, "position": position}
 
+    # =========================================================================
+    # Gymnasium-compatible interface (for n_envs=1, evaluation mode)
+    # =========================================================================
+
+    def gym_reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, np.ndarray], dict]:
+        """
+        Gymnasium-compatible reset for single env mode.
+
+        Use this method for evaluation/backtesting with n_envs=1.
+        Returns observation and info dict like standard Gymnasium envs.
+
+        Args:
+            seed: Random seed (optional).
+            options: Additional options (unused).
+
+        Returns:
+            Tuple of (observation, info).
+        """
+        assert self.num_envs == 1, f"gym_reset() requires n_envs=1, got {self.num_envs}"
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        obs = self.reset()
+        # Unwrap single env observation
+        obs_single = {k: v[0] for k, v in obs.items()}
+        info = self._get_single_info(0)
+
+        return obs_single, info
+
+    def gym_step(self, action: np.ndarray) -> Tuple[Dict[str, np.ndarray], float, bool, bool, dict]:
+        """
+        Gymnasium-compatible step for single env mode.
+
+        Use this method for evaluation/backtesting with n_envs=1.
+        Returns (obs, reward, terminated, truncated, info) like standard Gymnasium envs.
+
+        Args:
+            action: Action array (will be reshaped to (1, 1) for batch processing).
+
+        Returns:
+            Tuple of (observation, reward, terminated, truncated, info).
+        """
+        assert self.num_envs == 1, f"gym_step() requires n_envs=1, got {self.num_envs}"
+
+        # Ensure action is properly shaped for batch processing
+        if isinstance(action, (int, float)):
+            action = np.array([[action]], dtype=np.float32)
+        elif action.ndim == 0:
+            action = np.array([[action.item()]], dtype=np.float32)
+        elif action.ndim == 1:
+            action = action.reshape(1, -1)
+
+        self.step_async(action)
+        obs, rewards, dones, infos = self.step_wait()
+
+        # Unwrap single env results
+        obs_single = {k: v[0] for k, v in obs.items()}
+        reward = float(rewards[0])
+        terminated = bool(dones[0])
+        truncated = False  # We don't use truncation
+        info = infos[0]
+
+        # Add extra info for evaluation compatibility
+        info.update(self._get_single_info(0))
+
+        return obs_single, reward, terminated, truncated, info
+
+    def _get_single_info(self, idx: int) -> dict:
+        """
+        Build comprehensive info dict for single env (Gymnasium compatibility).
+
+        Args:
+            idx: Environment index (0 for single env mode).
+
+        Returns:
+            Info dict with NAV, position, price, and other metrics.
+        """
+        navs = self._get_navs()
+        return {
+            'nav': float(navs[idx].item()),
+            'cash': float(self.cash[idx].item()),
+            'position': float(self.positions[idx].item()),
+            'position_pct': float(self.position_pcts[idx].item()),
+            'price': float(self.prices[self.current_steps[idx]].item()),
+            'total_trades': int(self.total_trades[idx].item()),
+            'total_commission': float(self.total_commissions[idx].item()),
+            'vol/current_volatility': float(torch.sqrt(self.ema_vars[idx]).item()),
+            'vol/vol_scalar': float(self.vol_scalars[idx].item()),
+            'vol/target_volatility': self.target_volatility,
+        }
+
     def close(self) -> None:
         """Clean up resources."""
         pass
@@ -766,7 +871,7 @@ class BatchCryptoEnv(VecEnv):
         cls,
         parquet_path: str = "data/processed_data.parquet",
         train_ratio: float = 0.8,
-        n_envs: int = 1024,
+        n_envs: int = 512,
         **kwargs
     ) -> Tuple["BatchCryptoEnv", "BatchCryptoEnv"]:
         """

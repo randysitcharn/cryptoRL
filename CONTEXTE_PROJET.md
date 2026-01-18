@@ -74,9 +74,8 @@ cryptoRL/
 │   │   ├── rl_adapter.py       # FoundationFeatureExtractor (13K)
 │   │   └── agent.py            # Agent wrapper (4K)
 │   ├── training/               # Training infrastructure
-│   │   ├── batch_env.py        # GPU-accelerated BatchCryptoEnv (35K)
+│   │   ├── batch_env.py        # GPU-accelerated BatchCryptoEnv (unified env)
 │   │   ├── callbacks.py        # Training callbacks (32K)
-│   │   ├── env.py              # CryptoTradingEnv CPU (25K)
 │   │   ├── train_agent.py      # TQC training entrypoint (40K)
 │   │   ├── train_foundation.py # MAE training entrypoint (16K)
 │   │   └── wrappers.py         # Risk management wrappers (11K)
@@ -94,9 +93,8 @@ cryptoRL/
 |------|---------|------|
 | `scripts/run_full_wfo.py` | Main WFO orchestration (HMM -> MAE -> TQC -> Eval) | ~1600 lines |
 | `src/training/train_agent.py` | TQC training with Foundation Model | 40 KB |
-| `src/training/batch_env.py` | GPU-accelerated vectorized environment | 35 KB |
+| `src/training/batch_env.py` | GPU-accelerated vectorized environment (unified) | 35 KB |
 | `src/training/callbacks.py` | Curriculum learning (3-Phase), logging | 32 KB |
-| `src/training/env.py` | CPU trading environment (evaluation) | 25 KB |
 | `src/models/rl_adapter.py` | FoundationFeatureExtractor (MAE -> TQC) | 13 KB |
 | `src/models/foundation.py` | CryptoMAE autoencoder model | 9.5 KB |
 
@@ -254,9 +252,8 @@ PHASES = [
 |  +-- [5] TQC Training: BatchCryptoEnv (1024 envs, 54M steps)            |
 |  +-- [6] OOS Evaluation: Test window backtest                            |
 +-------------------------------------------------------------------------+
-|  Training Environments                                                   |
-|  +-- BatchCryptoEnv (batch_env.py) - GPU 1024 envs                      |
-|  +-- CryptoTradingEnv (env.py) - CPU evaluation                         |
+|  Training Environment (unified)                                          |
+|  +-- BatchCryptoEnv (batch_env.py) - GPU/CPU, supports n_envs=1 eval    |
 +-------------------------------------------------------------------------+
 |  Callbacks (callbacks.py)                                                |
 |  +-- ThreePhaseCurriculumCallback: churn + smooth curriculum            |

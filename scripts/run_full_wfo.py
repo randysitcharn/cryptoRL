@@ -591,9 +591,9 @@ class WFOPipeline:
         print(f"\n[Segment {segment_id}] Evaluating (skipping {context_rows} warmup rows)...")
 
         import torch
+        from collections import deque
         from sb3_contrib import TQC
-        from src.training.env import CryptoTradingEnv
-        from src.training.wrappers import RiskManagementWrapper
+        from src.training.batch_env import BatchCryptoEnv
 
         # Calculate baseline_vol from TRAIN data (avoids data leakage)
         if train_path and os.path.exists(train_path):
@@ -604,55 +604,83 @@ class WFOPipeline:
             baseline_vol = 0.01  # Conservative fallback
             print(f"  [WARNING] train_path not provided. Using default baseline_vol: {baseline_vol:.5f}")
 
-        # Create test environment
+        # Calculate episode length from test data (full episode)
+        test_df = pd.read_parquet(test_path)
+        test_episode_length = len(test_df) - self.config.window_size - 1
+
+        # Create test environment using BatchCryptoEnv with n_envs=1
         # NOTE: max_leverage=1.0 disables volatility scaling for evaluation
         # This prevents the "stuck in cash" bug where portfolio returns collapse to 0
-        env = CryptoTradingEnv(
+        env = BatchCryptoEnv(
             parquet_path=test_path,
+            n_envs=1,  # Single env for Gymnasium-compatible evaluation
+            device='cuda' if torch.cuda.is_available() else 'cpu',
             window_size=self.config.window_size,
+            episode_length=test_episode_length,  # Full episode
             commission=0.0004,  # churn_analysis.yaml
-            episode_length=None,  # Full episode
-            random_start=False,
+            slippage=0.0001,
             target_volatility=self.config.target_volatility,
             vol_window=self.config.vol_window,
             max_leverage=1.0,  # Disable vol scaling (was: self.config.max_leverage)
             price_column='BTC_Close',
+            random_start=False,  # Sequential start for evaluation
         )
 
-        # Wrap with Risk Management (Circuit Breaker)
-        # baseline_vol computed from TRAIN data to avoid data leakage
-        env = RiskManagementWrapper(
-            env,
-            vol_window=24,
-            vol_threshold=3.0,
-            max_drawdown=0.10,  # 10% drawdown trigger
-            cooldown_steps=12,
-            augment_obs=False,
-            baseline_vol=baseline_vol,
-        )
+        # Circuit Breaker state (inline implementation)
+        cb_vol_window = 24
+        cb_vol_threshold = 3.0
+        cb_max_drawdown = 0.10
+        cb_cooldown_steps = 12
+        cb_nav_history = deque(maxlen=cb_vol_window + 1)
+        cb_peak_nav = 10000.0
+        cb_cooldown_remaining = 0
+        circuit_breaker_count = 0
 
         # Load agent (must use CUDA - encoder uses float16 which fails on CPU)
         model = TQC.load(tqc_path, device='cuda')
 
-        # Run evaluation
-        obs, _ = env.reset()
+        # Run evaluation using Gymnasium-compatible interface
+        obs, info = env.gym_reset()
         done = False
         total_reward = 0
         rewards = []
         navs = []
-        circuit_breaker_count = 0
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
+            # Circuit Breaker: force HOLD if in cooldown
+            if cb_cooldown_remaining > 0:
+                action = np.array([0.0])
+                cb_cooldown_remaining -= 1
+            else:
+                action, _ = model.predict(obs, deterministic=True)
+
+            obs, reward, terminated, truncated, info = env.gym_step(action)
             done = terminated or truncated
+
+            # Track NAV for circuit breaker
+            nav = info.get('nav', 10000.0)
+            cb_nav_history.append(nav)
+            cb_peak_nav = max(cb_peak_nav, nav)
+            current_drawdown = (cb_peak_nav - nav) / cb_peak_nav
+
+            # Calculate rolling volatility
+            rolling_vol = 0.0
+            if len(cb_nav_history) > 1:
+                nav_array = np.array(cb_nav_history)
+                returns = np.diff(np.log(nav_array))
+                rolling_vol = np.std(returns) if len(returns) > 1 else 0.0
+
+            # Check circuit breaker triggers
+            if cb_cooldown_remaining == 0:
+                vol_trigger = rolling_vol > (baseline_vol * cb_vol_threshold)
+                dd_trigger = current_drawdown > cb_max_drawdown
+                if vol_trigger or dd_trigger:
+                    cb_cooldown_remaining = cb_cooldown_steps
+                    circuit_breaker_count += 1
 
             total_reward += reward
             rewards.append(reward)
-            if 'nav' in info:
-                navs.append(info['nav'])
-            if info.get('circuit_breaker'):
-                circuit_breaker_count += 1
+            navs.append(nav)
 
         # Calculate metrics - SKIP context_rows (warmup period)
         all_rewards = np.array(rewards)
