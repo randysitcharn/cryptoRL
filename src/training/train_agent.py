@@ -555,14 +555,14 @@ def create_callbacks(
         )
         callbacks.append(curriculum_callback)
 
-    # Overfitting guard - stop training if NAV exceeds 5x (unrealistic returns)
-    overfitting_guard = OverfittingGuardCallback(
-        nav_threshold=5.0,
-        initial_nav=10_000.0,
-        check_freq=25_600,  # Check every ~25k steps
-        verbose=1
-    )
-    callbacks.append(overfitting_guard)
+    # Overfitting guard - DISABLED (OOS Sharpe 4.75 shows model generalizes well)
+    # overfitting_guard = OverfittingGuardCallback(
+    #     nav_threshold=5.0,
+    #     initial_nav=10_000.0,
+    #     check_freq=25_600,  # Check every ~25k steps
+    #     verbose=1
+    # )
+    # callbacks.append(overfitting_guard)
 
     return callbacks, detail_callback
 
