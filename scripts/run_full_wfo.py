@@ -627,11 +627,11 @@ class WFOPipeline:
             random_start=False,  # Sequential start for evaluation
         )
 
-        # Circuit Breaker state (inline implementation)
+        # Circuit Breaker state (DISABLED - too aggressive)
         cb_vol_window = 24
-        cb_vol_threshold = 3.0
-        cb_max_drawdown = 0.10
-        cb_cooldown_steps = 12
+        cb_vol_threshold = 999.0  # Effectively disabled
+        cb_max_drawdown = 1.0     # Effectively disabled
+        cb_cooldown_steps = 0
         cb_nav_history = deque(maxlen=cb_vol_window + 1)
         cb_peak_nav = 10000.0
         cb_cooldown_remaining = 0
