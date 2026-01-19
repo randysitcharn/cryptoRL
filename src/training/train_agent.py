@@ -33,6 +33,9 @@ from src.training.callbacks import (
     CurriculumFeesCallback,
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallback,
+    PLOAdaptivePenaltyCallback,
+    PLOChurnCallback,
+    PLOSmoothnessCallback,
 )
 
 
@@ -411,6 +414,55 @@ def create_callbacks(
             verbose=1
         )
         callbacks.append(curriculum_callback)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PLO (Predictive Lagrangian Optimization) Callbacks
+    # Adaptive penalties based on drawdown, churn, and smoothness constraints
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # PLO Drawdown: Increase downside penalty when DD > 10%
+    plo_dd_callback = PLOAdaptivePenaltyCallback(
+        dd_threshold=0.10,
+        dd_lambda_min=1.0,
+        dd_lambda_max=5.0,
+        dd_Kp=2.0,
+        dd_Ki=0.05,
+        dd_Kd=0.3,
+        prediction_horizon=50,
+        use_prediction=True,
+        max_lambda_change=0.05,
+        dd_quantile=0.9,
+        verbose=1
+    )
+    callbacks.append(plo_dd_callback)
+
+    # PLO Churn: Increase churn penalty when turnover > 8%
+    plo_churn_callback = PLOChurnCallback(
+        turnover_threshold=0.08,
+        turnover_lambda_min=1.0,
+        turnover_lambda_max=5.0,
+        turnover_Kp=2.5,
+        turnover_Ki=0.08,
+        turnover_Kd=0.4,
+        use_prediction=True,
+        max_lambda_change=0.08,
+        verbose=1
+    )
+    callbacks.append(plo_churn_callback)
+
+    # PLO Smoothness: Increase smoothness penalty when jerk > 0.40
+    plo_smooth_callback = PLOSmoothnessCallback(
+        jerk_threshold=0.40,
+        jerk_lambda_min=1.0,
+        jerk_lambda_max=5.0,
+        jerk_Kp=3.0,
+        jerk_Ki=0.1,
+        jerk_Kd=0.5,
+        decay_rate=0.99,
+        max_lambda_change=0.1,
+        verbose=1
+    )
+    callbacks.append(plo_smooth_callback)
 
     # Overfitting guard - DISABLED (OOS Sharpe 4.75 shows model generalizes well)
     # overfitting_guard = OverfittingGuardCallback(

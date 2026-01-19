@@ -124,6 +124,15 @@ class BatchCryptoEnv(VecEnv):
         self.curriculum_lambda = 0.0  # Dynamic penalty weight
         self.last_gate_mean = 0.0     # Mean gate opening for logging
 
+        # ═══════════════════════════════════════════════════════════════════
+        # PLO (Predictive Lagrangian Optimization) Multipliers
+        # Each PLO controller adjusts its multiplier based on constraint violations
+        # λ ∈ [1.0, 5.0] where 1.0 = neutral, 5.0 = max penalty
+        # ═══════════════════════════════════════════════════════════════════
+        self.downside_multiplier = 1.0  # PLO Drawdown: scales downside risk penalty
+        self.churn_multiplier = 1.0     # PLO Churn: scales churn penalty
+        self.smooth_multiplier = 1.0    # PLO Smoothness: scales smoothness penalty
+
         # Load and preprocess data
         df = pd.read_parquet(parquet_path)
 
@@ -157,6 +166,11 @@ class BatchCryptoEnv(VecEnv):
         self.n_steps = len(df)
 
         # Define spaces (SB3 requirement)
+        # ═══════════════════════════════════════════════════════════════════
+        # OBSERVATION SPACE with PLO augmentation
+        # Agent MUST see PLO levels for Markov property to hold
+        # Without this, same state + action gives different rewards (non-stationary)
+        # ═══════════════════════════════════════════════════════════════════
         self.observation_space = spaces.Dict({
             "market": spaces.Box(
                 low=-np.inf, high=np.inf,
@@ -167,7 +181,25 @@ class BatchCryptoEnv(VecEnv):
                 low=-1.0, high=1.0,
                 shape=(1,),
                 dtype=np.float32
-            )
+            ),
+            # PLO Drawdown: Risk level (λ_dd normalized to [0, 1])
+            "risk_level": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1,),
+                dtype=np.float32
+            ),
+            # PLO Churn: Churn pressure level (λ_churn normalized to [0, 1])
+            "churn_level": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1,),
+                dtype=np.float32
+            ),
+            # PLO Smoothness: Smoothness pressure level (λ_smooth normalized to [0, 1])
+            "smooth_level": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1,),
+                dtype=np.float32
+            ),
         })
         self.action_space = spaces.Box(
             low=-1.0, high=1.0,
@@ -226,6 +258,14 @@ class BatchCryptoEnv(VecEnv):
 
         # Done flags buffer (for _build_infos optimization)
         self._dones = torch.zeros(n, dtype=torch.bool, device=device)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PLO Smoothness: Jerk tracking buffers
+        # Jerk = |Δpos(t) - Δpos(t-1)| = acceleration of position changes
+        # Must be calculated DURING _calculate_rewards BEFORE updating prev
+        # ═══════════════════════════════════════════════════════════════════
+        self.prev_position_deltas = torch.zeros(n, device=device)
+        self.latest_jerks = torch.zeros(n, device=device)
 
         # Reward component buffers (pour observabilité)
         self._rew_pnl = torch.zeros(n, device=device)
@@ -317,12 +357,17 @@ class BatchCryptoEnv(VecEnv):
         dones: torch.Tensor,
     ) -> torch.Tensor:
         """
-        SOTA Reward: Curriculum-Based Risk & Cost Gating.
+        SOTA Reward: Curriculum-Based Risk & Cost Gating with PLO Multipliers.
 
-        Based on: Moody & Saffell (Direct RL) + AAAI 2024 Curriculum Learning.
+        Based on: Moody & Saffell (Direct RL) + AAAI 2024 Curriculum Learning + PLO (2025).
 
         Formula:
-            reward = log_returns - curriculum_lambda * (churn_penalty + downside_risk)
+            reward = log_returns - curriculum_lambda * (churn_penalty + downside_risk) - smoothness_penalty
+
+        PLO Integration:
+            - downside_risk *= downside_multiplier (PLO Drawdown)
+            - churn_penalty *= churn_multiplier (PLO Churn) with leak minimum
+            - smoothness_penalty *= smooth_multiplier (PLO Smoothness)
 
         Args:
             step_returns: Simple returns (new_nav - old_nav) / old_nav. Shape: (n_envs,)
@@ -334,6 +379,19 @@ class BatchCryptoEnv(VecEnv):
         """
         SCALE = 100.0
         TARGET_PNL = 0.005  # 0.5% threshold for gate
+        MIN_GATE_LEAK = 0.2  # PLO Churn: leak minimum to avoid "Profit Gate Paradox"
+
+        # Safety caps to prevent NaN/explosion
+        DOWNSIDE_PENALTY_CAP = 20.0
+        CHURN_PENALTY_CAP = 15.0
+        SMOOTH_PENALTY_CAP = 10.0
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 0. PLO SMOOTHNESS: Calculate Jerk BEFORE updating prev_position_deltas
+        # CRITICAL: This must happen FIRST to avoid off-by-one bug
+        # ═══════════════════════════════════════════════════════════════════
+        jerks = torch.abs(position_deltas - self.prev_position_deltas)
+        self.latest_jerks = jerks.detach().clone()
 
         # ═══════════════════════════════════════════════════════════════════
         # 1. BASE REWARD: Log Returns (always active)
@@ -342,27 +400,47 @@ class BatchCryptoEnv(VecEnv):
         log_returns = torch.log1p(safe_returns) * SCALE
 
         # ═══════════════════════════════════════════════════════════════════
-        # 2. COMPONENT A: Churn Penalty with Instant Linear Gate
+        # 2. COMPONENT A: Churn Penalty with PLO + Leak Minimum
         # ═══════════════════════════════════════════════════════════════════
-        # Gate: Only penalize churn when THIS step is profitable
-        gate = torch.clamp(step_returns / TARGET_PNL, min=0.0, max=1.0)
+        # Base gate: Only penalize churn when THIS step is profitable
+        base_gate = torch.clamp(step_returns / TARGET_PNL, min=0.0, max=1.0)
 
-        # Store gate mean for logging (before applying to penalty)
-        self.last_gate_mean = gate.mean().item()
+        # Store gate mean for logging (before PLO modification)
+        self.last_gate_mean = base_gate.mean().item()
+
+        # PLO Churn: Leak Minimum to avoid "Profit Gate Paradox"
+        # If PLO is active (λ > 1), force at least some penalty even on losing steps
+        # This prevents agent from ignoring churn_level signal when churning at a loss
+        if self.churn_multiplier > 1.0:
+            plo_intensity = (self.churn_multiplier - 1.0) / 4.0  # [0, 1]
+            min_gate = MIN_GATE_LEAK * plo_intensity  # 0% if λ=1, 20% if λ=5
+            effective_gate = torch.clamp(base_gate, min=min_gate)
+        else:
+            effective_gate = base_gate
 
         # Raw churn cost (aligned with actual transaction fees)
         cost_rate = self.commission + self.slippage
         raw_churn = position_deltas * cost_rate * self._current_churn_coef * SCALE
 
-        # Gated churn: No penalty if step_returns <= 0
-        churn_penalty = raw_churn * gate
+        # Gated churn with PLO multiplier
+        gated_churn = raw_churn * effective_gate
+        plo_churn = gated_churn * self.churn_multiplier
+
+        # Safety clip
+        churn_penalty = torch.clamp(plo_churn, max=CHURN_PENALTY_CAP)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 3. COMPONENT B: Downside Risk (Soft Sortino)
+        # 3. COMPONENT B: Downside Risk with PLO Multiplier (Soft Sortino)
         # ═══════════════════════════════════════════════════════════════════
         # Squared negative returns only (Sortino-style asymmetric risk)
         negative_returns = torch.clamp(step_returns, max=0.0)
-        downside_risk = torch.square(negative_returns) * SCALE * 5.0
+        base_downside = torch.square(negative_returns) * SCALE * self.downside_coef
+
+        # PLO Drawdown: Apply multiplier
+        raw_downside = base_downside * self.downside_multiplier
+
+        # Safety clip to prevent extreme penalties during crashes
+        downside_risk = torch.clamp(raw_downside, max=DOWNSIDE_PENALTY_CAP)
 
         # ═══════════════════════════════════════════════════════════════════
         # 4. CURRICULUM AGGREGATION
@@ -371,9 +449,18 @@ class BatchCryptoEnv(VecEnv):
         total_penalty = self.curriculum_lambda * (churn_penalty + downside_risk)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 5. SMOOTHNESS PENALTY (outside curriculum, always active)
+        # 5. SMOOTHNESS PENALTY with PLO Multiplier
         # ═══════════════════════════════════════════════════════════════════
-        smoothness_penalty = self._current_smooth_coef * (position_deltas ** 2) * SCALE
+        base_smoothness = self._current_smooth_coef * (position_deltas ** 2) * SCALE
+
+        # PLO Smoothness: Apply multiplier
+        raw_smoothness = base_smoothness * self.smooth_multiplier
+
+        # Safety clip
+        safe_smoothness = torch.clamp(raw_smoothness, max=SMOOTH_PENALTY_CAP)
+
+        # Scale by curriculum
+        smoothness_penalty = safe_smoothness * self.curriculum_lambda
 
         # ═══════════════════════════════════════════════════════════════════
         # 6. FINAL REWARD
@@ -387,6 +474,11 @@ class BatchCryptoEnv(VecEnv):
         self._rew_churn = -churn_penalty * self.curriculum_lambda
         self._rew_downside = -downside_risk * self.curriculum_lambda
         self._rew_smooth = -smoothness_penalty
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 8. UPDATE JERK TRACKER (must be AFTER jerk calculation)
+        # ═══════════════════════════════════════════════════════════════════
+        self.prev_position_deltas = position_deltas.clone()
 
         return reward * self.reward_scaling
 
@@ -436,6 +528,10 @@ class BatchCryptoEnv(VecEnv):
         self.peak_navs.fill_(self.initial_balance)
         self.current_drawdowns.zero_()
 
+        # Reset PLO Smoothness jerk tracking
+        self.prev_position_deltas.zero_()
+        self.latest_jerks.zero_()
+
         return self._get_observations()
 
     def _get_observations(self) -> Dict[str, np.ndarray]:
@@ -451,10 +547,44 @@ class BatchCryptoEnv(VecEnv):
         # Position: (n_envs, 1) - NO noise on position (agent's own state)
         position = self.position_pcts.unsqueeze(1)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # PLO OBSERVATION AUGMENTATION
+        # Agent MUST see PLO levels for Value Function to converge
+        # Without this, environment becomes non-stationary (breaks Markov)
+        # Normalization: λ ∈ [1, 5] → level ∈ [0, 1]
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # Risk level (PLO Drawdown λ_dd normalized)
+        risk_level_value = (self.downside_multiplier - 1.0) / 4.0
+        risk_level = torch.full(
+            (self.num_envs, 1),
+            risk_level_value,
+            device=self.device
+        )
+
+        # Churn level (PLO Churn λ_churn normalized)
+        churn_level_value = (self.churn_multiplier - 1.0) / 4.0
+        churn_level = torch.full(
+            (self.num_envs, 1),
+            churn_level_value,
+            device=self.device
+        )
+
+        # Smooth level (PLO Smoothness λ_smooth normalized)
+        smooth_level_value = (self.smooth_multiplier - 1.0) / 4.0
+        smooth_level = torch.full(
+            (self.num_envs, 1),
+            smooth_level_value,
+            device=self.device
+        )
+
         # Transfer to CPU numpy for SB3
         return {
             "market": market.cpu().numpy(),
-            "position": position.cpu().numpy()
+            "position": position.cpu().numpy(),
+            "risk_level": risk_level.cpu().numpy(),
+            "churn_level": churn_level.cpu().numpy(),
+            "smooth_level": smooth_level.cpu().numpy(),
         }
 
     def set_training_mode(self, training: bool):
@@ -638,6 +768,10 @@ class BatchCryptoEnv(VecEnv):
         self.peak_navs[dones] = self.initial_balance
         self.current_drawdowns[dones] = 0.0
 
+        # Reset PLO Smoothness jerk tracking for done envs
+        self.prev_position_deltas[dones] = 0.0
+        self.latest_jerks[dones] = 0.0
+
     def _build_infos(
         self,
         dones: torch.Tensor,
@@ -687,7 +821,19 @@ class BatchCryptoEnv(VecEnv):
         start = step - self.window_size + 1
         market = self.data[start:step+1].cpu().numpy()
         position = np.array([self.position_pcts[idx].item()], dtype=np.float32)
-        return {"market": market, "position": position}
+        
+        # PLO levels (same for all envs, use current multipliers)
+        risk_level = np.array([(self.downside_multiplier - 1.0) / 4.0], dtype=np.float32)
+        churn_level = np.array([(self.churn_multiplier - 1.0) / 4.0], dtype=np.float32)
+        smooth_level = np.array([(self.smooth_multiplier - 1.0) / 4.0], dtype=np.float32)
+        
+        return {
+            "market": market,
+            "position": position,
+            "risk_level": risk_level,
+            "churn_level": churn_level,
+            "smooth_level": smooth_level,
+        }
 
     # =========================================================================
     # Gymnasium-compatible interface (for n_envs=1, evaluation mode)
@@ -841,6 +987,59 @@ class BatchCryptoEnv(VecEnv):
         else:
             # Phase 3: Stability - fixed discipline
             self.curriculum_lambda = 0.4
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PLO (Predictive Lagrangian Optimization) Setters and Properties
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def set_downside_multiplier(self, value: float) -> None:
+        """
+        Setter for PLO Drawdown callback.
+        
+        Clamps value to [1.0, 10.0] for safety.
+        λ=1.0 is neutral, λ=5.0 is typical max, λ=10.0 is hard cap.
+        """
+        self.downside_multiplier = max(1.0, min(value, 10.0))
+
+    def set_churn_multiplier(self, value: float) -> None:
+        """
+        Setter for PLO Churn callback.
+        
+        Clamps value to [1.0, 10.0] for safety.
+        """
+        self.churn_multiplier = max(1.0, min(value, 10.0))
+
+    def set_smooth_multiplier(self, value: float) -> None:
+        """
+        Setter for PLO Smoothness callback.
+        
+        Clamps value to [1.0, 10.0] for safety.
+        """
+        self.smooth_multiplier = max(1.0, min(value, 10.0))
+
+    @property
+    def current_jerks(self) -> torch.Tensor:
+        """
+        Returns jerks calculated during the last step.
+        
+        IMPORTANT (Audit v1.1 fix):
+        - Does NOT calculate jerk here (would always be 0 due to execution order)
+        - Simply reads the buffer filled during _calculate_rewards
+        
+        Returns:
+            Tensor of shape (n_envs,) with jerk values for each env.
+        """
+        return self.latest_jerks
+
+    @property
+    def current_position_deltas(self) -> torch.Tensor:
+        """
+        Returns absolute position deltas for PLO Churn callback.
+        
+        Returns:
+            Tensor of shape (n_envs,) with |Δposition| for each env.
+        """
+        return torch.abs(self.position_pcts - self.prev_position_pcts)
 
     def get_attr(self, attr_name: str, indices=None):
         """Get attribute from envs."""
