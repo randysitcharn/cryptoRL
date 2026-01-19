@@ -65,7 +65,7 @@ class EnvConfig:
 
     # Reward function
     reward_scaling: float = 30.0
-    downside_coef: float = 10.0
+    downside_coef: float = 1.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
     churn_coef: float = 0.0

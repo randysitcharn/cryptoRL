@@ -41,7 +41,7 @@ class TQCTrainingConfig:
     # Reward function (x100 SCALE applied in env.py)
     reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
     # TODO: Monitor for risk paralysis (0 trades). Decrease to 2.0 if needed.
-    downside_coef: float = 10.0
+    downside_coef: float = 1.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
     churn_coef: float = 0.5       # Max target après curriculum (réduit)
