@@ -72,18 +72,19 @@ class WFOConfig:
     tqc_timesteps: int = 90_000_000  # 90M steps
 
     # TQC Hyperparameters
-    learning_rate: float = 3e-4      # Standard TQC
+    learning_rate: float = 1e-4      # Réduit (était 3e-4) - Slow Down & Explore
     buffer_size: int = 2_500_000  # 2.5M replay buffer
     n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
     batch_size: int = 512  # Smaller batch for more frequent updates
     gradient_steps: int = 1  # GS=1 with 1024 envs for max diversity
     gamma: float = 0.95    # Shorter horizon for faster learning
-    ent_coef: Union[str, float] = "auto"  # Auto entropy tuning
+    ent_coef: Union[str, float] = "auto_0.5"  # Boost exploration (était "auto")
     churn_coef: float = 0.5    # Max target après curriculum (réduit)
     smooth_coef: float = 1e-5  # Très bas (curriculum monte à 0.00005 max)
 
     # Regularization (anti-overfitting)
     observation_noise: float = 0.01  # 1% Gaussian noise on market observations
+    critic_dropout: float = 0.1      # 10% dropout (DroQ max) - Slow Down & Explore
 
     # Volatility Scaling (Target Volatility)
     target_volatility: float = 0.05  # 5% target vol
@@ -515,6 +516,7 @@ class WFOPipeline:
         config.churn_coef = self.config.churn_coef
         config.smooth_coef = self.config.smooth_coef
         config.observation_noise = self.config.observation_noise  # Anti-overfitting
+        config.critic_dropout = self.config.critic_dropout  # Régularisation renforcée
         config.target_volatility = self.config.target_volatility
         config.vol_window = self.config.vol_window
         config.max_leverage = self.config.max_leverage
