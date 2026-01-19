@@ -202,7 +202,209 @@ downside_risk = base_downside × downside_multiplier
 
 ---
 
-## 9. Métriques de Performance
+## 9. Dynamic Observation Noise (SOTA 2026)
+
+### Problème
+Le bruit d'observation constant (1%) ne s'adapte pas à la progression du training ni aux conditions de marché.
+
+### Solution : Combinaison de 2 Techniques
+
+#### 1. Noise Annealing (Time-based)
+```python
+annealing_factor = 1.0 - 0.5 * progress  # 100% → 50%
+```
+- **Début** : Fort bruit → exploration robuste
+- **Fin** : Bruit réduit → précision accrue
+- **Référence** : NoisyRollout (2025)
+
+#### 2. Volatility-Adaptive (Regime-based)
+```python
+current_vol = torch.sqrt(ema_vars).clamp(min=1e-6)
+vol_factor = (target_volatility / current_vol).clamp(0.5, 2.0)
+```
+- **Marché calme** : Plus de bruit (risque d'overfitting élevé)
+- **Marché volatile** : Moins de bruit (bruit naturel suffisant)
+- **Innovation** : Propre à CryptoRL
+
+#### Formule Combinée
+```python
+final_scale = observation_noise × annealing_factor × vol_factor
+noise = torch.randn_like(market) × final_scale
+```
+
+| Composante | Effet |
+|------------|-------|
+| `annealing_factor` | Décroissance temporelle [1.0 → 0.5] |
+| `vol_factor` | Adaptation au régime [0.5 → 2.0] |
+
+---
+
+## 10. TQCDropoutPolicy (DroQ + STAC)
+
+### Problème
+Les réseaux TQC standards peuvent surajuster aux données d'entraînement.
+
+### Solution : Dropout + LayerNorm (DroQ-style)
+
+#### Architecture par Couche
+```
+Linear → LayerNorm → ReLU → Dropout
+```
+
+#### Pourquoi LayerNorm est CRITIQUE
+- Sans LayerNorm, le dropout déstabilise l'entraînement en RL
+- LayerNorm normalise les activations après chaque couche
+- **Obligatoire** pour stabilité (DroQ, Hiraoka 2021)
+
+#### Paramètres Recommandés
+| Composant | Dropout Rate | Justification |
+|-----------|--------------|---------------|
+| **Critics** | 0.01 | Estimation Q-value robuste |
+| **Actor** | 0.005 | Régularisation légère (ou 0.0 si gSDE) |
+
+#### Conflit gSDE
+Si `use_sde=True` et `actor_dropout > 0`, le dropout casse la continuité temporelle de gSDE → **Désactiver dropout actor avec gSDE**.
+
+#### Références
+- **DroQ** (Hiraoka 2021) : Dropout remplace gros ensembles de critics
+- **STAC** (2026) : Dropout sur actor aussi
+
+---
+
+## 11. OverfittingGuardCallbackV2 (5 Signaux)
+
+### Problème
+La détection d'overfitting via un seul signal (NAV) est fragile.
+
+### Solution : 5 Signaux Indépendants
+
+| Signal | Détecte | Méthode |
+|--------|---------|---------|
+| **1. NAV Threshold** | Returns irréalistes (+400%) | `max_nav > 5× initial` |
+| **2. Weight Stagnation** | Convergence/collapse | CV des poids < 0.01 |
+| **3. Train/Eval Divergence** | Overfitting classique | `train_rew - eval_rew > 50%` |
+| **4. Action Saturation** | Policy collapse | >80% actions à ±1 |
+| **5. Reward Variance** | Mémorisation | Variance → 0 |
+
+### Logique de Décision
+```python
+STOP si:
+  - Un signal atteint 'patience' violations consécutives (défaut: 3)
+  - OU 2+ signaux actifs simultanément
+```
+
+### Signal 3 : Prérequis
+- Nécessite des **données d'évaluation séparées** temporellement
+- Lit `ep_info_buffer` (train) et `EvalCallback.last_mean_reward` (eval)
+- **Désactivé en mode WFO** (évite data leakage)
+
+### Métriques TensorBoard
+```
+overfit/max_nav_ratio
+overfit/weight_delta, overfit/weight_cv
+overfit/train_eval_divergence
+overfit/action_saturation
+overfit/reward_variance, overfit/reward_cv
+overfit/violations_*, overfit/active_signals
+```
+
+---
+
+## 12. Séparation Données Train/Eval
+
+### Problème : Data Leakage
+Si train et eval partagent les mêmes données, la mesure de généralisation est faussée.
+
+### Solution : Split Temporel Strict + Purge
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DONNÉES HISTORIQUES                          │
+│                                                                 │
+│   ┌───────────────────┐  ┌───────┐  ┌─────────────────────┐    │
+│   │      TRAIN        │  │ PURGE │  │       EVAL          │    │
+│   │     (80%)         │  │ (50h) │  │      (20%)          │    │
+│   │ 2020-01→2023-06   │  │       │  │ 2023-07→2024-12     │    │
+│   └───────────────────┘  └───────┘  └─────────────────────┘    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Purge Window (50h)
+- Les indicateurs techniques (RSI, MACD) utilisent des données passées
+- Sans purge, les features d'Eval contiennent des infos de Train
+- 50h couvre la plupart des lookback d'indicateurs
+
+### Fichiers de Données
+| Fichier | Contenu | Usage |
+|---------|---------|-------|
+| `processed_data.parquet` | 80% historique | Training |
+| `processed_data_eval.parquet` | 20% historique | Évaluation |
+
+### Différences Train vs Eval Env
+| Paramètre | Train | Eval |
+|-----------|-------|------|
+| `random_start` | True | False |
+| `observation_noise` | 0.01 | 0.0 |
+| `curriculum` | Actif | Valeurs finales |
+
+---
+
+## 13. Intégration WFO du Guard (Fail-over)
+
+### Problème
+Sans Guard en WFO, le training peut continuer même si le modèle a divergé.
+
+### Solution : Guard Partiel en WFO
+
+| Signal | Actif en WFO ? | Raison |
+|--------|----------------|--------|
+| 1. NAV | ✅ Oui | Pas de dépendance externe |
+| 2. Weights | ✅ Oui | Lecture poids du modèle |
+| 3. Divergence | ❌ Non | Pas d'EvalCallback |
+| 4. Saturation | ✅ Oui | Lecture actions locales |
+| 5. Variance | ✅ Oui | Lecture rewards locales |
+
+### Politique Fail-over
+
+```
+Guard déclenche l'arrêt
+        │
+        ▼
+┌───────────────────────────────┐
+│ completion_ratio >= 30% ?    │
+│ ET checkpoint valide ?       │
+└───────────────────────────────┘
+        │
+   ┌────┴────┐
+  OUI       NON
+   │         │
+   ▼         ▼
+RECOVERED   FAILED
+(dernier    (stratégie
+checkpoint) de repli)
+```
+
+### Statuts de Segment
+| Statut | Description |
+|--------|-------------|
+| `SUCCESS` | Training complet sans intervention |
+| `RECOVERED` | Arrêt Guard, checkpoint valide utilisé |
+| `FAILED` | Arrêt Guard, pas de checkpoint valide |
+
+### Chain of Inheritance
+Le Segment N+1 hérite des poids du **dernier segment valide** (pas forcément N si N a FAILED).
+
+```
+Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
+         │                   │                      ↑
+         └───────────────────┴──────────────────────┘
+              Segment 2 utilise les poids de Segment 0
+```
+
+---
+
+## 14. Métriques de Performance
 
 ### Trading
 | Métrique | Formule | Cible |
@@ -221,20 +423,22 @@ downside_risk = base_downside × downside_multiplier
 
 ---
 
-## 10. Fichiers Principaux
+## 15. Fichiers Principaux
 
 | Fichier | Rôle | Lignes |
 |---------|------|--------|
 | `scripts/run_full_wfo.py` | Orchestration WFO complète | ~1600 |
-| `src/training/batch_env.py` | Environnement GPU-vectorisé | ~950 |
-| `src/training/callbacks.py` | Curriculum, Logging, Checkpoints | ~500 |
-| `src/training/train_agent.py` | Entraînement TQC | ~800 |
+| `src/training/batch_env.py` | Environnement GPU-vectorisé + Dynamic Noise | ~1200 |
+| `src/training/callbacks.py` | Curriculum, PLO, OverfittingGuardV2 | ~1700 |
+| `src/training/train_agent.py` | Entraînement TQC | ~880 |
+| `src/models/tqc_dropout_policy.py` | TQCDropoutPolicy (DroQ + LayerNorm) | ~420 |
+| `src/models/rl_adapter.py` | FoundationFeatureExtractor | ~330 |
 | `src/data_engineering/features.py` | Feature engineering (FFD, Vol) | ~650 |
-| `src/data_engineering/manager.py` | HMM Regime Detection | ~300 |
+| `scripts/prepare_train_eval_split.py` | Split train/eval avec purge | ~100 |
 
 ---
 
-## 11. Termes Techniques Courants
+## 16. Termes Techniques Courants
 
 | Terme | Définition |
 |-------|------------|
@@ -246,16 +450,23 @@ downside_risk = base_downside × downside_multiplier
 | **Curriculum** | Augmentation progressive de la difficulté |
 | **NAV** | Net Asset Value (valeur du portefeuille) |
 | **Slippage** | Écart entre prix demandé et exécuté |
+| **Annealing** | Réduction progressive d'un paramètre (bruit, learning rate) |
+| **DroQ** | Dropout + LayerNorm pour RL (Hiraoka 2021) |
+| **CV** | Coefficient de Variation = σ/μ (mesure de dispersion relative) |
+| **Purge Window** | Gap temporel entre train et eval pour éviter leakage |
+| **Fail-over** | Stratégie de repli en cas d'échec (checkpoint ou stratégie passive) |
+| **Policy Collapse** | Dégénérescence de la policy (actions bloquées à ±1) |
+| **Weight Stagnation** | Poids du réseau qui ne bougent plus (signe de convergence/collapse) |
 
 ---
 
-## 12. Références Essentielles
+## 17. Références Essentielles
 
 1. **Lopez de Prado (2018)** - "Advances in Financial Machine Learning"
    - Fractional Differentiation, Meta-Labeling, Purged CV
 
 2. **Kuznetsov et al. (2020)** - "TQC: Truncated Quantile Critics"
-   - Algorithme RL utilisé
+   - Algorithme RL principal
 
 3. **Stooke et al. (2020)** - "PID Lagrangian Methods"
    - Base théorique pour PLO
@@ -263,6 +474,21 @@ downside_risk = base_downside × downside_multiplier
 4. **He et al. (2022)** - "Masked Autoencoders Are Scalable Vision Learners"
    - Architecture MAE adaptée aux séries temporelles
 
+5. **Hiraoka et al. (2021)** - "DroQ: Dropout Q-functions"
+   - Dropout + LayerNorm pour régularisation en RL
+
+6. **NoisyRollout (2025)** - arXiv:2504.13055
+   - Noise annealing pour observation noise
+
+7. **GRADSTOP (2025)** - arXiv:2508.19028
+   - Early stopping sans validation set (adapté pour Signal 2)
+
+8. **FineFT (2025)** - arXiv:2512.23773
+   - Détection policy collapse via action saturation (Signal 4)
+
+9. **Sparse-Reg (2025)** - arXiv:2506.17155
+   - Variance rewards comme proxy généralisation (Signal 5)
+
 ---
 
-*Dernière mise à jour : 2026-01-18*
+*Dernière mise à jour : 2026-01-19*

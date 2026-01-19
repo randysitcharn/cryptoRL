@@ -266,6 +266,8 @@ class BatchCryptoEnv(VecEnv):
         # Done flags buffer (for _build_infos optimization)
         self._dones = torch.zeros(n, dtype=torch.bool, device=device)
         self._final_total_trades = None  # Captured before reset for evaluation
+        self._final_navs = None  # Captured before reset for evaluation
+        self._final_positions = None  # Captured before reset for evaluation
 
         # ═══════════════════════════════════════════════════════════════════
         # PLO Smoothness: Jerk tracking buffers
@@ -745,12 +747,16 @@ class BatchCryptoEnv(VecEnv):
         final_ep_rewards = None
         final_ep_lengths = None
         final_total_trades = None
+        final_navs = None
+        final_positions = None
         n_done = 0
         if dones.any():
             n_done = dones.sum().item()
             final_ep_rewards = self.episode_rewards[dones].cpu().numpy()
             final_ep_lengths = self.episode_lengths[dones].cpu().numpy()
             final_total_trades = self.total_trades[dones].cpu().numpy()  # Capture before reset!
+            final_navs = self._get_navs()[dones].cpu().numpy()  # Capture NAV before reset!
+            final_positions = self.position_pcts[dones].cpu().numpy()  # Capture position before reset!
 
         # 14. Auto-reset terminated environments (resets episode tracking)
         if n_done > 0:
@@ -758,6 +764,8 @@ class BatchCryptoEnv(VecEnv):
 
         # Store for _get_single_info (used by gym_step for evaluation)
         self._final_total_trades = final_total_trades
+        self._final_navs = final_navs
+        self._final_positions = final_positions
 
         # 15. Build info dicts (OPTIMIZED: only for done envs)
         infos = self._build_infos(dones, final_ep_rewards, final_ep_lengths)
@@ -959,18 +967,32 @@ class BatchCryptoEnv(VecEnv):
         Returns:
             Info dict with NAV, position, price, and other metrics.
         """
-        navs = self._get_navs()
-        # Use captured total_trades if episode just ended (before reset cleared it)
-        if self._final_total_trades is not None and self._dones[idx]:
-            total_trades = int(self._final_total_trades[0])  # Single env mode
+        # Use captured values if episode just ended (before reset cleared them)
+        if self._dones[idx]:
+            # Episode ended - use values captured BEFORE auto-reset
+            if self._final_navs is not None:
+                nav = float(self._final_navs[0])  # Single env mode
+            else:
+                nav = float(self._get_navs()[idx].item())
+            if self._final_positions is not None:
+                position_pct = float(self._final_positions[0])
+            else:
+                position_pct = float(self.position_pcts[idx].item())
+            if self._final_total_trades is not None:
+                total_trades = int(self._final_total_trades[0])
+            else:
+                total_trades = int(self.total_trades[idx].item())
         else:
+            # Episode ongoing - use current values
+            nav = float(self._get_navs()[idx].item())
+            position_pct = float(self.position_pcts[idx].item())
             total_trades = int(self.total_trades[idx].item())
 
         return {
-            'nav': float(navs[idx].item()),
+            'nav': nav,
             'cash': float(self.cash[idx].item()),
             'position': float(self.positions[idx].item()),
-            'position_pct': float(self.position_pcts[idx].item()),
+            'position_pct': position_pct,
             'price': float(self.prices[self.current_steps[idx]].item()),
             'total_trades': total_trades,
             'total_commission': float(self.total_commissions[idx].item()),
