@@ -361,14 +361,17 @@ class TQCDropoutPolicy(TQCPolicy):
     def make_critic(self, features_extractor: Optional[nn.Module] = None) -> DropoutCritic:
         """
         Crée les critics avec Dropout + LayerNorm.
-        
+
         Override de TQCPolicy.make_critic() pour utiliser DropoutCritic.
-        
+
         Returns:
             DropoutCritic avec n_critics têtes, chacune prédisant n_quantiles
         """
         critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
-        
+
+        # Get features_dim from critic_kwargs (set by TQCPolicy.__init__)
+        features_dim = critic_kwargs.get('features_dim', 512)
+
         # Récupération de l'architecture spécifique au critic
         if self.net_arch is None:
             net_arch = [256, 256]
@@ -378,7 +381,7 @@ class TQCDropoutPolicy(TQCPolicy):
             net_arch = self.net_arch
 
         return DropoutCritic(
-            features_dim=self.features_dim,
+            features_dim=features_dim,
             action_dim=get_action_dim(self.action_space),
             n_critics=self.n_critics,
             n_quantiles=self.n_quantiles,
