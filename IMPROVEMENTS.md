@@ -6,22 +6,27 @@ Liste des améliorations prévues pour le projet, priorisées par importance.
 
 ## P0 - Haute Priorité
 
-### [ ] Short Selling Support
-**Fichier:** `src/training/batch_env.py` (lignes 522-525)
+### [x] Short Selling Support ✅ IMPLÉMENTÉ
 
-**Problème actuel:**
+**Fichier:** `src/training/batch_env.py` (lignes 681-684)
+
+**Statut:** ✅ **IMPLÉMENTÉ** (2026-01-19)
+
+**Implémentation actuelle:**
 ```python
-# Map [-1, 1] to exposure [0, 1]
-target_exposures = (target_positions + 1.0) / 2.0
+# Direct mapping: -1=100% short, 0=cash, +1=100% long
+target_exposures = target_positions
+target_values = old_navs * target_exposures
+target_units = target_values / old_prices
 ```
-Actuellement, action=-1 = 0% (cash), action=1 = 100% long. Pas de positions short.
 
-**Solution proposée:**
-- Mapping symétrique : action=-1 = -100% short, action=0 = cash, action=1 = +100% long
-- Modifier le calcul de NAV pour supporter positions négatives
-- Ajouter paramètre `allow_short: bool = True` pour activer/désactiver
+**Fonctionnalités:**
+- ✅ Mapping symétrique : action=-1 = -100% short, action=0 = cash, action=1 = +100% long
+- ✅ Calcul NAV supporte positions négatives (`cash + positions * prices`)
+- ✅ Action space `[-1, 1]` et position space `[-1, 1]`
+- ✅ Funding rate pour positions short (voir P1 ci-dessous)
 
-**Impact:** Permet à l'agent de profiter des marchés baissiers.
+**Impact:** L'agent peut profiter des marchés baissiers.
 
 ---
 
@@ -46,18 +51,28 @@ Le lambda max est hardcodé à 0.4.
 
 ## P1 - Moyenne Priorité
 
-### [ ] Funding Rate pour Shorts
-**Fichier:** `src/training/batch_env.py`
+### [x] Funding Rate pour Shorts ✅ IMPLÉMENTÉ
 
-**Description:**
-Ajouter un coût de funding réaliste pour les positions short (comme sur les perpetual futures).
+**Fichier:** `src/training/batch_env.py` (lignes 702-706)
 
-**Solution proposée:**
-- Paramètre `funding_rate: float = 0.0001` (0.01% par step, ~0.24%/jour)
-- Appliquer uniquement sur positions négatives
-- Déduire du cash à chaque step
+**Statut:** ✅ **IMPLÉMENTÉ** (2026-01-19)
 
-**Impact:** Rend le short selling plus réaliste et évite l'abus de positions short longue durée.
+**Implémentation actuelle:**
+```python
+# 6b. Apply funding cost for short positions (perpetual futures style)
+if self.funding_rate > 0:
+    short_mask = self.positions < 0
+    funding_cost = torch.abs(self.positions) * old_prices * self.funding_rate
+    self.cash = torch.where(short_mask, self.cash - funding_cost, self.cash)
+```
+
+**Fonctionnalités:**
+- ✅ Paramètre `funding_rate: float = 0.0001` (0.01% par step, ~0.24%/jour)
+- ✅ Appliqué uniquement sur positions négatives (`positions < 0`)
+- ✅ Déduit du cash à chaque step
+- ✅ Configurable via constructeur de `BatchCryptoEnv`
+
+**Impact:** Short selling réaliste avec coût de funding style perpetual futures.
 
 ---
 
@@ -79,64 +94,50 @@ Ajouter un coût de funding réaliste pour les positions short (comme sur les pe
 
 ---
 
-### [ ] Data Augmentation - Volatility-Adaptive Noise
+### [x] Data Augmentation - Dynamic Noise (Annealing + Volatility-Adaptive)
 
 **Fichier:** `src/training/batch_env.py`
+
+**Statut:** ✅ **IMPLÉMENTÉ** (2026-01-19) - Voir `docs/AUDIT_OBSERVATION_NOISE.md`
 
 **Problème actuel:**
 ```python
 noise = torch.randn_like(market) * self.observation_noise  # Bruit fixe à 1%
 ```
-Le bruit est constant quelle que soit la volatilité du marché.
+Le bruit est constant quelle que soit la volatilité du marché et la progression du training.
 
-**Solution proposée:**
+**Solution approuvée (combinée):**
 ```python
-volatility = torch.sqrt(self.ema_vars)  # Vol courante (déjà calculée)
-noise_scale = self.observation_noise * (self.target_volatility / volatility)
-noise = torch.randn_like(market) * noise_scale.unsqueeze(1).unsqueeze(2)
+if self.observation_noise > 0 and self.training:
+    # 1. ANNEALING (Time-based) - Standard NoisyRollout 2025
+    annealing_factor = 1.0 - 0.5 * self.progress
+    
+    # 2. ADAPTIVE (Regime-based) - Innovation CryptoRL
+    current_vol = torch.sqrt(self.ema_vars).clamp(min=1e-6)
+    target_vol = getattr(self, 'target_volatility', 0.015)
+    vol_factor = (target_vol / current_vol).clamp(0.5, 2.0)  # CRITIQUE: garde-fous
+    
+    # 3. INJECTION COMBINÉE
+    final_scale = self.observation_noise * annealing_factor * vol_factor
+    noise = torch.randn_like(market) * final_scale.unsqueeze(1).unsqueeze(2)
+    market = market + noise
 ```
 
-**Intuition:** Plus de bruit en marché calme (où l'overfitting est facile), moins en marché volatile (déjà bruité naturellement).
+**Intuition:** 
+- Annealing: Exploration forte au début, précision à la fin (standard industriel)
+- Volatility-Adaptive: Plus de bruit en marché calme, moins en marché volatile
 
-**Impact:** Meilleure généralisation sans détruire le signal en période volatile.
-
----
-
-### [ ] Data Augmentation - Feature-Specific Noise
-
-**Fichier:** `src/training/batch_env.py`
-
-**Problème actuel:**
-Le même niveau de bruit est appliqué à toutes les features, mais certaines sont plus sensibles que d'autres.
-
-**Solution proposée:**
-```python
-noise_scales = {
-    'price_features': 0.005,   # 0.5% - Très sensible
-    'volume_features': 0.02,   # 2% - Plus tolérant
-    'momentum_features': 0.01, # 1% - Modéré
-    'regime_probs': 0.0        # 0% - Sortie de modèle, pas de bruit
-}
-```
-
-**Impact:** Préserve les features sensibles tout en régularisant les autres.
+**Impact:** Meilleure généralisation, convergence plus stable.
 
 ---
 
 ## P2 - Basse Priorité
 
-### [ ] Observation Noise Adaptive
-**Fichier:** `src/training/batch_env.py`
+### [x] ~~Observation Noise Adaptive~~ (Fusionné dans P1)
 
-**Description:**
-Réduire le bruit d'observation progressivement pendant le training (curriculum-style).
+**Statut:** ✅ **FUSIONNÉ** dans "Dynamic Noise" (P1) - Voir audit 2026-01-19
 
-**Solution proposée:**
-- Début: `observation_noise = 0.02` (2%)
-- Fin: `observation_noise = 0.005` (0.5%)
-- Décroissance linéaire basée sur `progress`
-
-**Impact:** Exploration forte au début, précision à la fin.
+L'annealing fait maintenant partie de la solution combinée approuvée.
 
 ---
 
@@ -231,6 +232,78 @@ Entraîner plusieurs HMM sur différents timeframes pour capturer les régimes �
 
 ---
 
+### [ ] A/B Testing: gSDE vs Actor Noise
+**Fichier:** `src/training/train_agent.py`, configuration TQC
+
+**Description:**
+Comparer deux approches d'exploration pour TQC:
+1. **gSDE (generalized State-Dependent Exploration):** Bruit dans l'espace des paramètres, corrélé au state
+2. **Actor Noise (OrnsteinUhlenbeckActionNoise):** Bruit sur les actions, indépendant du state
+
+**Protocole A/B proposé:**
+```python
+# Config A: gSDE (actuel)
+policy_kwargs = dict(use_sde=True, log_std_init=-2.0)
+
+# Config B: Actor Noise (alternative)
+from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
+action_noise = OrnsteinUhlenbeckActionNoise(
+    mean=np.zeros(action_dim),
+    sigma=0.1 * np.ones(action_dim),
+    theta=0.15
+)
+policy_kwargs = dict(use_sde=False)
+```
+
+**Métriques à comparer:**
+- Sharpe OOS (Walk-Forward)
+- Max Drawdown
+- Stabilité inter-folds
+- Convergence speed (timesteps to plateau)
+- Action smoothness (churn)
+
+**Hypothèses:**
+- gSDE devrait mieux généraliser (exploration state-dependent)
+- Actor noise pourrait être plus stable en début de training
+- Trade-off exploration/exploitation peut différer selon le régime de marché
+
+**Impact:** Identifier la meilleure stratégie d'exploration pour le trading RL, potentiellement améliorer la performance OOS.
+
+---
+
+## Propositions REJETÉES (Audit 2026-01-19)
+
+Les propositions suivantes ont été évaluées et rejetées lors de l'audit. Voir `docs/AUDIT_OBSERVATION_NOISE.md` pour les justifications complètes.
+
+### [x] ~~Feature-Specific Noise~~ 🔴 REJETÉ
+
+**Raison:** Complexité de maintenance trop élevée pour gain marginal.
+
+**Détails:**
+- Mapping features → groupes fragile et difficile à maintenir
+- Valeurs (0.5%, 2%, 1%, 0%) purement heuristiques sans validation
+- Couplage fort avec pipeline de features
+- ROI insuffisant : +5% estimé vs. effort permanent
+
+**Alternative:** Reporter après validation des techniques approuvées (Dynamic Noise).
+
+---
+
+### [x] ~~SNI (Selective Noise Injection)~~ 🔴 REJETÉ
+
+**Raison:** Changement architectural trop profond, hors scope.
+
+**Détails:**
+- Nécessite modification du forward pass ou architecture dual-path
+- Impact sur toute la chaîne d'entraînement (TQC, callbacks)
+- Paper original (NeurIPS 2024) testé sur CoinRun, pas finance
+- Risque de régression élevé
+- Effort : 1+ jour vs. quelques heures pour solutions approuvées
+
+**Alternative:** Créer ticket de recherche pour évaluation future.
+
+---
+
 ## Data Augmentation - Techniques à ÉVITER
 
 | Technique | Pourquoi l'éviter |
@@ -252,4 +325,6 @@ Entraîner plusieurs HMM sur différents timeframes pour capturer les régimes �
 
 ---
 
-*Dernière mise à jour: 2026-01-18*
+*Dernière mise à jour: 2026-01-19*
+*Audit Observation Noise: 2026-01-19 - Voir `docs/AUDIT_OBSERVATION_NOISE.md`*
+*Mise à jour Short Selling + Funding Rate: 2026-01-19 - Marqués comme implémentés*

@@ -17,13 +17,23 @@ try:
     from src.models.transformer_policy import TransformerFeatureExtractor
     from src.models.rl_adapter import FoundationFeatureExtractor
     from src.models.callbacks import TensorBoardStepCallback
+    from src.models.tqc_dropout_policy import (
+        TQCDropoutPolicy,
+        DropoutActor,
+        DropoutCritic,
+        create_mlp_with_dropout,
+    )
 
     __all__.extend([
         'create_tqc_agent',
         'create_agent',
         'TransformerFeatureExtractor',
         'FoundationFeatureExtractor',
-        'TensorBoardStepCallback'
+        'TensorBoardStepCallback',
+        'TQCDropoutPolicy',
+        'DropoutActor',
+        'DropoutCritic',
+        'create_mlp_with_dropout',
     ])
 except ImportError:
     pass  # sb3_contrib not installed

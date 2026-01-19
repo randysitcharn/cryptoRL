@@ -110,6 +110,24 @@ class WFOConfig:
         'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
     ])
 
+    # === Overfitting Guard (Protection intra-train) ===
+    use_overfitting_guard: bool = True
+    guard_nav_threshold: float = 10.0       # 10x (plus permissif pour WFO long)
+    guard_patience: int = 5                 # Patience accrue en WFO
+    guard_check_freq: int = 25_000          # ~6 semaines de données
+    guard_action_saturation: float = 0.95   # 95% saturation = policy collapse
+    guard_reward_variance: float = 1e-5     # Seuil minimal de variance
+
+    # === Fail-over Strategy (Gestion des échecs) ===
+    use_checkpoint_on_failure: bool = True  # Tenter recovery via checkpoint
+    min_completion_ratio: float = 0.30      # Min 30% du training pour recovery
+    fallback_strategy: str = 'flat'         # 'flat' ou 'buy_and_hold'
+
+    # === Chain of Inheritance (Continuité WFO) ===
+    use_warm_start: bool = True             # Hériter poids du segment précédent
+    pretrained_model_path: Optional[str] = None  # Modèle de départ pour Seg 0
+    cleanup_failed_checkpoints: bool = True # Supprimer checkpoints des segments FAILED
+
     @property
     def train_rows(self) -> int:
         return self.train_months * self.hours_per_month
@@ -460,7 +478,8 @@ class WFOPipeline:
         encoder_path: str,
         segment_id: int,
         use_batch_env: bool = False,
-        resume: bool = False
+        resume: bool = False,
+        init_model_path: Optional[str] = None
     ) -> tuple[str, Dict[str, Any]]:
         """
         Train TQC agent on segment train data.
@@ -471,6 +490,7 @@ class WFOPipeline:
             segment_id: Segment identifier.
             use_batch_env: If True, use GPU-accelerated BatchCryptoEnv.
             resume: If True, resume from tqc_last.zip (continues TensorBoard steps).
+            init_model_path: Path to model for warm start (Chain of Inheritance).
 
         Returns:
             Tuple of (path to saved agent, training metrics dict).
@@ -502,6 +522,16 @@ class WFOPipeline:
         # 3-Phase Curriculum: Discovery → Discipline → Refinement (Gemini 2026-01-13)
         config.use_curriculum = True
 
+        # === Overfitting Guard V2 (WFO mode) ===
+        if self.config.use_overfitting_guard:
+            config.use_overfitting_guard = True
+            config.guard_nav_threshold = self.config.guard_nav_threshold
+            config.guard_patience = self.config.guard_patience
+            config.guard_check_freq = self.config.guard_check_freq
+            config.guard_action_saturation = self.config.guard_action_saturation
+            config.guard_reward_variance = self.config.guard_reward_variance
+            print(f"  [Guard] OverfittingGuardV2 enabled (NAV>{self.config.guard_nav_threshold}x, patience={self.config.guard_patience})")
+
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
         config.save_path = os.path.join(weights_dir, "tqc.zip")
@@ -524,7 +554,10 @@ class WFOPipeline:
             'batch_size': self.config.batch_size
         } if use_batch_env else None
 
-        # Resume logic: use tqc_last.zip if --resume flag is set
+        # Resume logic: Priority order:
+        # 1. --resume flag: use tqc_last.zip (continue training)
+        # 2. init_model_path: warm start from previous segment (Chain of Inheritance)
+        # 3. Fresh start (no model loaded)
         resume_path = None
         if resume:
             tqc_last_path = os.path.join(weights_dir, "tqc_last.zip")
@@ -533,6 +566,10 @@ class WFOPipeline:
                 print(f"  🔄 RESUME MODE: Loading from {tqc_last_path}")
             else:
                 print(f"  ⚠️ Resume requested but {tqc_last_path} not found. Starting fresh.")
+        elif init_model_path and os.path.exists(init_model_path):
+            # Chain of Inheritance: warm start from previous segment's model
+            resume_path = init_model_path
+            print(f"  🔗 WARM START: Inheriting from {os.path.basename(init_model_path)}")
 
         model = None
         try:
@@ -851,7 +888,8 @@ class WFOPipeline:
         df_raw: pd.DataFrame,
         segment: Dict[str, int],
         use_batch_env: bool = False,
-        resume: bool = False
+        resume: bool = False,
+        init_model_path: Optional[str] = None
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """
         Run full WFO pipeline for a single segment.
@@ -861,6 +899,7 @@ class WFOPipeline:
             segment: Segment boundaries dict.
             use_batch_env: If True, use GPU-accelerated BatchCryptoEnv for TQC.
             resume: If True, resume TQC training from tqc_last.zip.
+            init_model_path: Path to model for warm start (Chain of Inheritance).
 
         Returns:
             Tuple of (metrics dict, train_metrics dict) for this segment.
@@ -918,12 +957,64 @@ class WFOPipeline:
             print(f"[EXEC] Training MAE Foundation Model for Segment {segment_id}...")
             encoder_path = self.train_mae(train_path, segment_id)
 
-        # 5. TQC Training
+        # 5. TQC Training (with Chain of Inheritance support)
         tqc_path, train_metrics = self.train_tqc(
             train_path, encoder_path, segment_id,
             use_batch_env=use_batch_env,
-            resume=resume
+            resume=resume,
+            init_model_path=init_model_path
         )
+
+        # === 5.5 Guard Fail-over Logic ===
+        guard_triggered = train_metrics.get('guard_early_stop', False)
+        completion_ratio = train_metrics.get('completion_ratio', 1.0)
+        stop_reason = train_metrics.get('guard_stop_reason', None)
+
+        if guard_triggered:
+            print(f"\n  ⚠️ GUARD INTERVENTION on Segment {segment_id}")
+            print(f"     Reason: {stop_reason}")
+            print(f"     Completion: {completion_ratio:.1%}")
+
+            # Chercher le dernier checkpoint valide
+            last_ckpt = self._find_last_valid_checkpoint(segment_id)
+            can_recover = (
+                last_ckpt is not None
+                and self.config.use_checkpoint_on_failure
+                and completion_ratio >= self.config.min_completion_ratio
+            )
+
+            if can_recover:
+                # RECOVERY: Utiliser le checkpoint
+                print(f"  → 🚑 RECOVERY: Using checkpoint {os.path.basename(last_ckpt)}")
+                from sb3_contrib import TQC
+                recovered_model = TQC.load(last_ckpt)
+                # Sauvegarder comme modèle officiel
+                recovered_model.save(os.path.join(weights_dir, "tqc.zip"))
+                del recovered_model
+                train_metrics['segment_status'] = 'RECOVERED'
+                train_metrics['used_checkpoint'] = os.path.basename(last_ckpt)
+            else:
+                # FAILED: Utiliser stratégie de repli
+                reason = f"ratio {completion_ratio:.1%} < {self.config.min_completion_ratio:.0%}" if last_ckpt else "no checkpoint"
+                print(f"  → 💀 FAILED: Cannot recover ({reason})")
+                print(f"     Using fallback strategy: '{self.config.fallback_strategy}'")
+                train_metrics['segment_status'] = 'FAILED'
+                train_metrics['fallback_strategy'] = self.config.fallback_strategy
+
+                # Générer métriques de fallback (sans utiliser le modèle)
+                fallback_metrics = self._run_fallback_strategy(segment, test_path)
+                fallback_metrics['segment_id'] = segment_id
+                fallback_metrics['model_type'] = 'fallback'
+                fallback_metrics['segment_status'] = 'FAILED'
+                fallback_metrics['stop_reason'] = stop_reason
+                fallback_metrics['completion_ratio'] = completion_ratio
+
+                # Sauvegarder les résultats
+                self.save_results(fallback_metrics)
+
+                return fallback_metrics, train_metrics
+        else:
+            train_metrics['segment_status'] = 'SUCCESS'
 
         # 6. Organize Artifacts (Swap & Archive) - BEFORE evaluation
         # This ensures tqc.zip=Best and tqc_last.zip=Last exist on disk
@@ -956,8 +1047,11 @@ class WFOPipeline:
                 train_path=train_path
             )
 
-            # Tag results
+            # Tag results with model type and segment status
             metrics['model_type'] = model_type
+            metrics['segment_status'] = train_metrics.get('segment_status', 'SUCCESS')
+            metrics['stop_reason'] = train_metrics.get('guard_stop_reason', None)
+            metrics['completion_ratio'] = train_metrics.get('completion_ratio', 1.0)
 
             # Generate diagnostic plots with prefix
             plot_path = self.generate_segment_plots(
@@ -1042,6 +1136,150 @@ class WFOPipeline:
             print(f"  [CLEANUP] Total freed segment {segment_id}: {freed_bytes / 1024 / 1024:.1f} MB")
 
         return freed_bytes
+
+    def _find_last_valid_checkpoint(self, segment_id: int) -> Optional[str]:
+        """
+        Find the last valid checkpoint for a segment.
+
+        Looks for .zip files in the checkpoints directory and returns
+        the most recently modified one.
+
+        Args:
+            segment_id: Segment identifier.
+
+        Returns:
+            Path to the last checkpoint, or None if not found.
+        """
+        import glob
+
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        ckpt_dir = os.path.join(weights_dir, "checkpoints")
+
+        if not os.path.exists(ckpt_dir):
+            return None
+
+        # Find all .zip checkpoint files
+        checkpoints = glob.glob(os.path.join(ckpt_dir, "*.zip"))
+        if not checkpoints:
+            return None
+
+        # Return the most recently modified
+        return max(checkpoints, key=os.path.getmtime)
+
+    def _run_fallback_strategy(self, segment: Dict[str, int], test_path: str) -> Dict[str, Any]:
+        """
+        Execute a fallback strategy for FAILED segments.
+
+        Args:
+            segment: Segment boundaries dict.
+            test_path: Path to test data parquet.
+
+        Returns:
+            Metrics dict for the fallback strategy.
+        """
+        strategy = self.config.fallback_strategy
+
+        if strategy == 'flat':
+            # Flat = No trading = 0 returns
+            return {
+                'sharpe': 0.0,
+                'total_return': 0.0,
+                'pnl': 0.0,
+                'pnl_pct': 0.0,
+                'max_drawdown': 0.0,
+                'total_trades': 0,
+                'strategy': 'FLAT (fallback)',
+                'is_fallback': True,
+                'bnh_pct': 0.0,  # Will be calculated below
+                'alpha': 0.0,
+            }
+
+        elif strategy == 'buy_and_hold':
+            # Calculate B&H return on TEST period
+            test_df = pd.read_parquet(test_path)
+            prices = test_df['BTC_Close'].values
+
+            if len(prices) > 1:
+                start_price = prices[0]
+                end_price = prices[-1]
+                bnh_return = (end_price - start_price) / start_price
+                bnh_pct = bnh_return * 100
+
+                # Simple drawdown calculation
+                cummax = np.maximum.accumulate(prices)
+                drawdowns = (cummax - prices) / cummax
+                max_dd = np.max(drawdowns) * 100
+            else:
+                bnh_return = 0.0
+                bnh_pct = 0.0
+                max_dd = 0.0
+
+            return {
+                'sharpe': 0.0,  # Not calculated for simple B&H
+                'total_return': bnh_return,
+                'pnl': bnh_return * 10000,  # Assuming 10k initial
+                'pnl_pct': bnh_pct,
+                'max_drawdown': max_dd,
+                'total_trades': 0,
+                'strategy': 'BUY_AND_HOLD (fallback)',
+                'is_fallback': True,
+                'bnh_pct': bnh_pct,
+                'alpha': 0.0,  # B&H has no alpha vs itself
+            }
+
+        else:
+            raise ValueError(f"Unknown fallback strategy: {strategy}")
+
+    def _cleanup_failed_segment_checkpoints(self, segment_id: int) -> int:
+        """
+        Remove checkpoints from a FAILED segment to save disk space.
+
+        Checkpoints from failed segments are potentially corrupted or
+        in an unstable state and should not be reused.
+
+        Args:
+            segment_id: Segment identifier.
+
+        Returns:
+            Number of bytes freed.
+        """
+        import glob
+
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        ckpt_dir = os.path.join(weights_dir, "checkpoints")
+
+        if not os.path.exists(ckpt_dir):
+            return 0
+
+        freed_bytes = 0
+        checkpoints = glob.glob(os.path.join(ckpt_dir, "*.zip"))
+
+        for ckpt in checkpoints:
+            try:
+                size = os.path.getsize(ckpt)
+                os.remove(ckpt)
+                freed_bytes += size
+                print(f"  🗑️ Removed failed checkpoint: {os.path.basename(ckpt)}")
+            except OSError as e:
+                print(f"  [WARNING] Could not remove {ckpt}: {e}")
+
+        if freed_bytes > 0:
+            print(f"  [CLEANUP] Freed {freed_bytes / 1024 / 1024:.1f} MB from failed segment {segment_id}")
+
+        return freed_bytes
+
+    def _get_segment_model_path(self, segment_id: int) -> str:
+        """
+        Get the path to the final model for a segment.
+
+        Args:
+            segment_id: Segment identifier.
+
+        Returns:
+            Path to the segment's final model (tqc.zip).
+        """
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        return os.path.join(weights_dir, "tqc.zip")
 
     def _print_teacher_report(self, train_metrics: Dict[str, Any], segment_id: int):
         """Print hyperparameter diagnostic hints based on training metrics."""
@@ -1330,16 +1568,66 @@ class WFOPipeline:
 
         print(f"Running segments: {[s['id'] for s in segments]}")
 
+        # === Chain of Inheritance Configuration ===
+        if self.config.use_warm_start:
+            print(f"\n[Chain of Inheritance] Enabled")
+            print(f"  Pretrained model: {self.config.pretrained_model_path or 'None (cold start for Seg 0)'}")
+        else:
+            print(f"\n[Chain of Inheritance] Disabled (cold start for each segment)")
+
+        # Track the last successful model for inheritance (Rollback logic)
+        last_successful_model_path = self.config.pretrained_model_path
+
         # Run each segment
         all_metrics = []
+        all_train_info = []  # Track train info for summary
+        
         for segment in segments:
+            segment_id = segment['id']
+            
+            # === Determine init_model_path for this segment ===
+            init_model_path = None
+            if self.config.use_warm_start:
+                if segment_id == 0:
+                    init_model_path = self.config.pretrained_model_path
+                    if init_model_path:
+                        print(f"\n[Chain] Segment 0: Using pretrained model")
+                    else:
+                        print(f"\n[Chain] Segment 0: Cold start (no pretrained model)")
+                else:
+                    if last_successful_model_path and os.path.exists(last_successful_model_path):
+                        init_model_path = last_successful_model_path
+                        print(f"\n[Chain] Segment {segment_id}: Inheriting from {os.path.basename(last_successful_model_path)}")
+                    else:
+                        print(f"\n[Chain] Segment {segment_id}: Cold start (no valid previous model)")
+            
             try:
                 metrics, train_metrics = self.run_segment(
                     df_raw, segment,
                     use_batch_env=self.config.use_batch_env,
-                    resume=self.config.resume
+                    resume=self.config.resume,
+                    init_model_path=init_model_path
                 )
                 all_metrics.append(metrics)
+                all_train_info.append(train_metrics)
+                
+                # === Update Chain of Inheritance based on segment status ===
+                status = train_metrics.get('segment_status', 'SUCCESS')
+                
+                if status in ['SUCCESS', 'RECOVERED']:
+                    # This segment produced a valid model -> update chain
+                    current_model_path = self._get_segment_model_path(segment_id)
+                    if os.path.exists(current_model_path):
+                        last_successful_model_path = current_model_path
+                        print(f"  ✅ Chain updated: Segment {segment_id} model is now the inheritance source")
+                    else:
+                        print(f"  ⚠️ Warning: Status is {status} but model file not found")
+                else:
+                    # FAILED: Do NOT update chain, cleanup checkpoints
+                    print(f"  ⛔ Chain NOT updated (Segment {segment_id} FAILED)")
+                    if self.config.cleanup_failed_checkpoints:
+                        self._cleanup_failed_segment_checkpoints(segment_id)
+
                 # Note: save_results is now called inside run_segment for each model type
 
                 # GATE: Disabled - let WFO run all segments regardless of segment 0 performance
@@ -1391,6 +1679,27 @@ class WFOPipeline:
             print(f"Average Sharpe: {df_results['sharpe'].mean():.2f}")
             print(f"Average PnL: {df_results['pnl_pct'].mean():+.2f}%")
             print(f"Average Max DD: {df_results['max_drawdown'].mean():.2f}%")
+            
+            # === Segment Status Summary ===
+            if all_train_info:
+                statuses = [t.get('segment_status', 'UNKNOWN') for t in all_train_info]
+                n_success = statuses.count('SUCCESS')
+                n_recovered = statuses.count('RECOVERED')
+                n_failed = statuses.count('FAILED')
+                
+                print(f"\n[Segment Status]")
+                print(f"  SUCCESS:   {n_success}")
+                print(f"  RECOVERED: {n_recovered}")
+                print(f"  FAILED:    {n_failed}")
+                
+                # Calculate Sharpe excluding failed segments
+                if n_failed > 0 and 'is_fallback' in df_results.columns:
+                    df_valid = df_results[~df_results.get('is_fallback', False).fillna(False)]
+                    if len(df_valid) > 0:
+                        print(f"\n[Excluding Failed Segments]")
+                        print(f"  Average Sharpe: {df_valid['sharpe'].mean():.2f}")
+                        print(f"  Average PnL: {df_valid['pnl_pct'].mean():+.2f}%")
+            
             print(f"\nResults saved to: {self.config.results_path}")
 
         print(f"\nEnd time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1550,6 +1859,28 @@ def main():
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from tqc_last.zip (continues TensorBoard steps)")
 
+    # === Overfitting Guard Arguments ===
+    parser.add_argument("--no-overfitting-guard", action="store_true",
+                        help="Disable OverfittingGuardCallbackV2 (not recommended)")
+    parser.add_argument("--guard-nav-threshold", type=float, default=10.0,
+                        help="NAV multiplier threshold for Guard (default: 10.0)")
+    parser.add_argument("--guard-patience", type=int, default=5,
+                        help="Consecutive violations before Guard stops (default: 5)")
+    parser.add_argument("--guard-check-freq", type=int, default=25_000,
+                        help="Guard check frequency in steps (default: 25000)")
+
+    # === Fail-over Strategy Arguments ===
+    parser.add_argument("--fallback-strategy", type=str, choices=['flat', 'buy_and_hold'],
+                        default='flat', help="Strategy for FAILED segments (default: flat)")
+    parser.add_argument("--min-completion-ratio", type=float, default=0.30,
+                        help="Min training completion for recovery (default: 0.30)")
+
+    # === Chain of Inheritance Arguments ===
+    parser.add_argument("--no-warm-start", action="store_true",
+                        help="Disable warm start (cold start each segment)")
+    parser.add_argument("--pretrained-model", type=str, default=None,
+                        help="Path to pretrained model for Segment 0")
+
     args = parser.parse_args()
 
     # Create config
@@ -1572,6 +1903,34 @@ def main():
     if args.resume:
         print("[INFO] RESUME MODE: Will continue from tqc_last.zip (TensorBoard continues)")
         config.resume = True
+
+    # === Overfitting Guard Configuration ===
+    if args.no_overfitting_guard:
+        print("[WARNING] OverfittingGuardCallbackV2 DISABLED via --no-overfitting-guard")
+        config.use_overfitting_guard = False
+    else:
+        config.use_overfitting_guard = True
+        config.guard_nav_threshold = args.guard_nav_threshold
+        config.guard_patience = args.guard_patience
+        config.guard_check_freq = args.guard_check_freq
+
+    # === Fail-over Strategy Configuration ===
+    config.fallback_strategy = args.fallback_strategy
+    config.min_completion_ratio = args.min_completion_ratio
+
+    # === Chain of Inheritance Configuration ===
+    if args.no_warm_start:
+        print("[INFO] Warm start DISABLED: Each segment starts from scratch")
+        config.use_warm_start = False
+    else:
+        config.use_warm_start = True
+    
+    if args.pretrained_model:
+        if os.path.exists(args.pretrained_model):
+            config.pretrained_model_path = args.pretrained_model
+            print(f"[INFO] Pretrained model for Segment 0: {args.pretrained_model}")
+        else:
+            print(f"[WARNING] Pretrained model not found: {args.pretrained_model}")
 
     # Create pipeline
     pipeline = WFOPipeline(config)

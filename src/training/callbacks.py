@@ -12,6 +12,7 @@ Provides all training-related callbacks:
 import os
 import time
 import numpy as np
+from collections import deque
 from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
@@ -648,6 +649,10 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         real_env = get_underlying_batch_env(self.model.env)
         if hasattr(real_env, 'curriculum_lambda'):
             self.logger.record("curriculum/lambda", real_env.curriculum_lambda)
+        
+        # Log Dynamic Noise effective scale (Audit 2026-01-19)
+        if hasattr(real_env, '_last_noise_scale'):
+            self.logger.record("observation_noise/effective_scale", real_env._last_noise_scale)
 
         return True
 
@@ -1308,3 +1313,459 @@ class PLOSmoothnessCallback(BaseCallback):
             print(f"  Lambda range: [{self.jerk_lambda_min}, {self.jerk_lambda_max}]")
             print(f"  PID gains: Kp={self.jerk_Kp}, Ki={self.jerk_Ki}, Kd={self.jerk_Kd}")
             print(f"  No prediction (jerk is instantaneous)")
+
+
+# ============================================================================
+# Overfitting Guard Callback V2 (SOTA Multi-Signal Detection)
+# ============================================================================
+
+class OverfittingGuardCallbackV2(BaseCallback):
+    """
+    SOTA Overfitting Detection for RL Trading.
+
+    Version 2.3 - Production Release (Post-Audit):
+    - Signal 2: Weight Stagnation (replaces Gradient Variance - not accessible in SB3)
+    - Signal 3: Train/Eval divergence via ep_info_buffer + EvalCallback (NOT logger)
+    - Signal 5: Raw rewards + CV (handles VecNormalize bias)
+
+    Combines 5 independent detection signals:
+    1. NAV threshold - Unrealistic returns detection
+    2. Weight stagnation (GRADSTOP adapted) - Convergence/collapse detection
+    3. Train/Eval divergence - Classic overfitting signal (via buffers)
+    4. Action saturation - Policy collapse detection
+    5. Reward variance - Memorization detection
+
+    Decision Logic:
+    - Stop if any signal reaches 'patience' consecutive violations
+    - Stop if 2+ signals are active simultaneously
+
+    References:
+    [1] GRADSTOP (arXiv:2508.19028) - adapted for SB3 constraints
+    [2] FineFT (arXiv:2512.23773) - action saturation
+    [3] Sparse-Reg (arXiv:2506.17155) - reward variance
+    [4] Walk-Forward (arXiv:2512.12924) - train/eval divergence
+
+    Audit Fixes:
+    - v2.2: Memory leak fix (deque), raw rewards via infos
+    - v2.3: "Logger Trap" fix - reads ep_info_buffer + EvalCallback.last_mean_reward
+    """
+
+    def __init__(
+        self,
+        # === Signal 1: NAV Threshold ===
+        nav_threshold: float = 5.0,
+        initial_nav: float = 10_000.0,
+
+        # === Signal 2: Weight Stagnation (v2.1) ===
+        weight_delta_threshold: float = 1e-7,
+        cv_threshold: float = 0.01,
+
+        # === Signal 3: Train/Eval Divergence (v2.3: via buffers) ===
+        divergence_threshold: float = 0.5,
+        eval_callback: Optional[EvalCallback] = None,
+
+        # === Signal 4: Action Saturation ===
+        action_saturation_threshold: float = 0.95,
+        saturation_ratio_limit: float = 0.8,
+
+        # === Signal 5: Reward Variance ===
+        reward_variance_threshold: float = 1e-4,
+        reward_window: int = 1000,
+
+        # === Decision Logic ===
+        check_freq: int = 10_000,
+        patience: int = 3,
+
+        # === Logging ===
+        verbose: int = 1
+    ):
+        """
+        Initialize OverfittingGuardCallbackV2.
+
+        Args:
+            nav_threshold: NAV multiplier to trigger stop (5.0 = +400%)
+            initial_nav: Starting portfolio value
+            weight_delta_threshold: Min weight change to consider "learning"
+            cv_threshold: Coefficient of Variation threshold for stagnation
+            divergence_threshold: Train/Eval reward ratio to trigger (0.5 = 50% better)
+            eval_callback: EvalCallback instance for Signal 3 (optional but recommended)
+            action_saturation_threshold: |action| above this is "saturated"
+            saturation_ratio_limit: Fraction of saturated actions to trigger
+            reward_variance_threshold: Min variance to consider "adaptive"
+            reward_window: Window size for reward statistics
+            check_freq: How often to check signals (in timesteps)
+            patience: Consecutive violations before stopping
+            verbose: Verbosity level
+        """
+        super().__init__(verbose)
+
+        # Signal 1
+        self.nav_threshold = nav_threshold
+        self.initial_nav = initial_nav
+
+        # Signal 2
+        self.weight_delta_threshold = weight_delta_threshold
+        self.cv_threshold = cv_threshold
+
+        # Signal 3 (v2.3: uses EvalCallback directly, not logger)
+        self.divergence_threshold = divergence_threshold
+        self.eval_callback = eval_callback
+
+        # Signal 4
+        self.action_saturation_threshold = action_saturation_threshold
+        self.saturation_ratio_limit = saturation_ratio_limit
+
+        # Signal 5
+        self.reward_variance_threshold = reward_variance_threshold
+        self.reward_window = reward_window
+
+        # Decision
+        self.check_freq = check_freq
+        self.patience = patience
+
+        # Internal state
+        self.violation_counts = {
+            'nav': 0,
+            'weight': 0,
+            'divergence': 0,
+            'saturation': 0,
+            'variance': 0
+        }
+        self.max_nav_seen = initial_nav
+        self.last_params = None
+
+        # v2.2 FIX: Use deque with maxlen to prevent memory leak
+        # Without this, lists grow unbounded (1M steps = crash)
+        self.actions_history: deque = deque(maxlen=reward_window)
+        self.rewards_history: deque = deque(maxlen=reward_window)
+
+        # Metrics for logging
+        self._last_weight_cv = 0.0
+        self._last_weight_delta = 0.0
+        self._last_divergence = 0.0
+        self._last_saturation_ratio = 0.0
+        self._last_reward_variance = 0.0
+        self._last_reward_cv = 0.0
+
+    def _on_step(self) -> bool:
+        # 1. Collect data (every step, low overhead)
+        self._collect_step_data()
+
+        # 2. Evaluate signals (periodically)
+        if self.num_timesteps % self.check_freq != 0:
+            return True
+
+        violations = []
+
+        # Signal 1: NAV Threshold
+        if nav_violation := self._check_nav_threshold():
+            violations.append(nav_violation)
+            self.violation_counts['nav'] += 1
+        else:
+            self.violation_counts['nav'] = 0
+
+        # Signal 2: Weight Stagnation (v2.1)
+        if weight_violation := self._check_weight_stagnation():
+            violations.append(weight_violation)
+            self.violation_counts['weight'] += 1
+        else:
+            self.violation_counts['weight'] = 0
+
+        # Signal 3: Train/Eval Divergence (v2.1: via logs)
+        if div_violation := self._check_train_eval_divergence():
+            violations.append(div_violation)
+            self.violation_counts['divergence'] += 1
+        else:
+            self.violation_counts['divergence'] = 0
+
+        # Signal 4: Action Saturation
+        if sat_violation := self._check_action_saturation():
+            violations.append(sat_violation)
+            self.violation_counts['saturation'] += 1
+        else:
+            self.violation_counts['saturation'] = 0
+
+        # Signal 5: Reward Variance
+        if var_violation := self._check_reward_variance():
+            violations.append(var_violation)
+            self.violation_counts['variance'] += 1
+        else:
+            self.violation_counts['variance'] = 0
+
+        # Log metrics to TensorBoard
+        self._log_metrics(violations)
+
+        # Decision
+        should_stop = self._decide_stop(violations)
+
+        if should_stop:
+            self._print_report(violations)
+            return False
+
+        return True
+
+    def _collect_step_data(self):
+        """
+        Collect data for analysis (low overhead).
+
+        v2.2 FIX: Uses deque with maxlen, no manual truncation needed.
+        v2.2 FIX: Attempts to get raw rewards from infos if VecNormalize is used.
+        """
+        # Actions - take absolute value for saturation check
+        if 'actions' in self.locals and self.locals['actions'] is not None:
+            actions = self.locals['actions']
+            # deque.extend handles maxlen automatically
+            self.actions_history.extend(np.abs(actions).flatten())
+
+        # Rewards - try to get RAW rewards (before VecNormalize)
+        # Priority: infos['raw_reward'] > infos['original_reward'] > self.locals['rewards']
+        raw_rewards = None
+
+        # Attempt 1: Check infos for raw/original reward (custom wrapper or VecNormalize)
+        if 'infos' in self.locals and self.locals['infos'] is not None:
+            infos = self.locals['infos']
+            for info in infos:
+                if info is not None:
+                    # Some wrappers store raw reward in infos
+                    if 'raw_reward' in info:
+                        raw_rewards = [i.get('raw_reward', 0) for i in infos if i]
+                        break
+                    elif 'original_reward' in info:
+                        raw_rewards = [i.get('original_reward', 0) for i in infos if i]
+                        break
+
+        # Attempt 2: Fallback to self.locals['rewards']
+        # Note: Under VecNormalize, these are normalized (variance ~1)
+        # Signal 5 may be less effective in this case
+        if raw_rewards is None and 'rewards' in self.locals and self.locals['rewards'] is not None:
+            raw_rewards = self.locals['rewards'].flatten()
+
+        if raw_rewards is not None:
+            self.rewards_history.extend(raw_rewards)
+
+    def _check_nav_threshold(self) -> Optional[str]:
+        """Signal 1: Detect unrealistic returns."""
+        env = self.training_env
+        if hasattr(env, 'get_global_metrics'):
+            metrics = env.get_global_metrics()
+            current_nav = metrics.get("portfolio_value", self.initial_nav)
+            self.max_nav_seen = max(self.max_nav_seen, current_nav)
+
+            if self.max_nav_seen > self.initial_nav * self.nav_threshold:
+                ratio = self.max_nav_seen / self.initial_nav
+                return f"NAV {ratio:.1f}x (>{self.nav_threshold}x)"
+        return None
+
+    def _check_weight_stagnation(self) -> Optional[str]:
+        """
+        Signal 2: GRADSTOP proxy - Monitor if network weights stop evolving.
+
+        If weights don't change between rollouts, gradients were null/ineffective.
+
+        Note v2.1: Replaces gradient variance check because gradients are not
+        accessible in _on_step (collection phase ≠ optimization phase in SB3).
+        """
+        import torch
+
+        try:
+            # Snapshot current weights
+            current_params = torch.nn.utils.parameters_to_vector(
+                self.model.policy.parameters()
+            ).detach().cpu().numpy()
+
+            if self.last_params is not None:
+                # Compute delta
+                delta = np.abs(current_params - self.last_params)
+                mean_delta = np.mean(delta)
+
+                # Coefficient of variation
+                if mean_delta > 1e-12:
+                    cv = np.std(delta) / mean_delta
+                else:
+                    cv = 0.0  # Total stagnation
+
+                # Store for logging
+                self._last_weight_cv = cv
+                self._last_weight_delta = mean_delta
+
+                # Violation if CV low AND mean delta low
+                if cv < self.cv_threshold and mean_delta < self.weight_delta_threshold:
+                    self.last_params = current_params
+                    return f"Weight stagnation (CV={cv:.4f}, Δ={mean_delta:.2e})"
+
+            self.last_params = current_params
+
+        except Exception:
+            pass  # Graceful degradation if policy not accessible
+
+        return None
+
+    def _check_train_eval_divergence(self) -> Optional[str]:
+        """
+        Signal 3: Detect train >> eval gap via SB3 buffers.
+
+        v2.3 FIX ("Logger Trap"):
+        - DO NOT use logger.name_to_value (flushed after dump())
+        - Train reward: Read from self.model.ep_info_buffer (source)
+        - Eval reward: Read from eval_callback.last_mean_reward (source)
+
+        Note v2.2: Be aware of temporal lag!
+        - ep_info_buffer is a rolling window (typically 100 episodes)
+        - eval/mean_reward is an instantaneous snapshot
+        - This is mitigated by 'patience' but signal has inertia
+        """
+        # v2.3: Disabled if no EvalCallback linked
+        if self.eval_callback is None:
+            return None
+
+        try:
+            # === TRAIN REWARD: Read from ep_info_buffer (SB3 internal buffer) ===
+            # This is where SB3 stores episode info for computing ep_rew_mean
+            if not hasattr(self.model, 'ep_info_buffer') or len(self.model.ep_info_buffer) == 0:
+                return None  # Not enough data yet
+
+            train_mean = np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer])
+
+            # === EVAL REWARD: Read directly from EvalCallback ===
+            eval_mean = self.eval_callback.last_mean_reward
+
+            # Edge case: Eval hasn't run yet (initialized to -inf)
+            if eval_mean == -np.inf:
+                return None
+
+            # Avoid division by zero
+            if abs(eval_mean) < 1e-8:
+                return None
+
+            divergence = (train_mean - eval_mean) / (abs(eval_mean) + 1e-9)
+
+            # Store for logging
+            self._last_divergence = divergence
+
+            if divergence > self.divergence_threshold:
+                return f"Train/Eval divergence {divergence:.1%} (Train={train_mean:.1f}, Eval={eval_mean:.1f})"
+
+        except (AttributeError, KeyError, TypeError):
+            pass  # Buffer not available or unexpected structure
+
+        return None
+
+    def _check_action_saturation(self) -> Optional[str]:
+        """
+        Signal 4: Detect policy collapse via action saturation.
+
+        If agent always outputs |action| ≈ 1, it's a sign of degenerate policy.
+        """
+        if len(self.actions_history) < self.reward_window:
+            return None
+
+        # deque is already bounded, convert to array for numpy ops
+        recent = np.array(self.actions_history)
+        saturated = np.sum(recent > self.action_saturation_threshold)
+        ratio = saturated / len(recent)
+
+        # Store for logging
+        self._last_saturation_ratio = ratio
+
+        if ratio > self.saturation_ratio_limit:
+            return f"Action saturation {ratio:.0%} (>{self.saturation_ratio_limit:.0%})"
+
+        return None
+
+    def _check_reward_variance(self) -> Optional[str]:
+        """
+        Signal 5: Detect memorization via reward variance collapse.
+
+        Note v2.1: Uses raw rewards to avoid VecNormalize bias.
+        Note v2.2: Attempts to get raw rewards from infos first.
+                   If VecNormalize is used and raw_reward not in infos,
+                   this signal may be less effective (variance ~1).
+        """
+        if len(self.rewards_history) < self.reward_window:
+            return None
+
+        # deque is already bounded, convert to array for numpy ops
+        recent = np.array(self.rewards_history)
+        variance = np.var(recent)
+        mean = np.mean(np.abs(recent))
+
+        # Store for logging
+        self._last_reward_variance = variance
+
+        # Use CV if rewards are in narrow range
+        if mean > 1e-8:
+            cv = np.std(recent) / mean
+            self._last_reward_cv = cv
+
+            # CV < 1% = rewards quasi-constant
+            if cv < 0.01 and variance < self.reward_variance_threshold:
+                return f"Reward variance collapse (var={variance:.2e}, CV={cv:.4f})"
+        elif variance < self.reward_variance_threshold:
+            return f"Reward variance collapse ({variance:.2e})"
+
+        return None
+
+    def _decide_stop(self, active_violations: list) -> bool:
+        """Multi-criteria decision logic."""
+        # Criterion 1: Patience exhausted on any signal
+        for count in self.violation_counts.values():
+            if count >= self.patience:
+                return True
+
+        # Criterion 2: 2+ signals active simultaneously
+        if len(active_violations) >= 2:
+            return True
+
+        return False
+
+    def _log_metrics(self, violations: list):
+        """Log all overfitting metrics to TensorBoard."""
+        # Signal 1
+        self.logger.record("overfit/max_nav_ratio", self.max_nav_seen / self.initial_nav)
+
+        # Signal 2
+        self.logger.record("overfit/weight_delta", self._last_weight_delta)
+        self.logger.record("overfit/weight_cv", self._last_weight_cv)
+
+        # Signal 3
+        self.logger.record("overfit/train_eval_divergence", self._last_divergence)
+
+        # Signal 4
+        self.logger.record("overfit/action_saturation", self._last_saturation_ratio)
+
+        # Signal 5
+        self.logger.record("overfit/reward_variance", self._last_reward_variance)
+        self.logger.record("overfit/reward_cv", self._last_reward_cv)
+
+        # Violation counts
+        for name, count in self.violation_counts.items():
+            self.logger.record(f"overfit/violations_{name}", count)
+
+        # Active signals
+        self.logger.record("overfit/active_signals", len(violations))
+
+    def _print_report(self, violations: list):
+        """Print detailed overfitting report."""
+        print("\n" + "=" * 70)
+        print("  EARLY STOPPING: Overfitting Signals Detected!")
+        print("=" * 70)
+        print(f"\n  Step: {self.num_timesteps:,}")
+        print(f"\n  Active Violations:")
+        for v in violations:
+            print(f"    - {v}")
+        print(f"\n  Violation History (patience={self.patience}):")
+        for name, count in self.violation_counts.items():
+            status = "TRIGGERED" if count >= self.patience else f"{count}/{self.patience}"
+            print(f"    {name}: {status}")
+        print("\n" + "=" * 70 + "\n")
+
+    def _on_training_start(self) -> None:
+        if self.verbose > 0:
+            print(f"\n[Overfitting Guard V2.3] SOTA Multi-Signal Detection:")
+            print(f"  Signal 1 - NAV threshold: {self.nav_threshold}x")
+            print(f"  Signal 2 - Weight stagnation: Δ<{self.weight_delta_threshold:.0e}, CV<{self.cv_threshold}")
+            eval_status = "ENABLED (via EvalCallback)" if self.eval_callback else "DISABLED (no EvalCallback)"
+            print(f"  Signal 3 - Train/Eval divergence: >{self.divergence_threshold:.0%} [{eval_status}]")
+            print(f"  Signal 4 - Action saturation: {self.saturation_ratio_limit:.0%} @ |a|>{self.action_saturation_threshold}")
+            print(f"  Signal 5 - Reward variance: <{self.reward_variance_threshold:.0e}")
+            print(f"  Decision: patience={self.patience}, check_freq={self.check_freq:,}")

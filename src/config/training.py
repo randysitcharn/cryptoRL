@@ -55,6 +55,13 @@ class TQCTrainingConfig:
     # Regularization (anti-overfitting)
     observation_noise: float = 0.01  # 1% Gaussian noise on market observations
 
+    # --- Dropout Regularization (DroQ/STAC style) ---
+    # See docs/DROPOUT_TQC_DESIGN.md for details
+    use_dropout_policy: bool = True   # Use TQCDropoutPolicy instead of standard
+    critic_dropout: float = 0.01      # DroQ recommends 0.01-0.1 (conservative)
+    actor_dropout: float = 0.0        # Phase 1: critics only (0.005 for Phase 2)
+    use_layer_norm: bool = True       # CRITICAL for stability with dropout
+
     # --- Foundation Model ---
     d_model: int = 256  # Increased capacity for complex patterns
     n_heads: int = 4
@@ -96,6 +103,15 @@ class TQCTrainingConfig:
     # --- Curriculum Learning ---
     use_curriculum: bool = True
     curriculum_warmup_steps: int = 50_000
+
+    # --- Overfitting Guard V2 (WFO mode) ---
+    # See docs/WFO_OVERFITTING_GUARD.md for details
+    use_overfitting_guard: bool = False     # Disabled by default (WFO enables it)
+    guard_nav_threshold: float = 5.0        # 5x = +400% (standard mode)
+    guard_patience: int = 3                 # Violations before stop
+    guard_check_freq: int = 10_000          # Check frequency (steps)
+    guard_action_saturation: float = 0.95   # Saturation threshold
+    guard_reward_variance: float = 1e-4     # Min variance threshold
 
     # --- Risk Management ---
     use_risk_management: bool = True

@@ -124,6 +124,7 @@ class BatchCryptoEnv(VecEnv):
         self.random_start = random_start
         self.funding_rate = funding_rate
         self.training = True  # Flag for observation noise (disable during eval)
+        self._last_noise_scale = 0.0  # For TensorBoard logging (Dynamic Noise)
 
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
         self.progress = 0.0           # Training progress [0, 1]
@@ -546,10 +547,31 @@ class BatchCryptoEnv(VecEnv):
         # Market windows: (n_envs, window_size, n_features)
         market = self._get_batch_windows(self.current_steps)
 
-        # Add observation noise for regularization (anti-overfitting)
+        # ═══════════════════════════════════════════════════════════════════
+        # DYNAMIC OBSERVATION NOISE (Audit 2026-01-19)
+        # Combines Annealing + Volatility-Adaptive for anti-overfitting
+        # See: docs/AUDIT_OBSERVATION_NOISE.md
+        # ═══════════════════════════════════════════════════════════════════
         if self.observation_noise > 0 and self.training:
-            noise = torch.randn_like(market) * self.observation_noise
+            # 1. ANNEALING (Time-based) - Standard NoisyRollout 2025
+            # Reduces noise progressively from 100% to 50% during training
+            # Not going to 0% prevents "catastrophic forgetting" of robustness
+            annealing_factor = 1.0 - 0.5 * self.progress
+            
+            # 2. ADAPTIVE (Regime-based) - CryptoRL Innovation
+            # If volatility doubles, noise is halved (and vice versa)
+            # Clamped [0.5, 2.0] to prevent gradient explosion/collapse
+            current_vol = torch.sqrt(self.ema_vars).clamp(min=1e-6)
+            vol_factor = (self.target_volatility / current_vol).clamp(0.5, 2.0)
+            
+            # 3. COMBINED INJECTION
+            # final_scale shape: (n_envs,) -> broadcast to (n_envs, window, features)
+            final_scale = self.observation_noise * annealing_factor * vol_factor
+            noise = torch.randn_like(market) * final_scale.unsqueeze(1).unsqueeze(2)
             market = market + noise
+            
+            # Store for TensorBoard logging (mean across envs)
+            self._last_noise_scale = final_scale.mean().item()
 
         # Position: (n_envs, 1) - NO noise on position (agent's own state)
         position = self.position_pcts.unsqueeze(1)

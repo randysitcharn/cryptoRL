@@ -23,6 +23,7 @@ import torch
 import numpy as np
 
 from src.config import DEVICE, SEED
+from src.models.tqc_dropout_policy import TQCDropoutPolicy
 from src.utils.hardware import HardwareManager
 from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.batch_env import BatchCryptoEnv
@@ -33,6 +34,7 @@ from src.training.callbacks import (
     CurriculumFeesCallback,
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallback,
+    OverfittingGuardCallbackV2,
     PLOAdaptivePenaltyCallback,
     PLOChurnCallback,
     PLOSmoothnessCallback,
@@ -216,7 +218,7 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
     # Default to tiny architecture if not specified
     net_arch = config.net_arch if config.net_arch else dict(pi=[64, 64], qf=[64, 64])
 
-    return dict(
+    policy_kwargs = dict(
         features_extractor_class=FoundationFeatureExtractor,
         features_extractor_kwargs=dict(
             encoder_path=config.encoder_path,
@@ -235,6 +237,16 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
             eps=1e-5,
         ),
     )
+
+    # Add dropout parameters if using TQCDropoutPolicy
+    if config.use_dropout_policy:
+        policy_kwargs.update(
+            critic_dropout=config.critic_dropout,
+            actor_dropout=config.actor_dropout,
+            use_layer_norm=config.use_layer_norm,
+        )
+
+    return policy_kwargs
 
 
 def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: bool = True):
@@ -473,6 +485,33 @@ def create_callbacks(
     # )
     # callbacks.append(overfitting_guard)
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # OverfittingGuard V2 (WFO mode: Signal 3 auto-disabled if no EvalCallback)
+    # See docs/WFO_OVERFITTING_GUARD.md for details
+    # ═══════════════════════════════════════════════════════════════════════
+    if getattr(config, 'use_overfitting_guard', False):
+        # En WFO: eval_env=None => pas d'EvalCallback => Signal 3 désactivé
+        eval_cb = None
+        if eval_env is not None:
+            # Mode standard: chercher EvalCallback existant dans la liste
+            eval_cb = next(
+                (cb for cb in callbacks if isinstance(cb, EvalCallback)),
+                None
+            )
+
+        guard = OverfittingGuardCallbackV2(
+            nav_threshold=getattr(config, 'guard_nav_threshold', 5.0),
+            patience=getattr(config, 'guard_patience', 3),
+            check_freq=getattr(config, 'guard_check_freq', 10_000),
+            action_saturation_threshold=getattr(config, 'guard_action_saturation', 0.95),
+            reward_variance_threshold=getattr(config, 'guard_reward_variance', 1e-4),
+            eval_callback=eval_cb,
+            verbose=1
+        )
+        callbacks.append(guard)
+        signal3_status = 'ON' if eval_cb else 'OFF (WFO mode)'
+        print(f"  [Guard] OverfittingGuardCallbackV2 enabled (Signal 3: {signal3_status})")
+
     return callbacks, detail_callback
 
 
@@ -621,8 +660,17 @@ def train(
         # ========== NEW TRAINING MODE ==========
         print("\n[3/4] Creating TQC model...")
 
+        # Select policy class based on config
+        if config.use_dropout_policy:
+            policy_class = TQCDropoutPolicy
+            print(f"      Policy: TQCDropoutPolicy (critic_dropout={config.critic_dropout}, "
+                  f"actor_dropout={config.actor_dropout}, use_layer_norm={config.use_layer_norm})")
+        else:
+            policy_class = "MultiInputPolicy"
+            print("      Policy: MultiInputPolicy (standard)")
+
         model = TQC(
-            policy="MultiInputPolicy",  # Dict obs space (market + position)
+            policy=policy_class,
             env=train_env,
             learning_rate=linear_schedule(config.learning_rate),
             buffer_size=config.buffer_size,
@@ -745,6 +793,31 @@ def train(
     # ==================== Capture Training Metrics ====================
     training_metrics = detail_callback.get_training_metrics()
 
+    # === Guard Metrics (WFO Fail-over support) ===
+    training_metrics['guard_early_stop'] = False
+    training_metrics['guard_stop_reason'] = None
+    training_metrics['completion_ratio'] = model.num_timesteps / config.total_timesteps
+
+    # Vérifier si OverfittingGuardCallbackV2 a déclenché un arrêt
+    for cb in callbacks:
+        if isinstance(cb, OverfittingGuardCallbackV2):
+            # Le Guard retourne False dans _on_step si arrêt
+            # On détecte via violation_counts qui atteint patience
+            violated_signals = [
+                name for name, count in cb.violation_counts.items()
+                if count >= cb.patience
+            ]
+            if violated_signals:
+                training_metrics['guard_early_stop'] = True
+                training_metrics['guard_stop_reason'] = f"Signal(s): {', '.join(violated_signals)}"
+            # Also check for multi-signal trigger (2+ active)
+            active_signals = sum(1 for c in cb.violation_counts.values() if c > 0)
+            if active_signals >= 2 and not training_metrics['guard_early_stop']:
+                training_metrics['guard_early_stop'] = True
+                active_names = [n for n, c in cb.violation_counts.items() if c > 0]
+                training_metrics['guard_stop_reason'] = f"Multi-signal: {', '.join(active_names)}"
+            break
+
     print("\n[Training Diagnostics]")
     print(f"  Action Saturation: {training_metrics['action_saturation']:.3f}")
     print(f"  Avg Entropy: {training_metrics['avg_entropy']:.4f}")
@@ -753,6 +826,9 @@ def train(
     print(f"  Avg Churn Ratio: {training_metrics['avg_churn_ratio']:.3f}")
     print(f"  Avg Actor Grad Norm: {training_metrics['avg_actor_grad_norm']:.4f}")
     print(f"  Avg Critic Grad Norm: {training_metrics['avg_critic_grad_norm']:.4f}")
+    print(f"  Completion Ratio: {training_metrics['completion_ratio']:.1%}")
+    if training_metrics['guard_early_stop']:
+        print(f"  ⚠️ Guard Early Stop: {training_metrics['guard_stop_reason']}")
 
     # ==================== Save Final Model ====================
     print("\n" + "=" * 70)
