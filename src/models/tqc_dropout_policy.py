@@ -124,22 +124,30 @@ class DropoutActor(Actor):
         use_expln: bool = False,
         clip_mean: float = 2.0,
         normalize_images: bool = True,
-        features_extractor: Optional[nn.Module] = None,  # Explicit to avoid duplication
+        features_extractor: Optional[nn.Module] = None,
         # Paramètres custom DroQ
         dropout_rate: float = 0.0,
         use_layer_norm: bool = True,
-        **kwargs,  # Pass through other SB3 args
+        **kwargs,  # Absorb any extra args from SB3
     ):
         # Stocker les paramètres AVANT super().__init__
         self._dropout_rate = dropout_rate
         self._use_layer_norm = use_layer_norm
 
+        # Use ONLY keyword args to avoid positional conflicts
         super().__init__(
-            observation_space, action_space, net_arch, features_dim,
-            activation_fn, use_sde, log_std_init, full_std,
-            use_expln, clip_mean, normalize_images,
+            observation_space=observation_space,
+            action_space=action_space,
+            net_arch=net_arch,
+            features_dim=features_dim,
+            activation_fn=activation_fn,
+            use_sde=use_sde,
+            log_std_init=log_std_init,
+            full_std=full_std,
+            use_expln=use_expln,
+            clip_mean=clip_mean,
+            normalize_images=normalize_images,
             features_extractor=features_extractor,
-            **kwargs
         )
         
         # Reconstruire le MLP après super().__init__ car SB3 le crée par défaut
