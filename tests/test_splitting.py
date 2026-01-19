@@ -7,18 +7,28 @@ Verifies chronological splitting with purge windows.
 import sys
 import os
 import pandas as pd
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.data_engineering.splitter import TimeSeriesSplitter
+
+# Use parquet file that exists in the project
+DATA_FILE = "data/raw_training_data.parquet"
+
+
+def load_test_data():
+    """Load test data, skip if not available."""
+    if not os.path.exists(DATA_FILE):
+        pytest.skip(f"Data file not found: {DATA_FILE}")
+    return pd.read_parquet(DATA_FILE)
 
 
 def test_split_sizes():
     """Test: Split sizes are correct accounting for purge."""
     print("Test 1: Split Sizes...")
 
-    df = pd.read_csv("data/processed/BTC-USD_processed.csv",
-                     index_col=0, parse_dates=True)
+    df = load_test_data()
     splitter = TimeSeriesSplitter(df)
 
     train_df, val_df, test_df = splitter.split_data(
@@ -40,8 +50,7 @@ def test_chronological_order():
     """Test: Sets are in chronological order."""
     print("\nTest 2: Chronological Order...")
 
-    df = pd.read_csv("data/processed/BTC-USD_processed.csv",
-                     index_col=0, parse_dates=True)
+    df = load_test_data()
     splitter = TimeSeriesSplitter(df)
 
     train_df, val_df, test_df = splitter.split_data()
@@ -63,8 +72,7 @@ def test_no_empty_sets():
     """Test: All sets have data."""
     print("\nTest 3: No Empty Sets...")
 
-    df = pd.read_csv("data/processed/BTC-USD_processed.csv",
-                     index_col=0, parse_dates=True)
+    df = load_test_data()
     splitter = TimeSeriesSplitter(df)
 
     train_df, val_df, test_df = splitter.split_data()
