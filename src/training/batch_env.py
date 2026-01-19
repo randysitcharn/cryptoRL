@@ -264,6 +264,7 @@ class BatchCryptoEnv(VecEnv):
 
         # Done flags buffer (for _build_infos optimization)
         self._dones = torch.zeros(n, dtype=torch.bool, device=device)
+        self._final_total_trades = None  # Captured before reset for evaluation
 
         # ═══════════════════════════════════════════════════════════════════
         # PLO Smoothness: Jerk tracking buffers
@@ -721,15 +722,20 @@ class BatchCryptoEnv(VecEnv):
         # 13. Capture episode stats BEFORE reset (for SB3 ep_info_buffer)
         final_ep_rewards = None
         final_ep_lengths = None
+        final_total_trades = None
         n_done = 0
         if dones.any():
             n_done = dones.sum().item()
             final_ep_rewards = self.episode_rewards[dones].cpu().numpy()
             final_ep_lengths = self.episode_lengths[dones].cpu().numpy()
+            final_total_trades = self.total_trades[dones].cpu().numpy()  # Capture before reset!
 
         # 14. Auto-reset terminated environments (resets episode tracking)
         if n_done > 0:
             self._auto_reset(dones)
+
+        # Store for _get_single_info (used by gym_step for evaluation)
+        self._final_total_trades = final_total_trades
 
         # 15. Build info dicts (OPTIMIZED: only for done envs)
         infos = self._build_infos(dones, final_ep_rewards, final_ep_lengths)
@@ -932,13 +938,19 @@ class BatchCryptoEnv(VecEnv):
             Info dict with NAV, position, price, and other metrics.
         """
         navs = self._get_navs()
+        # Use captured total_trades if episode just ended (before reset cleared it)
+        if self._final_total_trades is not None and self._dones[idx]:
+            total_trades = int(self._final_total_trades[0])  # Single env mode
+        else:
+            total_trades = int(self.total_trades[idx].item())
+
         return {
             'nav': float(navs[idx].item()),
             'cash': float(self.cash[idx].item()),
             'position': float(self.positions[idx].item()),
             'position_pct': float(self.position_pcts[idx].item()),
             'price': float(self.prices[self.current_steps[idx]].item()),
-            'total_trades': int(self.total_trades[idx].item()),
+            'total_trades': total_trades,
             'total_commission': float(self.total_commissions[idx].item()),
             'vol/current_volatility': float(torch.sqrt(self.ema_vars[idx]).item()),
             'vol/vol_scalar': float(self.vol_scalars[idx].item()),
