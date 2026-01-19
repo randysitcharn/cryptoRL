@@ -205,14 +205,14 @@ class SingleQuantileNet(nn.Module):
 class DropoutCritic(nn.Module):
     """
     Critic complet pour TQC (Ensemble de SingleQuantileNet).
-    
+
     Remplace QuantileNetwork de SB3 avec support Dropout + LayerNorm.
     Chaque critic de l'ensemble est un SingleQuantileNet indépendant.
-    
+
     Output format: (batch_size, n_critics, n_quantiles)
     C'est le format exact attendu par la loss TQC.
     """
-    
+
     def __init__(
         self,
         features_dim: int,
@@ -223,16 +223,18 @@ class DropoutCritic(nn.Module):
         activation_fn: Type[nn.Module],
         dropout_rate: float = 0.0,
         use_layer_norm: bool = True,
+        features_extractor: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.n_critics = n_critics
         self.n_quantiles = n_quantiles
         self.features_dim = features_dim
         self.action_dim = action_dim
-        
+        self.features_extractor = features_extractor
+
         # Input = features concatenées avec action
         input_dim = features_dim + action_dim
-        
+
         # Création de l'ensemble de critics indépendants
         self.critics = nn.ModuleList([
             SingleQuantileNet(
@@ -246,18 +248,25 @@ class DropoutCritic(nn.Module):
             for _ in range(n_critics)
         ])
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs, action: torch.Tensor) -> torch.Tensor:
         """
         Forward pass à travers tous les critics.
 
         Args:
-            obs: Observations/features (batch_size, features_dim)
+            obs: Raw observations (dict) or pre-extracted features (Tensor)
             action: Actions (batch_size, action_dim)
 
         Returns:
             Quantiles de tous les critics (batch_size, n_critics, n_quantiles)
         """
-        x = torch.cat([obs, action], dim=1)
+        # Extract features if we have a features_extractor and obs is a dict
+        if self.features_extractor is not None:
+            with torch.no_grad():
+                features = self.features_extractor(obs)
+        else:
+            features = obs
+
+        x = torch.cat([features, action], dim=1)
         # Exécute chaque critic et empile les résultats
         return torch.stack([critic(x) for critic in self.critics], dim=1)
 
@@ -383,8 +392,9 @@ class TQCDropoutPolicy(TQCPolicy):
         """
         critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
 
-        # Get features_dim from critic_kwargs (set by TQCPolicy.__init__)
+        # Get features_dim and features_extractor from critic_kwargs
         features_dim = critic_kwargs.get('features_dim', 512)
+        critic_features_extractor = critic_kwargs.get('features_extractor', None)
 
         # Récupération de l'architecture spécifique au critic
         if self.net_arch is None:
@@ -403,6 +413,7 @@ class TQCDropoutPolicy(TQCPolicy):
             activation_fn=self.activation_fn,
             dropout_rate=self.critic_dropout,
             use_layer_norm=self.use_layer_norm,
+            features_extractor=critic_features_extractor,
         ).to(self.device)
 
 
