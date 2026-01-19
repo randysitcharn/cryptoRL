@@ -71,6 +71,8 @@ class BatchCryptoEnv(VecEnv):
         observation_noise: float = 0.0,  # 0 = disabled by default
         # Episode start mode
         random_start: bool = True,  # If False, start at beginning (for evaluation)
+        # Short selling
+        funding_rate: float = 0.0001,  # 0.01% per step (~0.24%/day) for short positions
     ):
         """
         Initialize the batch environment.
@@ -96,6 +98,9 @@ class BatchCryptoEnv(VecEnv):
             max_leverage: Max vol scaling factor.
             start_idx: Start index for data slice.
             end_idx: End index for data slice.
+            observation_noise: Noise level for observations (anti-overfitting).
+            random_start: If False, start at beginning (for evaluation).
+            funding_rate: Funding cost per step for short positions (perpetual futures style).
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.num_envs = n_envs  # Store locally, VecEnv.__init__ will set self.num_envs
@@ -117,6 +122,7 @@ class BatchCryptoEnv(VecEnv):
         self.max_leverage = max_leverage
         self.observation_noise = observation_noise
         self.random_start = random_start
+        self.funding_rate = funding_rate
         self.training = True  # Flag for observation noise (disable during eval)
 
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
@@ -649,8 +655,8 @@ class BatchCryptoEnv(VecEnv):
         old_prices = self._get_prices(self.current_steps)
         position_changed = target_positions != self.position_pcts
 
-        # Map [-1, 1] to exposure [0, 1]
-        target_exposures = (target_positions + 1.0) / 2.0
+        # Direct mapping: -1=100% short, 0=cash, +1=100% long
+        target_exposures = target_positions
         target_values = old_navs * target_exposures
         target_units = target_values / old_prices
 
@@ -669,6 +675,12 @@ class BatchCryptoEnv(VecEnv):
         self.position_pcts = torch.where(position_changed, target_positions, self.position_pcts)
         self.total_trades += position_changed.long()
         self.total_commissions += torch.where(position_changed, trade_costs, torch.zeros_like(trade_costs))
+
+        # 6b. Apply funding cost for short positions (perpetual futures style)
+        if self.funding_rate > 0:
+            short_mask = self.positions < 0
+            funding_cost = torch.abs(self.positions) * old_prices * self.funding_rate
+            self.cash = torch.where(short_mask, self.cash - funding_cost, self.cash)
 
         # 7. Advance time
         self.current_steps += 1
