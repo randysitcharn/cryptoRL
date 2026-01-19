@@ -298,6 +298,9 @@ class TQCDropoutPolicy(TQCPolicy):
         net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
         use_sde: bool = False,
+        # ====== TQC parameters (passed from TQC algorithm) ======
+        n_quantiles: int = 25,
+        n_critics: int = 2,
         # ====== Paramètres Dropout & Architecture ======
         critic_dropout: float = 0.01,   # Défaut DroQ (conservateur)
         actor_dropout: float = 0.005,   # Défaut STAC (très faible)
@@ -306,7 +309,7 @@ class TQCDropoutPolicy(TQCPolicy):
     ):
         """
         Initialize TQCDropoutPolicy.
-        
+
         Args:
             observation_space: Observation space
             action_space: Action space
@@ -314,6 +317,8 @@ class TQCDropoutPolicy(TQCPolicy):
             net_arch: Network architecture (list or dict with 'pi'/'qf' keys)
             activation_fn: Activation function
             use_sde: Whether to use gSDE (State Dependent Exploration)
+            n_quantiles: Number of quantiles for TQC (default 25)
+            n_critics: Number of critic networks (default 2)
             critic_dropout: Dropout rate for critics (0.01 recommended)
             actor_dropout: Dropout rate for actor (0.005, auto-disabled with gSDE)
             use_layer_norm: Use LayerNorm (CRITICAL for stability)
@@ -341,6 +346,8 @@ class TQCDropoutPolicy(TQCPolicy):
             net_arch,
             activation_fn,
             use_sde=use_sde,
+            n_quantiles=n_quantiles,
+            n_critics=n_critics,
             **kwargs
         )
 
