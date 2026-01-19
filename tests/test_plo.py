@@ -68,7 +68,6 @@ class TestPLODrawdown:
         """λ should increase when drawdown > threshold."""
         callback = PLOAdaptivePenaltyCallback(dd_threshold=0.10, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Simulate DD = 15% (5% above threshold)
@@ -85,7 +84,6 @@ class TestPLODrawdown:
         """λ should decay when drawdown < threshold."""
         callback = PLOAdaptivePenaltyCallback(dd_threshold=0.10, decay_rate=0.99, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
         callback.dd_lambda = 3.0  # Start high
 
@@ -109,7 +107,6 @@ class TestPLODrawdown:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Simulate extreme violation
@@ -130,7 +127,6 @@ class TestPLODrawdown:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Simulate sudden large violation
@@ -150,7 +146,6 @@ class TestPLODrawdown:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Fill history with DECREASING drawdown (recovery)
@@ -169,7 +164,6 @@ class TestPLODrawdown:
         """PLO should not accumulate integral in Phase 1 (curriculum ≈ 0)."""
         callback = PLOAdaptivePenaltyCallback(dd_threshold=0.10, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Phase 1: curriculum_lambda ≈ 0
@@ -199,7 +193,6 @@ class TestPLOChurn:
         """λ should increase when turnover > threshold."""
         callback = PLOChurnCallback(turnover_threshold=0.08, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Simulate high turnover (30%)
@@ -220,7 +213,6 @@ class TestPLOChurn:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Extreme turnover
@@ -235,7 +227,6 @@ class TestPLOChurn:
         """PLO should decay integral if churn_coef ≈ 0."""
         callback = PLOChurnCallback(turnover_threshold=0.08, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Curriculum not active
@@ -256,7 +247,6 @@ class TestPLOChurn:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Fill history with nearly flat turnover (slope < 0.001)
@@ -281,7 +271,6 @@ class TestPLOSmoothness:
         """λ should increase when jerk > threshold."""
         callback = PLOSmoothnessCallback(jerk_threshold=0.40, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Simulate high jerk (60%)
@@ -296,7 +285,6 @@ class TestPLOSmoothness:
         """λ should stay near 1.0 if jerk < threshold."""
         callback = PLOSmoothnessCallback(jerk_threshold=0.40, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Simulate low jerk (10%)
@@ -318,7 +306,6 @@ class TestPLOSmoothness:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Extreme jerk
@@ -337,7 +324,6 @@ class TestPLOSmoothness:
             verbose=0
         )
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
         callback.jerk_lambda = 3.0
 
@@ -355,7 +341,6 @@ class TestPLOSmoothness:
         """PLO should not activate if smooth_coef == 0."""
         callback = PLOSmoothnessCallback(jerk_threshold=0.40, verbose=0)
         callback.model = mock_model
-        callback.logger = mock_model.logger
         callback.num_timesteps = 100
 
         # Curriculum not active for smoothness
