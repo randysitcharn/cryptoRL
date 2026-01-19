@@ -249,17 +249,21 @@ class DropoutCritic(nn.Module):
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
         Forward pass à travers tous les critics.
-        
+
         Args:
             obs: Observations/features (batch_size, features_dim)
             action: Actions (batch_size, action_dim)
-        
+
         Returns:
             Quantiles de tous les critics (batch_size, n_critics, n_quantiles)
         """
         x = torch.cat([obs, action], dim=1)
         # Exécute chaque critic et empile les résultats
         return torch.stack([critic(x) for critic in self.critics], dim=1)
+
+    def set_training_mode(self, mode: bool) -> None:
+        """Set training mode (required by SB3 TQC)."""
+        self.train(mode)
 
 
 # ==============================================================================
