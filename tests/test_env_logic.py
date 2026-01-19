@@ -297,9 +297,11 @@ def test_short_profit_on_price_drop():
     """Test: Short position should profit when price drops."""
     print("\nTest 7: Short Profit on Price Drop...")
 
-    # Create prices: stable at 100 for window, then drops to 90
+    # Create prices: stable at 100 for window+1 steps, then drops to 90
+    # Episode starts at index=window_size, so we need price change at window_size+2
     window_size = 10
-    prices = [100.0] * (window_size + 5) + [90.0] * 50
+    # Index: 0-10 = 100 (window), 11 = 100 (first step), 12+ = 90 (price drop)
+    prices = [100.0] * (window_size + 2) + [90.0] * 50
     
     env, tmp_path = create_test_env(
         prices=prices, 
@@ -312,14 +314,14 @@ def test_short_profit_on_price_drop():
         obs, info = env.gym_reset()
         initial_nav = info['nav']  # 10,000
 
-        # Open short position at price 100
+        # Open short position at price 100 (step 10->11)
         action_short = np.array([-1.0], dtype=np.float32)
         obs, reward, terminated, truncated, info = env.gym_step(action_short)
         
         nav_after_short = info['nav']
         position_units = info['position']  # Should be -100 units
         
-        # Advance one more step (price drops to 90)
+        # Advance one more step - price drops to 90 (step 11->12)
         action_hold = np.array([-1.0], dtype=np.float32)
         obs, reward, terminated, truncated, info = env.gym_step(action_hold)
         
@@ -347,9 +349,11 @@ def test_short_loss_on_price_rise():
     """Test: Short position should lose when price rises."""
     print("\nTest 8: Short Loss on Price Rise...")
 
-    # Create prices: stable at 100 for window, then rises to 110
+    # Create prices: stable at 100 for window+1 steps, then rises to 110
+    # Episode starts at index=window_size, so we need price change at window_size+2
     window_size = 10
-    prices = [100.0] * (window_size + 5) + [110.0] * 50
+    # Index: 0-10 = 100 (window), 11 = 100 (first step), 12+ = 110 (price rise)
+    prices = [100.0] * (window_size + 2) + [110.0] * 50
     
     env, tmp_path = create_test_env(
         prices=prices, 
@@ -362,14 +366,14 @@ def test_short_loss_on_price_rise():
         obs, info = env.gym_reset()
         initial_nav = info['nav']  # 10,000
 
-        # Open short position at price 100
+        # Open short position at price 100 (step 10->11)
         action_short = np.array([-1.0], dtype=np.float32)
         obs, reward, terminated, truncated, info = env.gym_step(action_short)
         
         nav_after_short = info['nav']
         position_units = info['position']  # Should be -100 units
         
-        # Advance one more step (price rises to 110)
+        # Advance one more step - price rises to 110 (step 11->12)
         action_hold = np.array([-1.0], dtype=np.float32)
         obs, reward, terminated, truncated, info = env.gym_step(action_hold)
         
