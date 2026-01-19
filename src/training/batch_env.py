@@ -750,10 +750,15 @@ class BatchCryptoEnv(VecEnv):
         min_start = self.window_size
         max_start = self.n_steps - self.episode_length - 1
 
-        # Generate new random starts for done envs
-        new_starts = torch.randint(
-            min_start, max_start, (n_done,), device=self.device
-        )
+        # Generate new starts for done envs
+        if self.random_start and max_start > min_start:
+            # Random starts (training mode)
+            new_starts = torch.randint(
+                min_start, max_start, (n_done,), device=self.device
+            )
+        else:
+            # Sequential start at beginning (evaluation mode)
+            new_starts = torch.full((n_done,), min_start, dtype=torch.long, device=self.device)
 
         # Reset done envs
         self.episode_starts[dones] = new_starts
