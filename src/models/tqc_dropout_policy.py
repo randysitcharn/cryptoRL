@@ -228,6 +228,7 @@ class DropoutCritic(nn.Module):
         super().__init__()
         self.n_critics = n_critics
         self.n_quantiles = n_quantiles
+        self.quantiles_total = n_critics * n_quantiles  # Required by TQC
         self.features_dim = features_dim
         self.action_dim = action_dim
         self.features_extractor = features_extractor
