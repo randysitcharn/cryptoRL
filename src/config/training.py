@@ -90,6 +90,12 @@ class TQCTrainingConfig:
     sde_sample_freq: int = -1  # -1 = resample once per episode
     use_sde_at_warmup: bool = True
 
+    # Actor Noise (alternative to gSDE when use_sde=False)
+    # OrnsteinUhlenbeck noise for temporally correlated exploration
+    use_action_noise: bool = True   # Enable OU noise when use_sde=False
+    action_noise_sigma: float = 0.1  # Noise standard deviation (0.05-0.3)
+    action_noise_theta: float = 0.15  # Mean reversion rate (higher = less correlated)
+
     # --- Callbacks ---
     eval_freq: int = 5_000
     checkpoint_freq: int = 50_000

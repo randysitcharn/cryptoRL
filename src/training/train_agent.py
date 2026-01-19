@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 
 from sb3_contrib import TQC
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
+from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from src.training.callbacks import EvalCallbackWithNoiseControl
 import torch
 import numpy as np
@@ -610,6 +611,21 @@ def train(
     print(f"      features_dim: {market_shape[0]} * {config.d_model} + 1(pos) = {market_shape[0] * config.d_model + 1}")
     print(f"      gSDE: {config.use_sde} (sample_freq={config.sde_sample_freq})")
 
+    # Create action noise if gSDE is disabled
+    action_noise = None
+    if not config.use_sde and config.use_action_noise:
+        n_actions = train_env.action_space.shape[-1]
+        action_noise = OrnsteinUhlenbeckActionNoise(
+            mean=np.zeros(n_actions),
+            sigma=config.action_noise_sigma * np.ones(n_actions),
+            theta=config.action_noise_theta,
+        )
+        print(f"      Action Noise: OrnsteinUhlenbeck (sigma={config.action_noise_sigma}, theta={config.action_noise_theta})")
+    elif not config.use_sde:
+        print("      Action Noise: None (WARNING: deterministic policy)")
+    else:
+        print("      Action Noise: N/A (gSDE active)")
+
     # ==================== Model Creation ====================
     # Use custom name for TensorBoard if provided
     tb_log_name = config.name if config.name else "TQC"
@@ -684,6 +700,7 @@ def train(
             use_sde=config.use_sde,
             sde_sample_freq=config.sde_sample_freq,
             use_sde_at_warmup=config.use_sde_at_warmup,
+            action_noise=action_noise,
             policy_kwargs=policy_kwargs,
             tensorboard_log=config.tensorboard_log,
             verbose=1,
@@ -883,6 +900,13 @@ if __name__ == "__main__":
     # GPU-Vectorized Environment (BatchCryptoEnv)
     parser.add_argument("--use-batch-env", action="store_true",
                         help="Use GPU-vectorized BatchCryptoEnv (10-50x speedup vs SubprocVecEnv)")
+    # Exploration strategy
+    parser.add_argument("--no-sde", action="store_true",
+                        help="Disable gSDE (use OrnsteinUhlenbeck action noise instead)")
+    parser.add_argument("--action-noise-sigma", type=float, default=None,
+                        help="OrnsteinUhlenbeck noise sigma (default: 0.1)")
+    parser.add_argument("--action-noise-theta", type=float, default=None,
+                        help="OrnsteinUhlenbeck noise theta/mean reversion (default: 0.15)")
 
     args = parser.parse_args()
 
@@ -923,6 +947,13 @@ if __name__ == "__main__":
         config.n_envs = args.n_envs
     if args.buffer_size is not None:
         config.buffer_size = args.buffer_size
+    # Exploration strategy overrides
+    if args.no_sde:
+        config.use_sde = False
+    if args.action_noise_sigma is not None:
+        config.action_noise_sigma = args.action_noise_sigma
+    if args.action_noise_theta is not None:
+        config.action_noise_theta = args.action_noise_theta
 
     # Resolve --load-latest to actual checkpoint path
     if config.load_latest:

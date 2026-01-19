@@ -232,42 +232,46 @@ Entraîner plusieurs HMM sur différents timeframes pour capturer les régimes �
 
 ---
 
-### [ ] A/B Testing: gSDE vs Actor Noise
-**Fichier:** `src/training/train_agent.py`, configuration TQC
+### [x] A/B Testing: gSDE vs Actor Noise ✅ IMPLÉMENTÉ
+
+**Fichier:** `src/training/train_agent.py`, `src/config/training.py`
+
+**Statut:** ✅ **IMPLÉMENTÉ** (2026-01-19)
 
 **Description:**
-Comparer deux approches d'exploration pour TQC:
-1. **gSDE (generalized State-Dependent Exploration):** Bruit dans l'espace des paramètres, corrélé au state
+Support pour deux approches d'exploration pour TQC:
+1. **gSDE (generalized State-Dependent Exploration):** Bruit dans l'espace des paramètres, corrélé au state (défaut)
 2. **Actor Noise (OrnsteinUhlenbeckActionNoise):** Bruit sur les actions, indépendant du state
 
-**Protocole A/B proposé:**
+**Configuration:**
 ```python
-# Config A: gSDE (actuel)
-policy_kwargs = dict(use_sde=True, log_std_init=-2.0)
+# Config A: gSDE (défaut)
+use_sde: bool = True
 
-# Config B: Actor Noise (alternative)
-from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
-action_noise = OrnsteinUhlenbeckActionNoise(
-    mean=np.zeros(action_dim),
-    sigma=0.1 * np.ones(action_dim),
-    theta=0.15
-)
-policy_kwargs = dict(use_sde=False)
+# Config B: Actor Noise
+use_sde: bool = False
+use_action_noise: bool = True      # Active OU noise quand gSDE off
+action_noise_sigma: float = 0.1    # Écart-type du bruit (0.05-0.3)
+action_noise_theta: float = 0.15   # Taux de retour à la moyenne
 ```
 
-**Métriques à comparer:**
+**Usage CLI:**
+```bash
+# Défaut: gSDE activé
+python -m src.training.train_agent
+
+# Alternative: OrnsteinUhlenbeck noise
+python -m src.training.train_agent --no-sde --action-noise-sigma 0.1 --action-noise-theta 0.15
+```
+
+**Métriques à comparer (A/B testing):**
 - Sharpe OOS (Walk-Forward)
 - Max Drawdown
 - Stabilité inter-folds
 - Convergence speed (timesteps to plateau)
 - Action smoothness (churn)
 
-**Hypothèses:**
-- gSDE devrait mieux généraliser (exploration state-dependent)
-- Actor noise pourrait être plus stable en début de training
-- Trade-off exploration/exploitation peut différer selon le régime de marché
-
-**Impact:** Identifier la meilleure stratégie d'exploration pour le trading RL, potentiellement améliorer la performance OOS.
+**Impact:** Permet de tester quelle stratégie d'exploration fonctionne mieux pour le trading RL.
 
 ---
 
