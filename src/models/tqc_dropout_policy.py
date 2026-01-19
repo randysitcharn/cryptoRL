@@ -334,10 +334,13 @@ class TQCDropoutPolicy(TQCPolicy):
             print(f"[TQCDropoutPolicy] -> FORCE actor_dropout = 0.0 (Sécurité Active)\n")
             actor_dropout = 0.0
 
-        # Stocker les paramètres AVANT super().__init__
+        # Stocker TOUS les paramètres AVANT super().__init__
+        # Car make_critic() est appelé pendant _build() dans TQCPolicy.__init__
         self.critic_dropout = critic_dropout
         self.actor_dropout = actor_dropout
         self.use_layer_norm = use_layer_norm
+        self.n_quantiles = n_quantiles
+        self.n_critics = n_critics
 
         super().__init__(
             observation_space,
