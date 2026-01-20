@@ -168,18 +168,18 @@ cryptoRL/
 
 | Property | Value |
 |----------|-------|
-| Host | `142.171.48.138` |
-| Port | `24256` |
+| Host | `158.51.110.52` |
+| Port | `20941` |
 | User | `root` |
 | Provider | vast.ai |
 | TensorBoard | Port 8081 |
 
 ```bash
 # Quick connect
-ssh -p 24256 root@142.171.48.138
+ssh -p 20941 root@158.51.110.52
 
 # TensorBoard tunnel
-ssh -p 24256 -L 8081:localhost:8081 root@142.171.48.138
+ssh -p 20941 -L 8081:localhost:8081 root@158.51.110.52
 ```
 
 ---

@@ -22,6 +22,7 @@ __pycache__/
 data/*
 !data/raw/
 !data/raw/.gitkeep
+!data/raw_historical/
 !data/processed/
 !data/processed/.gitkeep
 data/processed/*.csv

@@ -1,34 +1,34 @@
 # Serveur actuel
 
 ```
-SSH_HOST=142.171.48.138
-SSH_PORT=24256
+SSH_HOST=158.51.110.52
+SSH_PORT=20941
 SSH_USER=root
 ```
 
 ## Connexion rapide
 
 ```bash
-ssh -p 24256 root@142.171.48.138
+ssh -p 20941 root@158.51.110.52
 ```
 
 ## SCP (copier donnees)
 
 ```bash
-scp -P 24256 -r data/raw_historical/ root@142.171.48.138:/workspace/cryptoRL/data/
+scp -P 20941 -r data/raw_historical/ root@158.51.110.52:/workspace/cryptoRL/data/
 ```
 
 ## Tunnel TensorBoard
 
 ```bash
-ssh -p 24256 -L 6006:localhost:16006 root@142.171.48.138
-# Ouvrir http://localhost:6006
+ssh -p 20941 -L 8081:localhost:8081 root@158.51.110.52
+# Ouvrir http://localhost:8081
 ```
 
 ## Reconfigurer TensorBoard (si nécessaire)
 
 ```bash
 # Sur le serveur: pointer sur les logs WFO
-pkill -f 'tensorboard.*16006'
-nohup tensorboard --logdir /workspace/cryptoRL/logs/wfo --port 16006 --bind_all > /dev/null 2>&1 &
+pkill -f 'tensorboard.*8081'
+nohup tensorboard --logdir /workspace/cryptoRL/logs/wfo --port 8081 --bind_all > /dev/null 2>&1 &
 ```
