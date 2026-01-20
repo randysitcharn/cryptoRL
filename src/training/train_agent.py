@@ -415,7 +415,8 @@ def create_callbacks(
         print(f"      [WFO Mode] RotatingCheckpointCallback enabled (freq={safety_freq}, keeps last only)")
 
     # Detail Tensorboard callback for reward components
-    detail_callback = DetailTensorboardCallback(verbose=0)
+    # Uses config.log_freq for consistent logging frequency across all callbacks
+    detail_callback = DetailTensorboardCallback(log_freq=config.log_freq, verbose=0)
     callbacks.append(detail_callback)
 
     # Curriculum Learning callback (3-Phase: Discovery → Discipline → Refinement)
@@ -434,6 +435,7 @@ def create_callbacks(
     # ═══════════════════════════════════════════════════════════════════════
 
     # PLO Drawdown: Increase downside penalty when DD > 10%
+    # All PLO callbacks use config.log_freq for consistent logging
     plo_dd_callback = PLOAdaptivePenaltyCallback(
         dd_threshold=0.10,
         dd_lambda_min=1.0,
@@ -445,6 +447,7 @@ def create_callbacks(
         use_prediction=True,
         max_lambda_change=0.05,
         dd_quantile=0.9,
+        log_freq=config.log_freq,
         verbose=1
     )
     callbacks.append(plo_dd_callback)
@@ -459,6 +462,7 @@ def create_callbacks(
         turnover_Kd=0.4,
         use_prediction=True,
         max_lambda_change=0.08,
+        log_freq=config.log_freq,
         verbose=1
     )
     callbacks.append(plo_churn_callback)
@@ -473,6 +477,7 @@ def create_callbacks(
         jerk_Kd=0.5,
         decay_rate=0.99,
         max_lambda_change=0.1,
+        log_freq=config.log_freq,
         verbose=1
     )
     callbacks.append(plo_smooth_callback)

@@ -357,47 +357,69 @@ class DetailTensorboardCallback(BaseCallback):
 
     Logs: log_return, penalty_vol, churn_penalty, total_raw.
     Also captures diagnostic metrics for post-training analysis.
+
+    IMPORTANT: Uses log_freq to limit TensorBoard writes and buffer_size to
+    prevent memory exhaustion on long training runs (90M+ steps).
     """
 
-    def __init__(self, verbose: int = 0):
+    # Maximum buffer size for diagnostic metrics (prevents OOM on long runs)
+    MAX_BUFFER_SIZE = 100_000
+
+    def __init__(self, log_freq: int = 100, verbose: int = 0):
+        """
+        Args:
+            log_freq: Logging frequency (use config.log_freq for consistency).
+            verbose: Verbosity level.
+        """
         super().__init__(verbose)
+        self.log_freq = log_freq
         self.episode_churn_penalties = []
         self.episode_log_returns = []
         self.episode_position_deltas = []
 
-        # Diagnostic metrics
-        self.all_actions = []
-        self.entropy_values = []
-        self.critic_losses = []
-        self.actor_losses = []
-        self.churn_ratios = []
-        self.actor_grad_norms = []
-        self.critic_grad_norms = []
+        # Diagnostic metrics (bounded buffers to prevent OOM)
+        # Using deque for O(1) append and automatic size limiting
+        self.all_actions = deque(maxlen=self.MAX_BUFFER_SIZE)
+        self.entropy_values = deque(maxlen=self.MAX_BUFFER_SIZE)
+        self.critic_losses = deque(maxlen=self.MAX_BUFFER_SIZE)
+        self.actor_losses = deque(maxlen=self.MAX_BUFFER_SIZE)
+        self.churn_ratios = deque(maxlen=self.MAX_BUFFER_SIZE)
+        self.actor_grad_norms = deque(maxlen=self.MAX_BUFFER_SIZE)
+        self.critic_grad_norms = deque(maxlen=self.MAX_BUFFER_SIZE)
 
     def _on_step(self) -> bool:
-        # Track actions for saturation analysis
-        if self.locals.get("actions") is not None:
-            self.all_actions.extend(np.abs(self.locals["actions"]).flatten())
+        # Only process every log_freq steps to reduce overhead
+        should_log = (self.n_calls % self.log_freq == 0)
+
+        # Track actions for saturation analysis (sampled, not every step)
+        if should_log and self.locals.get("actions") is not None:
+            # Sample a subset of actions to avoid memory explosion
+            actions = np.abs(self.locals["actions"]).flatten()
+            # Take mean of batch instead of storing all values
+            self.all_actions.append(float(np.mean(actions)))
 
         # ═══════════════════════════════════════════════════════════════════
         # DIRECT GPU METRIC POLLING (replaces info-based logging)
+        # Only log at log_freq intervals to reduce TensorBoard file size
         # ═══════════════════════════════════════════════════════════════════
-        # Unwrap to find BatchCryptoEnv under SB3 wrappers
-        real_env = get_underlying_batch_env(self.model.env)
+        if should_log:
+            # Unwrap to find BatchCryptoEnv under SB3 wrappers
+            real_env = get_underlying_batch_env(self.model.env)
 
-        if real_env is not None and hasattr(real_env, "get_global_metrics"):
-            metrics = real_env.get_global_metrics()
-            for key, value in metrics.items():
-                # Use record_mean for smoother TensorBoard curves
-                self.logger.record_mean(f"internal/{key}", value)
+            if real_env is not None and hasattr(real_env, "get_global_metrics"):
+                metrics = real_env.get_global_metrics()
+                for key, value in metrics.items():
+                    # Use record_mean for smoother TensorBoard curves
+                    self.logger.record_mean(f"internal/{key}", value)
 
-            # Track for episode aggregation
-            if "reward/pnl_component" in metrics:
-                self.episode_log_returns.append(metrics["reward/pnl_component"])
-            if "reward/churn_cost" in metrics:
-                self.episode_churn_penalties.append(metrics["reward/churn_cost"])
+                # Track for episode aggregation
+                if "reward/pnl_component" in metrics:
+                    self.episode_log_returns.append(metrics["reward/pnl_component"])
+                if "reward/churn_cost" in metrics:
+                    self.episode_churn_penalties.append(metrics["reward/churn_cost"])
 
         # Episode end logging (from info dict - still needed for episode stats)
+        # This is event-driven, not frequency-limited
         if self.locals.get("infos"):
             info = self.locals["infos"][0]
             if "episode" in info:
@@ -418,34 +440,35 @@ class DetailTensorboardCallback(BaseCallback):
                 self.episode_log_returns = []
                 self.episode_position_deltas = []
 
-        # Capture training metrics
-        try:
-            if hasattr(self.model, 'logger') and self.model.logger is not None:
-                name_to_value = self.model.logger.name_to_value
-                if "train/ent_coef" in name_to_value:
-                    self.entropy_values.append(name_to_value["train/ent_coef"])
-                if "train/critic_loss" in name_to_value:
-                    self.critic_losses.append(name_to_value["train/critic_loss"])
-                if "train/actor_loss" in name_to_value:
-                    self.actor_losses.append(name_to_value["train/actor_loss"])
-        except (KeyError, AttributeError):
-            pass
+        # Capture training metrics (only at log_freq intervals)
+        if should_log:
+            try:
+                if hasattr(self.model, 'logger') and self.model.logger is not None:
+                    name_to_value = self.model.logger.name_to_value
+                    if "train/ent_coef" in name_to_value:
+                        self.entropy_values.append(name_to_value["train/ent_coef"])
+                    if "train/critic_loss" in name_to_value:
+                        self.critic_losses.append(name_to_value["train/critic_loss"])
+                    if "train/actor_loss" in name_to_value:
+                        self.actor_losses.append(name_to_value["train/actor_loss"])
+            except (KeyError, AttributeError):
+                pass
 
-        # Log gradient norms
-        try:
-            if hasattr(self.model, 'actor') and self.model.actor is not None:
-                actor_grad_norm = self._compute_grad_norm(self.model.actor)
-                if actor_grad_norm is not None and actor_grad_norm > 0:
-                    self.logger.record_mean("grad/actor_norm", actor_grad_norm)
-                    self.actor_grad_norms.append(actor_grad_norm)
+            # Log gradient norms
+            try:
+                if hasattr(self.model, 'actor') and self.model.actor is not None:
+                    actor_grad_norm = self._compute_grad_norm(self.model.actor)
+                    if actor_grad_norm is not None and actor_grad_norm > 0:
+                        self.logger.record_mean("grad/actor_norm", actor_grad_norm)
+                        self.actor_grad_norms.append(actor_grad_norm)
 
-            if hasattr(self.model, 'critic') and self.model.critic is not None:
-                critic_grad_norm = self._compute_grad_norm(self.model.critic)
-                if critic_grad_norm is not None and critic_grad_norm > 0:
-                    self.logger.record_mean("grad/critic_norm", critic_grad_norm)
-                    self.critic_grad_norms.append(critic_grad_norm)
-        except Exception:
-            pass
+                if hasattr(self.model, 'critic') and self.model.critic is not None:
+                    critic_grad_norm = self._compute_grad_norm(self.model.critic)
+                    if critic_grad_norm is not None and critic_grad_norm > 0:
+                        self.logger.record_mean("grad/critic_norm", critic_grad_norm)
+                        self.critic_grad_norms.append(critic_grad_norm)
+            except Exception:
+                pass
 
         return True
 
