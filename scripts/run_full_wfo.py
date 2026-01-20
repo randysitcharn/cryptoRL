@@ -61,7 +61,7 @@ class WFOConfig:
     results_path: str = "results/wfo_results.csv"
 
     # WFO Parameters
-    train_months: int = 14       # Training data (excluding eval)
+    train_months: int = 13       # Training data (excluding eval)
     eval_months: int = 1         # In-train evaluation (last month of train window)
     test_months: int = 3         # Out-of-sample test
     step_months: int = 3         # Rolling step
