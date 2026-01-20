@@ -100,6 +100,7 @@ class TQCTrainingConfig:
     eval_freq: int = 5_000
     checkpoint_freq: int = 50_000
     log_freq: int = 100
+    verbose: int = 1  # SB3 verbosity level
 
     # --- Resume Training ---
     load_model_path: Optional[str] = None
