@@ -6,6 +6,13 @@ SSH_PORT=20941
 SSH_USER=root
 ```
 
+## IMPORTANT: Rate Limiting
+
+vast.ai bloque les connexions SSH trop fréquentes. Pour éviter d'être bloqué:
+- **Attendre 20 secondes** entre chaque commande SSH
+- Ne pas faire de requêtes SSH en parallèle
+- Si "Connection refused", attendre 60 secondes avant de réessayer
+
 ## Connexion rapide
 
 ```bash
