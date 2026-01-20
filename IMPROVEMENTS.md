@@ -141,6 +141,54 @@ L'annealing fait maintenant partie de la solution combinée approuvée.
 
 ---
 
+### [x] WFO In-Train Evaluation ✅ IMPLÉMENTÉ
+
+**Fichier:** `scripts/run_full_wfo.py`
+
+**Statut:** ✅ **IMPLÉMENTÉ** (2026-01-19)
+
+**Description:**
+Ajoute un split "eval" entre train et test pour permettre l'évaluation in-train (EvalCallback) pendant le WFO.
+
+**Schéma:**
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ◄────── 14 mois ──────►◄─ 1m ─►◄────── 3 mois ──────►                 │
+│  ┌─────────────────────┐┌──────┐┌─────────────────────┐                │
+│  │       TRAIN         ││ EVAL ││     TEST (OOS)      │                │
+│  │   (apprentissage)   ││(in-  ││  (validation WFO)   │                │
+│  │                     ││train)││                     │                │
+│  └─────────────────────┘└──────┘└─────────────────────┘                │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Configuration:**
+```python
+# WFOConfig (scripts/run_full_wfo.py)
+train_months: int = 14       # Training data (excluding eval)
+eval_months: int = 1         # In-train evaluation
+test_months: int = 3         # Out-of-sample test
+```
+
+**Usage CLI:**
+```bash
+# Défaut: 14m train / 1m eval / 3m test
+python scripts/run_full_wfo.py
+
+# Personnalisé: 12m train / 2m eval / 3m test  
+python scripts/run_full_wfo.py --train-months 12 --eval-months 2
+```
+
+**Avantages:**
+- Early stopping intelligent via EvalCallback
+- Best model selection basé sur eval (pas train)
+- Signal 3 OverfittingGuard (train/eval divergence) fonctionne
+- Pas de data leakage (test reste invisible)
+
+**Impact:** Détection précoce de l'overfitting, meilleure sélection de modèle.
+
+---
+
 ### [ ] Multi-Asset Support
 **Fichier:** `src/training/batch_env.py`
 

@@ -61,11 +61,12 @@ class WFOConfig:
     results_path: str = "results/wfo_results.csv"
 
     # WFO Parameters
-    train_months: int = 18
-    test_months: int = 3
-    step_months: int = 3  # Rolling step
-    hours_per_month: int = 720  # 30 days * 24 hours
-    window_size: int = 64  # Observation window for transformer encoder
+    train_months: int = 14       # Training data (excluding eval)
+    eval_months: int = 1         # In-train evaluation (last month of train window)
+    test_months: int = 3         # Out-of-sample test
+    step_months: int = 3         # Rolling step
+    hours_per_month: int = 720   # 30 days * 24 hours
+    window_size: int = 64        # Observation window for transformer encoder
 
     # Training Parameters
     mae_epochs: int = 90
@@ -131,15 +132,28 @@ class WFOConfig:
 
     @property
     def train_rows(self) -> int:
+        """Training rows (excluding eval)."""
         return self.train_months * self.hours_per_month
 
     @property
+    def eval_rows(self) -> int:
+        """In-train evaluation rows."""
+        return self.eval_months * self.hours_per_month
+
+    @property
     def test_rows(self) -> int:
+        """Out-of-sample test rows."""
         return self.test_months * self.hours_per_month
 
     @property
     def step_rows(self) -> int:
+        """Rolling step size."""
         return self.step_months * self.hours_per_month
+
+    @property
+    def full_train_rows(self) -> int:
+        """Full train window (train + eval) for scaler fitting."""
+        return self.train_rows + self.eval_rows
 
 
 # =============================================================================
@@ -213,11 +227,19 @@ class WFOPipeline:
         """
         Calculate segment boundaries for rolling WFO.
 
+        Segment structure:
+            [train_start ... train_end] [eval_start ... eval_end] [test_start ... test_end]
+            |<------- train_months ---->|<-- eval_months -->|<----- test_months ----->|
+
+        The eval window is the last month(s) of the training period, used for
+        in-train evaluation (EvalCallback) to detect overfitting early.
+
         Returns:
-            List of dicts with train_start, train_end, test_start, test_end
+            List of dicts with train_start, train_end, eval_start, eval_end, test_start, test_end
         """
         segments = []
-        segment_size = self.config.train_rows + self.config.test_rows
+        # Total segment size: train + eval + test
+        segment_size = self.config.train_rows + self.config.eval_rows + self.config.test_rows
 
         start = 0
         segment_id = 0
@@ -225,13 +247,17 @@ class WFOPipeline:
         while start + segment_size <= total_rows:
             train_start = start
             train_end = start + self.config.train_rows
-            test_start = train_end
-            test_end = train_end + self.config.test_rows
+            eval_start = train_end
+            eval_end = eval_start + self.config.eval_rows
+            test_start = eval_end
+            test_end = test_start + self.config.test_rows
 
             segments.append({
                 'id': segment_id,
                 'train_start': train_start,
                 'train_end': train_end,
+                'eval_start': eval_start,
+                'eval_end': eval_end,
                 'test_start': test_start,
                 'test_end': test_end,
             })
@@ -245,17 +271,23 @@ class WFOPipeline:
         self,
         df_raw: pd.DataFrame,
         segment: Dict[str, int]
-    ) -> tuple[pd.DataFrame, pd.DataFrame, RobustScaler]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, RobustScaler]:
         """
         Preprocess a segment with leak-free scaling.
 
-        1. Extract train/test slices from raw data
+        1. Extract train/eval/test slices from raw data
         2. Apply feature engineering
-        3. Fit scaler on TRAIN only
-        4. Transform both TRAIN and TEST
+        3. Fit scaler on TRAIN only (NOT eval, to prevent leakage)
+        4. Transform TRAIN, EVAL, and TEST
+
+        Segment structure:
+            [train] [eval] [test]
+            - train: Used for TQC learning
+            - eval: Used for in-train EvalCallback (early stopping, best model)
+            - test: Out-of-sample final evaluation
 
         Returns:
-            (train_df, test_df, scaler)
+            (train_df, eval_df, test_df, scaler)
         """
         segment_id = segment['id']
         print(f"\n[Segment {segment_id}] Preprocessing...")
@@ -275,24 +307,28 @@ class WFOPipeline:
         df_features = self._df_features_global.loc[start_time:end_time].copy()
         print(f"  Using pre-computed features: {start_time} to {end_time} ({len(df_features)} rows)")
 
-        # 2. Split train/test (take from END to get most recent valid data)
+        # 2. Split train/eval/test (take from END to get most recent valid data)
         train_len = segment['train_end'] - segment['train_start']
+        eval_len = segment['eval_end'] - segment['eval_start']
         test_len = segment['test_end'] - segment['test_start']
-        total_needed = train_len + test_len
+        total_needed = train_len + eval_len + test_len
 
         if len(df_features) < total_needed:
             print(f"  [WARNING] Not enough data: {len(df_features)} < {total_needed}")
+            # Fallback: split proportionally
             train_df = df_features.iloc[:train_len].copy()
-            test_df = df_features.iloc[train_len:].copy()
+            eval_df = df_features.iloc[train_len:train_len + eval_len].copy()
+            test_df = df_features.iloc[train_len + eval_len:].copy()
         else:
             # CRITICAL: Take from the END to match fallback behavior
-            train_df = df_features.iloc[-total_needed:-test_len].copy()
+            train_df = df_features.iloc[-total_needed:-(eval_len + test_len)].copy()
+            eval_df = df_features.iloc[-(eval_len + test_len):-test_len].copy()
             test_df = df_features.iloc[-test_len:].copy()
 
-        print(f"  Train: {len(train_df)} rows, Test: {len(test_df)} rows")
+        print(f"  Train: {len(train_df)} rows, Eval: {len(eval_df)} rows, Test: {len(test_df)} rows")
 
-        # 4. Leak-Free Scaling: fit on TRAIN only
-        print("  Applying RobustScaler (fit on train only)...")
+        # 3. Leak-Free Scaling: fit on TRAIN only (NOT eval!)
+        print("  Applying RobustScaler (fit on train only, NOT eval)...")
         scaler = RobustScaler()
 
         # Identify columns to scale
@@ -304,37 +340,41 @@ class WFOPipeline:
 
         print(f"  Scaling {len(cols_to_scale)} columns")
 
-        # Fit on train
+        # Fit on train ONLY
         scaler.fit(train_df[cols_to_scale])
 
-        # Transform both
+        # Transform all three splits
         train_df[cols_to_scale] = scaler.transform(train_df[cols_to_scale])
+        eval_df[cols_to_scale] = scaler.transform(eval_df[cols_to_scale])
         test_df[cols_to_scale] = scaler.transform(test_df[cols_to_scale])
 
         # Clip scaled features to [-5, 5]
         train_df[cols_to_scale] = train_df[cols_to_scale].clip(-5, 5)
+        eval_df[cols_to_scale] = eval_df[cols_to_scale].clip(-5, 5)
         test_df[cols_to_scale] = test_df[cols_to_scale].clip(-5, 5)
         print(f"  Clipped {len(cols_to_scale)} scaled columns to [-5, 5]")
 
         # Clip ZScores to [-5, 5] (already normalized, just safety clip)
         zscore_cols = [c for c in train_df.columns if 'ZScore' in c]
         train_df[zscore_cols] = train_df[zscore_cols].clip(-5, 5)
+        eval_df[zscore_cols] = eval_df[zscore_cols].clip(-5, 5)
         test_df[zscore_cols] = test_df[zscore_cols].clip(-5, 5)
         print(f"  Clipped {len(zscore_cols)} ZScore columns to [-5, 5]")
 
-        return train_df, test_df, scaler
+        return train_df, eval_df, test_df, scaler
 
     def train_hmm(
         self,
         train_df: pd.DataFrame,
+        eval_df: pd.DataFrame,
         test_df: pd.DataFrame,
         segment_id: int
-    ) -> tuple[pd.DataFrame, pd.DataFrame, RegimeDetector, int]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, RegimeDetector, int]:
         """
-        Train HMM on train data and predict on both.
+        Train HMM on train data and predict on train, eval, and test.
 
         Returns:
-            (train_with_hmm, test_with_hmm, detector, context_rows)
+            (train_with_hmm, eval_with_hmm, test_with_hmm, detector, context_rows)
             context_rows: Number of buffer rows prepended to test for env warmup
         """
         print(f"\n[Segment {segment_id}] Training HMM...")
@@ -350,14 +390,28 @@ class WFOPipeline:
             segment_id=segment_id
         )
 
-        # Predict on test WITH CONTEXT BUFFER (for HMM lookback requirements)
+        # Predict on eval WITH CONTEXT BUFFER (for HMM lookback requirements)
         # HMM needs 168h window, use 336h to be safe
         max_lookback = 336
-        context_rows = min(max_lookback, len(train_df))
+        eval_context_rows = min(max_lookback, len(train_df))
 
-        # Include last context_rows from train as buffer for test prediction
+        # Eval: use last rows from train as context
+        eval_with_context = pd.concat([
+            train_df.tail(eval_context_rows),
+            eval_df
+        ], ignore_index=True)
+        eval_with_hmm_full = detector.predict(eval_with_context)
+        # Remove context rows from eval (we want clean eval data)
+        eval_with_hmm = eval_with_hmm_full.iloc[eval_context_rows:].reset_index(drop=True)
+
+        # Predict on test WITH CONTEXT BUFFER
+        # For test, use last rows from (train + eval) as context
+        combined_train_eval = pd.concat([train_df, eval_df], ignore_index=True)
+        context_rows = min(max_lookback, len(combined_train_eval))
+
+        # Include last context_rows from combined as buffer for test prediction
         test_with_context = pd.concat([
-            train_df.tail(context_rows),
+            combined_train_eval.tail(context_rows),
             test_df
         ], ignore_index=True)
 
@@ -381,15 +435,17 @@ class WFOPipeline:
         # Remove HMM intermediate features (keep only Prob_*)
         hmm_features = ['HMM_Trend', 'HMM_Vol', 'HMM_Momentum']
         train_final = train_with_hmm.drop(columns=hmm_features, errors='ignore')
+        eval_final = eval_with_hmm.drop(columns=hmm_features, errors='ignore')
         test_final = test_with_hmm.drop(columns=hmm_features, errors='ignore')
 
-        print(f"  Train final: {train_final.shape}, Test final: {test_final.shape} (context_rows={context_rows})")
+        print(f"  Train final: {train_final.shape}, Eval final: {eval_final.shape}, Test final: {test_final.shape} (context_rows={context_rows})")
 
-        return train_final, test_final, detector, context_rows
+        return train_final, eval_final, test_final, detector, context_rows
 
     def save_segment_data(
         self,
         train_df: pd.DataFrame,
+        eval_df: pd.DataFrame,
         test_df: pd.DataFrame,
         scaler: RobustScaler,
         segment_id: int,
@@ -403,15 +459,19 @@ class WFOPipeline:
 
         # Save parquet files
         train_path = os.path.join(data_dir, "train.parquet")
+        eval_path = os.path.join(data_dir, "eval.parquet")
         test_path = os.path.join(data_dir, "test.parquet")
         train_df.to_parquet(train_path, index=False)
+        eval_df.to_parquet(eval_path, index=False)
         test_df.to_parquet(test_path, index=False)
 
         # Save metadata (for eval-only mode)
         metadata = {
             'context_rows': context_rows,
             'total_test_rows': len(test_df),
-            'actual_test_rows': len(test_df) - context_rows
+            'actual_test_rows': len(test_df) - context_rows,
+            'eval_rows': len(eval_df),
+            'train_rows': len(train_df)
         }
         metadata_path = os.path.join(data_dir, "metadata.json")
         with open(metadata_path, 'w') as f:
@@ -424,9 +484,9 @@ class WFOPipeline:
         with open(scaler_path, 'wb') as f:
             pickle.dump({'scaler': scaler, 'columns': list(train_df.columns)}, f)
 
-        print(f"  Saved: {train_path}, {test_path}, {metadata_path}")
+        print(f"  Saved: {train_path}, {eval_path}, {test_path}, {metadata_path}")
 
-        return train_path, test_path
+        return train_path, eval_path, test_path
 
     def train_mae(self, train_path: str, segment_id: int) -> str:
         """
@@ -480,10 +540,11 @@ class WFOPipeline:
         segment_id: int,
         use_batch_env: bool = False,
         resume: bool = False,
-        init_model_path: Optional[str] = None
+        init_model_path: Optional[str] = None,
+        eval_path: Optional[str] = None
     ) -> tuple[str, Dict[str, Any]]:
         """
-        Train TQC agent on segment train data.
+        Train TQC agent on segment train data with optional in-train evaluation.
 
         Args:
             train_path: Path to train data parquet.
@@ -492,6 +553,8 @@ class WFOPipeline:
             use_batch_env: If True, use GPU-accelerated BatchCryptoEnv.
             resume: If True, resume from tqc_last.zip (continues TensorBoard steps).
             init_model_path: Path to model for warm start (Chain of Inheritance).
+            eval_path: Path to eval data parquet for in-train EvalCallback.
+                       If provided, enables early stopping and best model selection.
 
         Returns:
             Tuple of (path to saved agent, training metrics dict).
@@ -541,10 +604,15 @@ class WFOPipeline:
         config.tensorboard_log = f"logs/wfo/segment_{segment_id}/"
         config.name = f"WFO_seg{segment_id}"
 
-        # NOTE: eval_data_path set to None to disable EvalCallback (WFO mode).
-        # This prevents data leakage and crashes from mismatched eval environments.
-        # Safety CheckpointCallback saves every 100k steps instead.
-        config.eval_data_path = None  # WFO mode: disable EvalCallback
+        # In-train evaluation: use eval_path for EvalCallback if provided
+        # This enables early stopping and best model selection during WFO
+        if eval_path and os.path.exists(eval_path):
+            config.eval_data_path = eval_path
+            print(f"  [Eval In-Train] Enabled with {eval_path}")
+            print(f"  [Eval In-Train] EvalCallback will run every {config.eval_freq} steps")
+        else:
+            config.eval_data_path = None
+            print("  [Eval In-Train] Disabled (no eval_path provided)")
 
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         os.makedirs(config.tensorboard_log, exist_ok=True)
@@ -909,8 +977,9 @@ class WFOPipeline:
         segment_id = segment['id']
         print("\n" + "=" * 70)
         print(f"SEGMENT {segment_id}")
-        print(f"Train: rows {segment['train_start']} - {segment['train_end']}")
-        print(f"Test:  rows {segment['test_start']} - {segment['test_end']}")
+        print(f"Train: rows {segment['train_start']} - {segment['train_end']} ({self.config.train_months}m)")
+        print(f"Eval:  rows {segment['eval_start']} - {segment['eval_end']} ({self.config.eval_months}m)")
+        print(f"Test:  rows {segment['test_start']} - {segment['test_end']} ({self.config.test_months}m)")
         print("=" * 70)
 
         # --- Define Paths ---
@@ -925,12 +994,21 @@ class WFOPipeline:
         hmm_path = os.path.join(models_dir, "hmm.pkl")
         scaler_path = os.path.join(models_dir, "scaler.pkl")
         train_path = os.path.join(data_dir, "train.parquet")
+        eval_path = os.path.join(data_dir, "eval.parquet")
         test_path = os.path.join(data_dir, "test.parquet")
         metadata_path = os.path.join(data_dir, "metadata.json")
         encoder_path = os.path.join(weights_dir, "encoder.pth")
 
         # --- 1. Preprocessing & HMM Logic (Smart Skip) ---
-        if os.path.exists(hmm_path) and os.path.exists(train_path) and os.path.exists(test_path) and os.path.exists(metadata_path):
+        all_data_exists = (
+            os.path.exists(hmm_path) and 
+            os.path.exists(train_path) and 
+            os.path.exists(eval_path) and
+            os.path.exists(test_path) and 
+            os.path.exists(metadata_path)
+        )
+        
+        if all_data_exists:
             print(f"[SKIP] Found existing HMM and processed data for Segment {segment_id}. Loading from disk...")
 
             # Load Metadata (context_rows)
@@ -942,14 +1020,14 @@ class WFOPipeline:
         else:
             print(f"[EXEC] Processing data and training HMM for Segment {segment_id}...")
             # Normal flow: Preprocess -> Train HMM -> Save
-            train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
-            train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, segment_id)
+            train_df, eval_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+            train_df, eval_df, test_df, hmm, context_rows = self.train_hmm(train_df, eval_df, test_df, segment_id)
 
             # Save artifacts for future skips
-            self.save_segment_data(train_df, test_df, scaler, segment_id, context_rows)
+            self.save_segment_data(train_df, eval_df, test_df, scaler, segment_id, context_rows)
 
             # Cleanup dataframes
-            del train_df, test_df, hmm
+            del train_df, eval_df, test_df, hmm
             gc.collect()
 
         # --- 2. MAE Logic (Smart Skip) ---
@@ -959,12 +1037,13 @@ class WFOPipeline:
             print(f"[EXEC] Training MAE Foundation Model for Segment {segment_id}...")
             encoder_path = self.train_mae(train_path, segment_id)
 
-        # 5. TQC Training (with Chain of Inheritance support)
+        # 5. TQC Training (with Chain of Inheritance support + Eval In-Train)
         tqc_path, train_metrics = self.train_tqc(
             train_path, encoder_path, segment_id,
             use_batch_env=use_batch_env,
             resume=resume,
-            init_model_path=init_model_path
+            init_model_path=init_model_path,
+            eval_path=eval_path  # Enable EvalCallback for in-train evaluation
         )
 
         # === 5.5 Guard Fail-over Logic ===
@@ -1543,8 +1622,10 @@ class WFOPipeline:
         print(f"\nStart time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"\nConfiguration:")
         print(f"  Train: {self.config.train_months} months ({self.config.train_rows} rows)")
-        print(f"  Test: {self.config.test_months} months ({self.config.test_rows} rows)")
-        print(f"  Step: {self.config.step_months} months ({self.config.step_rows} rows)")
+        print(f"  Eval:  {self.config.eval_months} months ({self.config.eval_rows} rows) [In-Train EvalCallback]")
+        print(f"  Test:  {self.config.test_months} months ({self.config.test_rows} rows) [OOS Final Evaluation]")
+        print(f"  Step:  {self.config.step_months} months ({self.config.step_rows} rows)")
+        print(f"  Total train window: {self.config.train_months + self.config.eval_months} months")
         print(f"  Volatility Scaling: Target={self.config.target_volatility}, Window={self.config.vol_window}")
         print(f"  GPU Acceleration: {'BatchCryptoEnv' if self.config.use_batch_env else 'SubprocVecEnv (CPU)'}")
 
@@ -1751,18 +1832,18 @@ class WFOPipeline:
 
             try:
                 # 1. Preprocessing
-                train_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+                train_df, eval_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
 
                 # 2. HMM (with context buffer)
-                train_df, test_df, hmm, context_rows = self.train_hmm(train_df, test_df, seg_id)
+                train_df, eval_df, test_df, hmm, context_rows = self.train_hmm(train_df, eval_df, test_df, seg_id)
 
                 # 3. Save data (with metadata)
-                train_path, test_path = self.save_segment_data(
-                    train_df, test_df, scaler, seg_id, context_rows
+                train_path, eval_path, test_path = self.save_segment_data(
+                    train_df, eval_df, test_df, scaler, seg_id, context_rows
                 )
 
                 # Cleanup
-                del train_df, test_df, hmm
+                del train_df, eval_df, test_df, hmm
                 gc.collect()
 
                 # 4. Check encoder exists
@@ -1847,11 +1928,13 @@ def main():
     parser.add_argument("--mae-epochs", type=int, default=WFOConfig.mae_epochs,
                         help="MAE training epochs per segment")
     parser.add_argument("--train-months", type=int, default=WFOConfig.train_months,
-                        help="Training window in months")
+                        help="Training window in months (default: 14)")
+    parser.add_argument("--eval-months", type=int, default=WFOConfig.eval_months,
+                        help="In-train eval window in months (default: 1)")
     parser.add_argument("--test-months", type=int, default=WFOConfig.test_months,
-                        help="Test window in months")
+                        help="OOS test window in months (default: 3)")
     parser.add_argument("--step-months", type=int, default=WFOConfig.step_months,
-                        help="Rolling step in months")
+                        help="Rolling step in months (default: 3)")
     parser.add_argument("--eval-only", action="store_true",
                         help="Re-run evaluation only (skip MAE/TQC training)")
     parser.add_argument("--eval-segments", type=str, default=None,
@@ -1891,6 +1974,7 @@ def main():
     config.tqc_timesteps = args.timesteps
     config.mae_epochs = args.mae_epochs
     config.train_months = args.train_months
+    config.eval_months = args.eval_months
     config.test_months = args.test_months
     config.step_months = args.step_months
     # Default to GPU (True) unless explicitly disabled via CLI
