@@ -36,7 +36,7 @@ class TQCTrainingConfig:
     commission: float = 0.0015  # 0.15% - Higher cost during training (penalty)
     train_ratio: float = 0.8
     episode_length: int = 2048
-    eval_episode_length: int = 720  # 1 month eval (30 days * 24h)
+    eval_episode_length: int = 600  # Safe value < (720 - window_size - 1)
 
     # Reward function (x100 SCALE applied in env.py)
     reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
