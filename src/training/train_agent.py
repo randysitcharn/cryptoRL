@@ -113,7 +113,13 @@ class RotatingCheckpointCallback(CheckpointCallback):
     """
 
     def __init__(self, save_freq: int, save_path: str, name_prefix: str = "rl_model", verbose: int = 0):
-        super().__init__(save_freq, save_path, name_prefix, verbose, save_replay_buffer=False)
+        super().__init__(
+            save_freq=save_freq,
+            save_path=save_path,
+            name_prefix=name_prefix,
+            save_replay_buffer=False,
+            verbose=verbose,
+        )
         self.last_model_path: Optional[str] = None
 
     def _on_step(self) -> bool:
