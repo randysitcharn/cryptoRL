@@ -207,6 +207,17 @@ class BatchCryptoEnv(VecEnv):
                 shape=(1,),
                 dtype=np.float32
             ),
+            # ═══════════════════════════════════════════════════════════════════
+            # MORL: Cost preference parameter w_cost ∈ [0, 1]
+            # 0 = Scalping (ignore costs, max profit)
+            # 1 = Buy & Hold (minimize costs, conservative)
+            # Agent learns π(a|s, w_cost) - policy conditioned on preference
+            # ═══════════════════════════════════════════════════════════════════
+            "w_cost": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(1,),
+                dtype=np.float32
+            ),
         })
         self.action_space = spaces.Box(
             low=-1.0, high=1.0,
@@ -276,6 +287,14 @@ class BatchCryptoEnv(VecEnv):
         # ═══════════════════════════════════════════════════════════════════
         self.prev_position_deltas = torch.zeros(n, device=device)
         self.latest_jerks = torch.zeros(n, device=device)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # MORL: w_cost preference parameter per environment
+        # Shape: (n_envs, 1) for proper broadcasting in reward calculation
+        # Sampled at reset() with biased distribution (20%/60%/20%)
+        # ═══════════════════════════════════════════════════════════════════
+        self.w_cost = torch.zeros(n, 1, device=device)
+        self._eval_w_cost = None  # Fixed w_cost for evaluation mode (None = sample)
 
         # Reward component buffers (pour observabilité)
         self._rew_pnl = torch.zeros(n, device=device)
@@ -367,17 +386,18 @@ class BatchCryptoEnv(VecEnv):
         dones: torch.Tensor,
     ) -> torch.Tensor:
         """
-        SOTA Reward: Curriculum-Based Risk & Cost Gating with PLO Multipliers.
+        MORL Reward: Multi-Objective Scalarization with Conditioned Preference.
 
-        Based on: Moody & Saffell (Direct RL) + AAAI 2024 Curriculum Learning + PLO (2025).
+        Based on: Abels et al. (ICML 2019) - Dynamic Weights in Multi-Objective Deep RL.
 
-        Formula:
-            reward = log_returns - curriculum_lambda * (churn_penalty + downside_risk) - smoothness_penalty
+        Architecture:
+            - Agent sees w_cost ∈ [0, 1] in observation (Conditioned Network)
+            - Reward = r_perf + w_cost * r_cost * MAX_PENALTY_SCALE
+            - w_cost = 0: Scalping mode (ignore costs, max profit)
+            - w_cost = 1: B&H mode (minimize costs, conservative)
 
-        PLO Integration:
-            - downside_risk *= downside_multiplier (PLO Drawdown)
-            - churn_penalty *= churn_multiplier (PLO Churn) with leak minimum
-            - smoothness_penalty *= smooth_multiplier (PLO Smoothness)
+        This replaces the old PLO + Curriculum architecture with a single
+        preference parameter that the agent learns to condition on.
 
         Args:
             step_returns: Simple returns (new_nav - old_nav) / old_nav. Shape: (n_envs,)
@@ -388,105 +408,69 @@ class BatchCryptoEnv(VecEnv):
             Rewards for all envs. Shape: (n_envs,)
         """
         SCALE = 100.0
-        TARGET_PNL = 0.005  # 0.5% threshold for gate
-        MIN_GATE_LEAK = 0.2  # PLO Churn: leak minimum to avoid "Profit Gate Paradox"
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # MORL CALIBRATION: MAX_PENALTY_SCALE
+        # CRITICAL: r_cost * MAX_PENALTY_SCALE must be same order of magnitude as r_perf
+        # If log-returns ≈ 0.01/step → SCALE*0.01 = 1.0
+        # If position_delta ≈ 0.1/step → SCALE*0.1 = 10.0
+        # We want w_cost=1 to make costs matter, so scale up costs
+        # ═══════════════════════════════════════════════════════════════════
+        MAX_PENALTY_SCALE = 2.0  # Calibrate: if r_cost flat in TensorBoard, increase
 
         # Safety caps to prevent NaN/explosion
-        DOWNSIDE_PENALTY_CAP = 20.0
-        CHURN_PENALTY_CAP = 15.0
-        SMOOTH_PENALTY_CAP = 10.0
+        COST_PENALTY_CAP = 20.0
 
         # ═══════════════════════════════════════════════════════════════════
-        # 0. PLO SMOOTHNESS: Calculate Jerk BEFORE updating prev_position_deltas
-        # CRITICAL: This must happen FIRST to avoid off-by-one bug
+        # 0. JERK TRACKING (for backward compatibility with PLO logging)
         # ═══════════════════════════════════════════════════════════════════
         jerks = torch.abs(position_deltas - self.prev_position_deltas)
         self.latest_jerks = jerks.detach().clone()
 
         # ═══════════════════════════════════════════════════════════════════
-        # 1. BASE REWARD: Log Returns (always active)
+        # 1. OBJECTIVE 1: Performance (Log Returns)
+        # Always active, this is what we want to maximize
         # ═══════════════════════════════════════════════════════════════════
         safe_returns = torch.clamp(step_returns, min=-0.99)
-        log_returns = torch.log1p(safe_returns) * SCALE
+        r_perf = torch.log1p(safe_returns) * SCALE
 
         # ═══════════════════════════════════════════════════════════════════
-        # 2. COMPONENT A: Churn Penalty with PLO + Leak Minimum
+        # 2. OBJECTIVE 2: Costs (Turnover Penalty)
+        # Raw turnover without gates/thresholds - immediate and local
+        # Easier for critic to learn than deferred penalties
         # ═══════════════════════════════════════════════════════════════════
-        # Base gate: Only penalize churn when THIS step is profitable
-        base_gate = torch.clamp(step_returns / TARGET_PNL, min=0.0, max=1.0)
+        # Direct turnover cost: penalize all position changes proportionally
+        r_cost = -position_deltas * SCALE
 
-        # Store gate mean for logging (before PLO modification)
-        self.last_gate_mean = base_gate.mean().item()
-
-        # PLO Churn: Leak Minimum to avoid "Profit Gate Paradox"
-        # If PLO is active (λ > 1), force at least some penalty even on losing steps
-        # This prevents agent from ignoring churn_level signal when churning at a loss
-        if self.churn_multiplier > 1.0:
-            plo_intensity = (self.churn_multiplier - 1.0) / 4.0  # [0, 1]
-            min_gate = MIN_GATE_LEAK * plo_intensity  # 0% if λ=1, 20% if λ=5
-            effective_gate = torch.clamp(base_gate, min=min_gate)
-        else:
-            effective_gate = base_gate
-
-        # Raw churn cost (aligned with actual transaction fees)
-        cost_rate = self.commission + self.slippage
-        raw_churn = position_deltas * cost_rate * self._current_churn_coef * SCALE
-
-        # Gated churn with PLO multiplier
-        gated_churn = raw_churn * effective_gate
-        plo_churn = gated_churn * self.churn_multiplier
-
-        # Safety clip
-        churn_penalty = torch.clamp(plo_churn, max=CHURN_PENALTY_CAP)
+        # Safety clip to prevent extreme penalties during high volatility
+        r_cost = torch.clamp(r_cost, min=-COST_PENALTY_CAP)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 3. COMPONENT B: Downside Risk with PLO Multiplier (Soft Sortino)
+        # 3. MORL SCALARIZATION: Dynamic weighting by w_cost
+        # w_cost is known to agent via observation (Conditioned Network)
+        # Shape: w_cost (n_envs, 1), r_cost (n_envs,) → squeeze for broadcast
         # ═══════════════════════════════════════════════════════════════════
-        # Squared negative returns only (Sortino-style asymmetric risk)
-        negative_returns = torch.clamp(step_returns, max=0.0)
-        base_downside = torch.square(negative_returns) * SCALE * self.downside_coef
-
-        # PLO Drawdown: Apply multiplier
-        raw_downside = base_downside * self.downside_multiplier
-
-        # Safety clip to prevent extreme penalties during crashes
-        downside_risk = torch.clamp(raw_downside, max=DOWNSIDE_PENALTY_CAP)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 4. CURRICULUM AGGREGATION
-        # ═══════════════════════════════════════════════════════════════════
-        # Apply curriculum_lambda to BOTH penalties
-        total_penalty = self.curriculum_lambda * (churn_penalty + downside_risk)
+        w_cost_squeezed = self.w_cost.squeeze(-1)  # (n_envs,)
+        
+        # Total reward: performance + weighted costs
+        # When w_cost=0: reward = r_perf (pure profit seeking)
+        # When w_cost=1: reward = r_perf + r_cost * MAX_PENALTY_SCALE (cost-conscious)
+        reward = r_perf + (w_cost_squeezed * r_cost * MAX_PENALTY_SCALE)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 5. SMOOTHNESS PENALTY with PLO Multiplier
+        # 4. OBSERVABILITY (TensorBoard metrics)
+        # Maintain backward compatibility with existing logging
         # ═══════════════════════════════════════════════════════════════════
-        base_smoothness = self._current_smooth_coef * (position_deltas ** 2) * SCALE
+        self._rew_pnl = r_perf
+        self._rew_churn = w_cost_squeezed * r_cost * MAX_PENALTY_SCALE  # MORL cost component
+        self._rew_downside = torch.zeros_like(r_perf)  # Disabled in MORL (simplification)
+        self._rew_smooth = torch.zeros_like(r_perf)    # Disabled in MORL (simplification)
 
-        # PLO Smoothness: Apply multiplier
-        raw_smoothness = base_smoothness * self.smooth_multiplier
-
-        # Safety clip
-        safe_smoothness = torch.clamp(raw_smoothness, max=SMOOTH_PENALTY_CAP)
-
-        # Scale by curriculum
-        smoothness_penalty = safe_smoothness * self.curriculum_lambda
+        # Legacy compatibility: store gate mean (always 1.0 in MORL - no gating)
+        self.last_gate_mean = 1.0
 
         # ═══════════════════════════════════════════════════════════════════
-        # 6. FINAL REWARD
-        # ═══════════════════════════════════════════════════════════════════
-        reward = log_returns - total_penalty - smoothness_penalty
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 7. OBSERVABILITY (TensorBoard metrics)
-        # ═══════════════════════════════════════════════════════════════════
-        self._rew_pnl = log_returns
-        self._rew_churn = -churn_penalty * self.curriculum_lambda
-        self._rew_downside = -downside_risk * self.curriculum_lambda
-        self._rew_smooth = -smoothness_penalty
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 8. UPDATE JERK TRACKER (must be AFTER jerk calculation)
+        # 5. UPDATE JERK TRACKER (must be AFTER jerk calculation)
         # ═══════════════════════════════════════════════════════════════════
         self.prev_position_deltas = position_deltas.clone()
 
@@ -541,6 +525,30 @@ class BatchCryptoEnv(VecEnv):
         # Reset PLO Smoothness jerk tracking
         self.prev_position_deltas.zero_()
         self.latest_jerks.zero_()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # MORL: Sample w_cost with biased distribution (Audit SOTA Fix)
+        # 20% extremes (0 or 1) + 60% uniform to ensure agent explores
+        # both pure scalping and pure B&H strategies, not just the middle
+        # ═══════════════════════════════════════════════════════════════════
+        if self._eval_w_cost is not None:
+            # Evaluation mode: use fixed w_cost for reproducibility
+            self.w_cost.fill_(self._eval_w_cost)
+        else:
+            # Training mode: sample with biased distribution
+            sample_type = torch.rand(self.num_envs, device=self.device)
+            # 20% chance: w_cost = 0 (scalping mode - ignore costs)
+            # 20% chance: w_cost = 1 (B&H mode - maximize cost avoidance)
+            # 60% chance: w_cost ~ Uniform[0, 1] (exploration)
+            self.w_cost = torch.where(
+                sample_type.unsqueeze(1) < 0.2,
+                torch.zeros(self.num_envs, 1, device=self.device),
+                torch.where(
+                    sample_type.unsqueeze(1) > 0.8,
+                    torch.ones(self.num_envs, 1, device=self.device),
+                    torch.rand(self.num_envs, 1, device=self.device)
+                )
+            )
 
         return self._get_observations()
 
@@ -616,11 +624,22 @@ class BatchCryptoEnv(VecEnv):
             "risk_level": risk_level.cpu().numpy(),
             "churn_level": churn_level.cpu().numpy(),
             "smooth_level": smooth_level.cpu().numpy(),
+            "w_cost": self.w_cost.cpu().numpy(),  # MORL preference parameter
         }
 
     def set_training_mode(self, training: bool):
         """Enable/disable observation noise for eval."""
         self.training = training
+
+    def set_eval_w_cost(self, w_cost: Optional[float]):
+        """
+        Set fixed w_cost for evaluation mode (MORL Pareto Front).
+        
+        Args:
+            w_cost: Fixed preference in [0, 1], or None to resume sampling.
+                   0 = Scalping (ignore costs), 1 = B&H (minimize costs)
+        """
+        self._eval_w_cost = w_cost
 
     def step_async(self, actions) -> None:
         """Store actions for step_wait (VecEnv interface).

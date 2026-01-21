@@ -70,7 +70,7 @@ class WFOConfig:
 
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 90_000_000  # 90M steps
+    tqc_timesteps: int = 30_000_000  # 30M steps (MORL: réduit pour convergence stable)
 
     # TQC Hyperparameters
     learning_rate: float = 1e-4      # Réduit (était 3e-4) - Slow Down & Explore
@@ -126,7 +126,7 @@ class WFOConfig:
     fallback_strategy: str = 'flat'         # 'flat' ou 'buy_and_hold'
 
     # === Chain of Inheritance (Continuité WFO) ===
-    use_warm_start: bool = True             # Hériter poids du segment précédent
+    use_warm_start: bool = False            # MORL: Cold start par défaut (architecture change)
     pretrained_model_path: Optional[str] = None  # Modèle de départ pour Seg 0
     cleanup_failed_checkpoints: bool = True # Supprimer checkpoints des segments FAILED
 
@@ -729,7 +729,7 @@ class WFOPipeline:
             slippage=0.0001,
             target_volatility=self.config.target_volatility,
             vol_window=self.config.vol_window,
-            max_leverage=1.0,  # Disable vol scaling (was: self.config.max_leverage)
+            max_leverage=self.config.max_leverage,  # MORL: Cohérence train/eval (fix Distributional Shift)
             price_column='BTC_Close',
             random_start=False,  # Sequential start for evaluation
         )

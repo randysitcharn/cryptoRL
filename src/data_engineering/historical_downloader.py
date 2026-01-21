@@ -10,6 +10,7 @@ Permet de télécharger des données depuis 2017 (au lieu de 730 jours avec Yaho
 """
 
 import os
+import sys
 import time
 import requests
 import pandas as pd
@@ -191,7 +192,7 @@ class HistoricalDownloader:
         Returns:
             DataFrame avec colonnes OHLCV.
         """
-        url = f"https://api.massive.com/v2/aggs/ticker/{ticker}/range/1/hour/{start_date}/{end_date}"
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/hour/{start_date}/{end_date}"
         params = {
             'apiKey': self.polygon_api_key,
             'limit': 50000,
@@ -304,7 +305,8 @@ class HistoricalDownloader:
         vol_normalized = (rolling_vol - rolling_vol.mean()) / (rolling_vol.std() + 1e-8)
         vol_normalized = vol_normalized.clip(-3, 3)
 
-        np.random.seed(42)
+        # Générateur local (évite pollution du seed global)
+        rng = np.random.default_rng(seed=42)
         funding = np.zeros(n)
         funding[0] = mu
 
@@ -314,7 +316,7 @@ class HistoricalDownloader:
             sigma_t = sigma_base * (1 + 0.5 * vol_normalized.iloc[t])
             vol_bias = 0.5 * mu * vol_normalized.iloc[t]
 
-            dW = np.random.normal(0, np.sqrt(dt))
+            dW = rng.normal(0, np.sqrt(dt))
             funding[t] = (
                 funding[t-1]
                 + theta * (mu + vol_bias - funding[t-1]) * dt
@@ -429,8 +431,12 @@ class HistoricalDownloader:
 
 
 if __name__ == "__main__":
-    # API Key Polygon.io
-    POLYGON_API_KEY = "tsHVgcCE6TNepRWK5c3x_dY50gIr9woc"
+    # API Key Polygon.io (from environment variable)
+    POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+    if not POLYGON_API_KEY:
+        print("[ERROR] POLYGON_API_KEY environment variable not set.")
+        print("Please set it with: export POLYGON_API_KEY='your_api_key'")
+        sys.exit(1)
 
     downloader = HistoricalDownloader(polygon_api_key=POLYGON_API_KEY)
 

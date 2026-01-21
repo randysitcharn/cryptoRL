@@ -90,6 +90,83 @@ class MultiAssetDownloader:
 
         return df
 
+    def _validate_raw_data(
+        self,
+        df: pd.DataFrame,
+        ticker: str,
+        is_crypto: bool = False
+    ) -> pd.DataFrame:
+        """
+        Valide et nettoie les données brutes.
+
+        Vérifie:
+        - Pas de prix négatifs ou nuls
+        - Pas de volumes négatifs
+        - Pas de duplicats d'index
+        - Pas de gaps temporels anormaux (> 24h pour crypto, > 72h pour macro)
+
+        Args:
+            df: DataFrame avec colonnes OHLCV.
+            ticker: Symbole de l'actif pour les logs.
+            is_crypto: True si crypto (24/7), False si macro (5/7).
+
+        Returns:
+            DataFrame validé et nettoyé.
+        """
+        if df.empty:
+            return df
+
+        warnings_count = 0
+
+        # 1. Vérifier les prix négatifs ou nuls
+        price_cols = [c for c in ['Open', 'High', 'Low', 'Close'] if c in df.columns]
+        for col in price_cols:
+            invalid_mask = df[col] <= 0
+            if invalid_mask.any():
+                count = invalid_mask.sum()
+                warnings_count += 1
+                print(f"[WARNING] {ticker}: {count} invalid prices in {col} (<=0), replacing with NaN")
+                df.loc[invalid_mask, col] = np.nan
+
+        # 2. Vérifier les volumes négatifs
+        if 'Volume' in df.columns:
+            neg_vol_mask = df['Volume'] < 0
+            if neg_vol_mask.any():
+                count = neg_vol_mask.sum()
+                warnings_count += 1
+                print(f"[WARNING] {ticker}: {count} negative volumes, replacing with 0")
+                df.loc[neg_vol_mask, 'Volume'] = 0
+
+        # 3. Supprimer les duplicats d'index
+        if df.index.duplicated().any():
+            dup_count = df.index.duplicated().sum()
+            warnings_count += 1
+            print(f"[WARNING] {ticker}: {dup_count} duplicate timestamps, keeping last")
+            df = df[~df.index.duplicated(keep='last')]
+
+        # 4. Vérifier les gaps temporels
+        if len(df) > 1:
+            time_diffs = df.index.to_series().diff()
+            max_gap_hours = 24 if is_crypto else 72  # 24h crypto, 72h macro (weekends)
+
+            large_gaps = time_diffs[time_diffs > pd.Timedelta(hours=max_gap_hours)]
+            if len(large_gaps) > 0:
+                warnings_count += 1
+                print(f"[WARNING] {ticker}: {len(large_gaps)} gaps > {max_gap_hours}h detected")
+                for idx, gap in large_gaps.head(3).items():  # Show max 3
+                    print(f"  - {idx}: gap of {gap}")
+
+        # 5. Forward-fill les NaN créés (prix invalides)
+        if df.isna().any().any():
+            df = df.ffill()
+
+        if warnings_count == 0:
+            print(f"[VALIDATION] {ticker}: All checks passed")
+        else:
+            print(f"[VALIDATION] {ticker}: {warnings_count} issues found and handled")
+
+        return df
+
     def _generate_synthetic_funding(self, price_series: pd.Series) -> pd.Series:
         """
         Génère un Funding Rate synthétique réaliste via processus Ornstein-Uhlenbeck.
@@ -120,8 +197,8 @@ class MultiAssetDownloader:
         vol_normalized = (rolling_vol - rolling_vol.mean()) / (rolling_vol.std() + 1e-8)
         vol_normalized = vol_normalized.clip(-3, 3)  # Clip à 3 sigma
 
-        # Générer le processus O-U
-        np.random.seed(42)  # Reproductibilité
+        # Générer le processus O-U avec un générateur local (évite pollution du seed global)
+        rng = np.random.default_rng(seed=42)
         funding = np.zeros(n)
         funding[0] = mu
 
@@ -135,7 +212,7 @@ class MultiAssetDownloader:
             vol_bias = 0.5 * mu * vol_normalized.iloc[t]  # Biais corrélé à la vol
 
             # Euler-Maruyama discretization
-            dW = np.random.normal(0, np.sqrt(dt))
+            dW = rng.normal(0, np.sqrt(dt))
             funding[t] = (
                 funding[t-1]
                 + theta * (mu + vol_bias - funding[t-1]) * dt
@@ -247,13 +324,17 @@ class MultiAssetDownloader:
         print("\n[PHASE 1] Downloading Crypto assets (Master Timeframe)...")
         crypto_dfs = {}
         for ticker in CRYPTO_TICKERS:
-            crypto_dfs[ticker] = self._download_asset(ticker)
+            df = self._download_asset(ticker)
+            df = self._validate_raw_data(df, ticker, is_crypto=True)
+            crypto_dfs[ticker] = df
 
         # 2. Télécharger les actifs Macro
         print("\n[PHASE 2] Downloading Macro assets (Slave Timeframe)...")
         macro_dfs = {}
         for ticker in MACRO_TICKERS:
-            macro_dfs[ticker] = self._download_asset(ticker)
+            df = self._download_asset(ticker)
+            df = self._validate_raw_data(df, ticker, is_crypto=False)
+            macro_dfs[ticker] = df
 
         # 3. Synchroniser sur l'Index Maître (BTC-USD)
         print("\n[PHASE 3] Synchronizing on Master Index (BTC-USD)...")

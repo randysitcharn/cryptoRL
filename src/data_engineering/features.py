@@ -15,6 +15,8 @@ import pandas as pd
 from typing import Dict, Tuple, Optional
 from statsmodels.tsa.stattools import adfuller
 
+from src.config.constants import ASSETS, FRACDIFF_ASSETS, VOLUME_ASSETS
+
 
 class FeatureEngineer:
     """
@@ -24,14 +26,10 @@ class FeatureEngineer:
     stationnaires tout en préservant un maximum de mémoire historique.
     """
 
-    # Actifs pour lesquels calculer les features
-    ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
-
-    # Actifs pour Fracdiff (Close uniquement)
-    FRACDIFF_ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
-
-    # Actifs pour Volume relatif
-    VOLUME_ASSETS = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
+    # Import centralized asset lists from constants
+    ASSETS = ASSETS
+    FRACDIFF_ASSETS = FRACDIFF_ASSETS
+    VOLUME_ASSETS = VOLUME_ASSETS
 
     # FFD d-values: Empty cache forces ADF test per segment for optimal regime adaptation
     # Fixed d=0.30 was suboptimal across different time periods (2017-2025)

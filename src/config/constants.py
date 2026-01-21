@@ -27,6 +27,7 @@ EXCLUDE_COLS: List[str] = [
     'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
     # HMM intermediate features (only use Prob_0/1/2/3 outputs)
     'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
+    'HMM_Funding', 'HMM_RiskOnOff', 'HMM_VolRatio',
 ]
 
 # Ticker configurations
@@ -40,3 +41,13 @@ TICKER_MAPPING = {
     'DX-Y.NYB': 'DXY',
     '^IXIC': 'NASDAQ'
 }
+
+# Unified asset list (short names used in feature columns)
+# Centralized here to ensure consistency across all modules
+ASSETS: List[str] = ['BTC', 'ETH', 'SPX', 'DXY', 'NASDAQ']
+
+# Assets for which to compute Fractional Differentiation
+FRACDIFF_ASSETS: List[str] = ASSETS
+
+# Assets for which to compute Volume features
+VOLUME_ASSETS: List[str] = ASSETS
