@@ -79,46 +79,46 @@ def test_domain_randomization_sampling():
             slippage_max=0.00015,
         )
         env.training = True  # Set training mode after init
-    
-    # Reset and capture initial fees
-    env.reset()
-    initial_commissions = env.commission_per_env.clone()
-    initial_slippages = env.slippage_per_env.clone()
-    
-    # Run a few steps (fees should NOT change)
-    for _ in range(10):
-        actions = np.random.uniform(-1, 1, (env.num_envs, 1)).astype(np.float32)
-        env.step_async(actions)
-        env.step_wait()
         
-        # Fees should remain constant during episode
-        assert torch.allclose(env.commission_per_env, initial_commissions), \
-            "Fees should not change during episode"
-        assert torch.allclose(env.slippage_per_env, initial_slippages), \
-            "Slippages should not change during episode"
-    
-    # Reset again (fees should change)
-    env.reset()
-    new_commissions = env.commission_per_env.clone()
-    new_slippages = env.slippage_per_env.clone()
-    
-    # Fees should be different (with high probability)
-    # Note: Very unlikely that all fees are identical after resampling
-    assert not torch.allclose(new_commissions, initial_commissions, atol=1e-6), \
-        "Fees should change after reset (new episode)"
-    assert not torch.allclose(new_slippages, initial_slippages, atol=1e-6), \
-        "Slippages should change after reset (new episode)"
-    
-    # Verify fees are within bounds
-    assert torch.all(env.commission_per_env >= env.commission_min), \
-        "Commissions should be >= commission_min"
-    assert torch.all(env.commission_per_env <= env.commission_max), \
-        "Commissions should be <= commission_max"
-    assert torch.all(env.slippage_per_env >= env.slippage_min), \
-        "Slippages should be >= slippage_min"
-    assert torch.all(env.slippage_per_env <= env.slippage_max), \
-        "Slippages should be <= slippage_max"
-    
+        # Reset and capture initial fees
+        env.reset()
+        initial_commissions = env.commission_per_env.clone()
+        initial_slippages = env.slippage_per_env.clone()
+        
+        # Run a few steps (fees should NOT change)
+        for _ in range(10):
+            actions = np.random.uniform(-1, 1, (env.num_envs, 1)).astype(np.float32)
+            env.step_async(actions)
+            env.step_wait()
+            
+            # Fees should remain constant during episode
+            assert torch.allclose(env.commission_per_env, initial_commissions), \
+                "Fees should not change during episode"
+            assert torch.allclose(env.slippage_per_env, initial_slippages), \
+                "Slippages should not change during episode"
+        
+        # Reset again (fees should change)
+        env.reset()
+        new_commissions = env.commission_per_env.clone()
+        new_slippages = env.slippage_per_env.clone()
+        
+        # Fees should be different (with high probability)
+        # Note: Very unlikely that all fees are identical after resampling
+        assert not torch.allclose(new_commissions, initial_commissions, atol=1e-6), \
+            "Fees should change after reset (new episode)"
+        assert not torch.allclose(new_slippages, initial_slippages, atol=1e-6), \
+            "Slippages should change after reset (new episode)"
+        
+        # Verify fees are within bounds
+        assert torch.all(env.commission_per_env >= env.commission_min), \
+            "Commissions should be >= commission_min"
+        assert torch.all(env.commission_per_env <= env.commission_max), \
+            "Commissions should be <= commission_max"
+        assert torch.all(env.slippage_per_env >= env.slippage_min), \
+            "Slippages should be >= slippage_min"
+        assert torch.all(env.slippage_per_env <= env.slippage_max), \
+            "Slippages should be <= slippage_max"
+        
         print("✓ Domain Randomization: Fees sampled per-episode correctly")
     finally:
         # Cleanup
@@ -142,15 +142,15 @@ def test_domain_randomization_eval_mode():
             enable_domain_randomization=True,
         )
         env.training = False  # Eval mode
-    
-    env.reset()
-    
-    # In eval mode, fees should be fixed (not randomized)
-    assert torch.allclose(env.commission_per_env, torch.full((env.num_envs,), env.commission)), \
-        "In eval mode, commissions should be fixed"
-    assert torch.allclose(env.slippage_per_env, torch.full((env.num_envs,), env.slippage)), \
-        "In eval mode, slippages should be fixed"
-    
+        
+        env.reset()
+        
+        # In eval mode, fees should be fixed (not randomized)
+        assert torch.allclose(env.commission_per_env, torch.full((env.num_envs,), env.commission)), \
+            "In eval mode, commissions should be fixed"
+        assert torch.allclose(env.slippage_per_env, torch.full((env.num_envs,), env.slippage)), \
+            "In eval mode, slippages should be fixed"
+        
         print("✓ Domain Randomization: Disabled in eval mode correctly")
     finally:
         # Cleanup
@@ -285,28 +285,28 @@ def test_integration_morl_compatibility():
             enable_domain_randomization=True,
         )
         env.training = True  # Set training mode
-    
-    env.reset()
-    
-    # Verify w_cost is still sampled (MORL functionality)
-    assert env.w_cost.shape == (env.num_envs, 1), "w_cost should have correct shape"
-    assert torch.all(env.w_cost >= 0.0) and torch.all(env.w_cost <= 1.0), \
-        "w_cost should be in [0, 1]"
-    
-    # Verify domain randomization is active
-    assert torch.any(env.commission_per_env != env.commission), \
-        "Commissions should be randomized"
-    assert torch.any(env.slippage_per_env != env.slippage), \
-        "Slippages should be randomized"
-    
-    # Run a step and verify reward calculation still works
-    actions = np.random.uniform(-1, 1, (env.num_envs, 1)).astype(np.float32)
-    env.step_async(actions)
-    obs, rewards, dones, infos = env.step_wait()
-    
-    assert rewards.shape == (env.num_envs,), "Rewards should have correct shape"
-    assert not np.isnan(rewards).any(), "Rewards should not contain NaN"
-    
+        
+        env.reset()
+        
+        # Verify w_cost is still sampled (MORL functionality)
+        assert env.w_cost.shape == (env.num_envs, 1), "w_cost should have correct shape"
+        assert torch.all(env.w_cost >= 0.0) and torch.all(env.w_cost <= 1.0), \
+            "w_cost should be in [0, 1]"
+        
+        # Verify domain randomization is active
+        assert torch.any(env.commission_per_env != env.commission), \
+            "Commissions should be randomized"
+        assert torch.any(env.slippage_per_env != env.slippage), \
+            "Slippages should be randomized"
+        
+        # Run a step and verify reward calculation still works
+        actions = np.random.uniform(-1, 1, (env.num_envs, 1)).astype(np.float32)
+        env.step_async(actions)
+        obs, rewards, dones, infos = env.step_wait()
+        
+        assert rewards.shape == (env.num_envs,), "Rewards should have correct shape"
+        assert not np.isnan(rewards).any(), "Rewards should not contain NaN"
+        
         print("✓ Integration: Domain Randomization compatible with MORL")
     finally:
         # Cleanup
