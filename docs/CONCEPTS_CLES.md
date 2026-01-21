@@ -271,7 +271,111 @@ Si `use_sde=True` et `actor_dropout > 0`, le dropout casse la continuité tempor
 
 ---
 
-## 11. OverfittingGuardCallbackV2 (5 Signaux)
+## 11. Comprendre l'Overfitting en RL
+
+L'overfitting, c'est quand le modèle **mémorise** les données d'entraînement au lieu d'**apprendre** des patterns généralisables.
+
+### Signe 1 : Divergence Train/Eval (le classique)
+
+```
+Train reward:  ████████████████████ +50%
+Eval reward:   ████████             +15%
+```
+
+**Ce qui se passe** : Le modèle performe bien sur les données connues, mais échoue sur des données nouvelles.
+
+**Métrique** : `overfit/train_eval_divergence` - si > 0.2, alerte.
+
+### Signe 2 : La forme en U de la loss (U-shape)
+
+```
+Loss
+  │
+  │\
+  │ \
+  │  \____ ← Point optimal (meilleure généralisation)
+  │       \____/
+  │            ↑ Overfitting commence ici
+  └─────────────────── Steps
+```
+
+**Ce qui se passe** :
+- Phase 1 : La loss descend → le modèle apprend
+- Phase 2 : La loss remonte → le modèle mémorise au lieu de généraliser
+
+**Détection** : Analyser la trajectoire de `train/critic_loss` - si "U-shape", le meilleur checkpoint est au milieu, pas à la fin.
+
+### Signe 3 : Saturation des actions
+
+```
+Actions au début:     [-0.3, 0.5, -0.2, 0.1, ...]  ← Diversifiées
+Actions après overfit: [1.0, -1.0, 1.0, -1.0, ...] ← Extrêmes
+```
+
+**Ce qui se passe** : Le modèle devient trop "confiant" et pousse toutes ses actions vers les extrêmes (-1 ou +1), au lieu de nuancer.
+
+**Métrique** : `overfit/action_saturation` - si > 0.8, policy collapse probable.
+
+### Signe 4 : Variance des rewards qui explose
+
+```
+Rewards stables:    [10, 12, 11, 10, 13, 11]     CV = 0.10
+Rewards instables:  [50, -30, 80, -20, 60, -40]  CV = 1.50
+```
+
+**Ce qui se passe** : Un modèle overfitté fait des paris risqués basés sur des patterns spécifiques. Ça marche parfois (gros gains), ça échoue souvent (grosses pertes).
+
+**Métrique** : `overfit/reward_cv` - si > 0.5, instabilité.
+
+### Signe 5 : Entropie qui s'effondre
+
+```
+Entropie haute:   Le modèle explore, hésite, essaie des choses
+Entropie basse:   Le modèle est figé, toujours la même action
+```
+
+**Ce qui se passe** : L'entropie mesure la diversité des décisions. Si elle tombe à zéro, le modèle a convergé vers une politique rigide, souvent basée sur du bruit.
+
+**Métrique** : `train/ent_coef` - surveiller si proche de 0.
+
+### Signe 6 : NAV inconsistant entre épisodes
+
+```
+Épisode 1:  +15% return  (a appris ce segment)
+Épisode 2:  -5% return   (nouveau segment, ne généralise pas)
+Épisode 3:  +12% return  (re-mémorise)
+Épisode 4:  -8% return   (re-échoue sur nouveau)
+```
+
+**Ce qui se passe** : Le modèle performe bien sur certains régimes de marché mais échoue sur d'autres.
+
+**Signe de convergence saine** : Les returns inter-épisodes doivent être **stables** (CV < 0.2).
+
+### Résumé des seuils d'alerte
+
+| Signe | Métrique | Seuil d'alerte |
+|-------|----------|----------------|
+| Train >> Eval | `train_eval_divergence` | > 0.2 |
+| Loss en U | `critic_loss` trajectory | "U-shape" |
+| Actions saturées | `action_saturation` | > 0.8 |
+| Rewards instables | `reward_cv` | > 0.5 |
+| Entropie effondrée | `ent_coef` | proche de 0 |
+| NAV inconsistant | CV épisodes | > 0.3 |
+
+### Comment CryptoRL combat l'overfitting
+
+| Mécanisme | Effet |
+|-----------|-------|
+| **Observation noise** | Empêche la mémorisation des patterns exacts |
+| **Curriculum learning** | Augmente progressivement la difficulté |
+| **PLO** | Pénalise les comportements extrêmes (drawdown, churn) |
+| **Walk-Forward Optimization** | Entraîne sur segment N, teste sur segment N+1 |
+| **TQCDropoutPolicy** | Dropout + LayerNorm pour régularisation |
+| **OverfittingGuardV2** | Détecte et stoppe automatiquement l'overfitting |
+
+---
+
+## 12. OverfittingGuardCallbackV2 (5 Signaux)
 
 ### Problème
 La détection d'overfitting via un seul signal (NAV) est fragile.
@@ -310,7 +414,7 @@ overfit/violations_*, overfit/active_signals
 
 ---
 
-## 12. Séparation Données Train/Eval
+## 13. Séparation Données Train/Eval
 
 ### Problème : Data Leakage
 Si train et eval partagent les mêmes données, la mesure de généralisation est faussée.
@@ -350,7 +454,7 @@ Si train et eval partagent les mêmes données, la mesure de généralisation es
 
 ---
 
-## 13. Intégration WFO du Guard (Fail-over)
+## 14. Intégration WFO du Guard (Fail-over)
 
 ### Problème
 Sans Guard en WFO, le training peut continuer même si le modèle a divergé.
@@ -404,7 +508,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 14. Métriques de Performance
+## 15. Métriques de Performance
 
 ### Trading
 | Métrique | Formule | Cible |
@@ -423,7 +527,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 15. Fichiers Principaux
+## 16. Fichiers Principaux
 
 | Fichier | Rôle | Lignes |
 |---------|------|--------|
@@ -438,7 +542,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 16. Termes Techniques Courants
+## 17. Termes Techniques Courants
 
 | Terme | Définition |
 |-------|------------|
@@ -460,7 +564,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 17. Références Essentielles
+## 18. Références Essentielles
 
 1. **Lopez de Prado (2018)** - "Advances in Financial Machine Learning"
    - Fractional Differentiation, Meta-Labeling, Purged CV
@@ -491,4 +595,4 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-*Dernière mise à jour : 2026-01-19*
+*Dernière mise à jour : 2026-01-21*

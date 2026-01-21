@@ -773,6 +773,256 @@ def format_episodic_report(episodic_analysis: Dict[str, Any]) -> List[str]:
 
 
 # ============================================================================
+# Diagnostic Overfitting
+# ============================================================================
+
+def diagnose_overfitting(
+    metrics_dict: Dict[str, pd.Series],
+    n_checkpoints: int = 10
+) -> Dict[str, Any]:
+    """
+    Analyse les métriques pour détecter les signes d'overfitting.
+
+    Vérifie 6 signaux d'overfitting avec leurs seuils d'alerte :
+    1. Train/Eval divergence > 0.2
+    2. Action saturation > 0.8
+    3. Reward CV > 0.5
+    4. Entropy coefficient proche de 0 (< 0.01)
+    5. Critic loss en U-shape
+    6. NAV épisodique inconsistant (CV > 0.3)
+
+    Args:
+        metrics_dict: Dictionnaire {metric_name: pd.Series}
+        n_checkpoints: Nombre de checkpoints pour l'analyse de trajectoire
+
+    Returns:
+        Dictionnaire avec les résultats du diagnostic
+    """
+    diagnosis = {
+        'signals': {},
+        'alerts': [],
+        'ok': [],
+        'missing': [],
+        'verdict': 'UNKNOWN'
+    }
+
+    # Signal 1: Train/Eval Divergence
+    metric_name = 'overfit/train_eval_divergence'
+    if metric_name in metrics_dict:
+        series = metrics_dict[metric_name]
+        # Prendre la moyenne des derniers 20% de points
+        n_last = max(1, len(series) // 5)
+        last_values = series.iloc[-n_last:].values
+        mean_divergence = float(np.mean(last_values))
+        threshold = 0.2
+
+        diagnosis['signals']['train_eval_divergence'] = {
+            'value': mean_divergence,
+            'threshold': threshold,
+            'alert': mean_divergence > threshold,
+            'description': 'Écart train vs eval'
+        }
+        if mean_divergence > threshold:
+            diagnosis['alerts'].append(f"train_eval_divergence: {mean_divergence:.3f} (seuil: {threshold})")
+        else:
+            diagnosis['ok'].append(f"train_eval_divergence: {mean_divergence:.3f} (seuil: {threshold})")
+    else:
+        diagnosis['missing'].append('train_eval_divergence')
+
+    # Signal 2: Action Saturation
+    metric_name = 'overfit/action_saturation'
+    if metric_name in metrics_dict:
+        series = metrics_dict[metric_name]
+        n_last = max(1, len(series) // 5)
+        last_values = series.iloc[-n_last:].values
+        mean_saturation = float(np.mean(last_values))
+        threshold = 0.8
+
+        diagnosis['signals']['action_saturation'] = {
+            'value': mean_saturation,
+            'threshold': threshold,
+            'alert': mean_saturation > threshold,
+            'description': 'Actions bloquées à ±1'
+        }
+        if mean_saturation > threshold:
+            diagnosis['alerts'].append(f"action_saturation: {mean_saturation:.3f} (seuil: {threshold})")
+        else:
+            diagnosis['ok'].append(f"action_saturation: {mean_saturation:.3f} (seuil: {threshold})")
+    else:
+        diagnosis['missing'].append('action_saturation')
+
+    # Signal 3: Reward CV (Coefficient of Variation)
+    metric_name = 'overfit/reward_cv'
+    if metric_name in metrics_dict:
+        series = metrics_dict[metric_name]
+        n_last = max(1, len(series) // 5)
+        last_values = series.iloc[-n_last:].values
+        mean_cv = float(np.mean(last_values))
+        threshold = 0.5
+
+        diagnosis['signals']['reward_cv'] = {
+            'value': mean_cv,
+            'threshold': threshold,
+            'alert': mean_cv > threshold,
+            'description': 'Instabilité des rewards'
+        }
+        if mean_cv > threshold:
+            diagnosis['alerts'].append(f"reward_cv: {mean_cv:.3f} (seuil: {threshold})")
+        else:
+            diagnosis['ok'].append(f"reward_cv: {mean_cv:.3f} (seuil: {threshold})")
+    else:
+        diagnosis['missing'].append('reward_cv')
+
+    # Signal 4: Entropy Coefficient (effondrement)
+    metric_name = 'train/ent_coef'
+    if metric_name in metrics_dict:
+        series = metrics_dict[metric_name]
+        n_last = max(1, len(series) // 5)
+        last_values = series.iloc[-n_last:].values
+        mean_entropy = float(np.mean(last_values))
+        threshold = 0.01  # Proche de 0
+
+        diagnosis['signals']['entropy_coef'] = {
+            'value': mean_entropy,
+            'threshold': threshold,
+            'alert': mean_entropy < threshold,
+            'description': 'Diversité des actions'
+        }
+        if mean_entropy < threshold:
+            diagnosis['alerts'].append(f"entropy_coef: {mean_entropy:.4f} (seuil: > {threshold})")
+        else:
+            diagnosis['ok'].append(f"entropy_coef: {mean_entropy:.4f} (seuil: > {threshold})")
+    else:
+        diagnosis['missing'].append('entropy_coef')
+
+    # Signal 5: Critic Loss U-shape
+    metric_name = 'train/critic_loss'
+    if metric_name in metrics_dict:
+        series = metrics_dict[metric_name]
+        trajectory = analyze_trajectory(series, n_checkpoints=n_checkpoints)
+
+        if trajectory:
+            trajectory_type = trajectory.get('trajectory_type', 'unknown')
+            is_u_shape = 'U-shape' in trajectory_type
+            best_position = trajectory.get('best_position', 'unknown')
+
+            diagnosis['signals']['critic_loss_shape'] = {
+                'value': trajectory_type,
+                'threshold': 'not U-shape',
+                'alert': is_u_shape,
+                'description': 'Forme de la loss',
+                'best_checkpoint': trajectory.get('best_checkpoint', {}),
+                'best_position': best_position
+            }
+            if is_u_shape:
+                best_step = trajectory.get('best_checkpoint', {}).get('step', '?')
+                diagnosis['alerts'].append(f"critic_loss: {trajectory_type} (meilleur: step {best_step}, position: {best_position})")
+            else:
+                diagnosis['ok'].append(f"critic_loss: {trajectory_type}")
+    else:
+        diagnosis['missing'].append('critic_loss')
+
+    # Signal 6: Actor Loss - vérifier aussi
+    metric_name = 'train/actor_loss'
+    if metric_name in metrics_dict:
+        series = metrics_dict[metric_name]
+        trajectory = analyze_trajectory(series, n_checkpoints=n_checkpoints)
+
+        if trajectory:
+            trajectory_type = trajectory.get('trajectory_type', 'unknown')
+            is_degrading = 'dégradation' in trajectory_type.lower()
+
+            diagnosis['signals']['actor_loss_trend'] = {
+                'value': trajectory_type,
+                'threshold': 'not degradation',
+                'alert': is_degrading,
+                'description': 'Tendance actor loss'
+            }
+            if is_degrading:
+                diagnosis['alerts'].append(f"actor_loss: {trajectory_type}")
+            else:
+                diagnosis['ok'].append(f"actor_loss: {trajectory_type}")
+
+    # Calculer le verdict
+    n_alerts = len(diagnosis['alerts'])
+    n_signals = len(diagnosis['signals'])
+
+    if n_signals == 0:
+        diagnosis['verdict'] = 'INCONNU (pas de métriques d\'overfitting)'
+        diagnosis['verdict_emoji'] = '❓'
+    elif n_alerts == 0:
+        diagnosis['verdict'] = 'SAIN - Aucun signe d\'overfitting détecté'
+        diagnosis['verdict_emoji'] = '✅'
+    elif n_alerts == 1:
+        diagnosis['verdict'] = 'ATTENTION - 1 signal d\'alerte'
+        diagnosis['verdict_emoji'] = '⚠️'
+    elif n_alerts >= 2:
+        diagnosis['verdict'] = f'OVERFITTING PROBABLE - {n_alerts} signaux d\'alerte'
+        diagnosis['verdict_emoji'] = '🚨'
+
+    diagnosis['n_alerts'] = n_alerts
+    diagnosis['n_signals'] = n_signals
+
+    return diagnosis
+
+
+def format_overfitting_diagnosis(diagnosis: Dict[str, Any]) -> List[str]:
+    """Formate le diagnostic d'overfitting pour le rapport."""
+    lines = []
+    lines.append("=" * 80)
+    lines.append("DIAGNOSTIC OVERFITTING")
+    lines.append("=" * 80)
+    lines.append("")
+
+    # Signaux OK
+    if diagnosis['ok']:
+        lines.append("Signaux OK:")
+        for signal in diagnosis['ok']:
+            lines.append(f"  ✅ {signal}")
+        lines.append("")
+
+    # Alertes
+    if diagnosis['alerts']:
+        lines.append("⚠️  ALERTES:")
+        for alert in diagnosis['alerts']:
+            lines.append(f"  🚨 {alert}")
+        lines.append("")
+
+    # Métriques manquantes
+    if diagnosis['missing']:
+        lines.append(f"Métriques non trouvées: {', '.join(diagnosis['missing'])}")
+        lines.append("")
+
+    # Verdict
+    lines.append("-" * 40)
+    lines.append(f"VERDICT: {diagnosis['verdict_emoji']} {diagnosis['verdict']}")
+    lines.append(f"         ({diagnosis['n_alerts']}/{diagnosis['n_signals']} signaux en alerte)")
+    lines.append("-" * 40)
+
+    # Recommandations si overfitting détecté
+    if diagnosis['n_alerts'] >= 2:
+        lines.append("")
+        lines.append("RECOMMANDATIONS:")
+
+        if 'critic_loss_shape' in diagnosis['signals']:
+            signal = diagnosis['signals']['critic_loss_shape']
+            if signal['alert']:
+                best_step = signal.get('best_checkpoint', {}).get('step', '?')
+                lines.append(f"  • Utiliser le checkpoint au step {best_step} (meilleur point avant overfit)")
+
+        if 'action_saturation' in diagnosis['signals'] and diagnosis['signals']['action_saturation']['alert']:
+            lines.append("  • Augmenter entropy_coef ou réduire le learning rate")
+
+        if 'reward_cv' in diagnosis['signals'] and diagnosis['signals']['reward_cv']['alert']:
+            lines.append("  • Vérifier la fonction de récompense (trop de variance)")
+
+        if 'train_eval_divergence' in diagnosis['signals'] and diagnosis['signals']['train_eval_divergence']['alert']:
+            lines.append("  • Augmenter la régularisation (dropout, observation noise)")
+
+    return lines
+
+
+# ============================================================================
 # Génération de rapport
 # ============================================================================
 
@@ -822,6 +1072,11 @@ def generate_report(
     lines.append("=" * 80)
     lines.append("ANALYSE STATISTIQUE DES LOGS TENSORBOARD")
     lines.append("=" * 80)
+    lines.append("")
+
+    # Diagnostic Overfitting en premier (résumé de santé)
+    diagnosis = diagnose_overfitting(metrics_dict, n_checkpoints=n_checkpoints)
+    lines.extend(format_overfitting_diagnosis(diagnosis))
     lines.append("")
 
     # Grouper par catégorie
