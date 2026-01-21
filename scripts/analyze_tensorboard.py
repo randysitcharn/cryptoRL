@@ -564,6 +564,215 @@ def analyze_phases(metric_series: pd.Series, n_phases: int = 3) -> Dict[str, Dic
 
 
 # ============================================================================
+# Analyse par épisodes (métriques périodiques comme NAV)
+# ============================================================================
+
+def analyze_episodic_metric(
+    metric_series: pd.Series,
+    episode_steps: int = 2097152,
+    initial_value: float = 10000.0,
+    metric_name: str = "nav"
+) -> Dict[str, Any]:
+    """
+    Analyse une métrique qui est réinitialisée périodiquement (ex: NAV).
+
+    Le NAV est réinitialisé à initial_value tous les episode_steps.
+    Cette fonction segmente la série par épisode et analyse la performance
+    de chaque épisode séparément.
+
+    Args:
+        metric_series: pd.Series avec index=step et values=metric values
+        episode_steps: Nombre de steps par épisode (défaut: 2097152 = 2048 * 1024)
+        initial_value: Valeur initiale après reset (défaut: 10000.0)
+        metric_name: Nom de la métrique pour le rapport
+
+    Returns:
+        Dictionnaire avec analyse par épisode
+    """
+    if len(metric_series) < 2:
+        return {}
+
+    steps = metric_series.index.values
+    values = metric_series.values
+
+    # Identifier les épisodes
+    episodes = []
+    current_episode_start = steps[0]
+    current_episode_idx = 0
+
+    for i, step in enumerate(steps):
+        # Calculer l'épisode théorique basé sur le step
+        episode_num = int(step // episode_steps)
+
+        if episode_num != current_episode_idx:
+            # Nouvel épisode détecté
+            current_episode_idx = episode_num
+            current_episode_start = step
+
+    # Regrouper les points par épisode
+    episode_data = {}
+    for step, value in zip(steps, values):
+        episode_num = int(step // episode_steps)
+        if episode_num not in episode_data:
+            episode_data[episode_num] = {'steps': [], 'values': []}
+        episode_data[episode_num]['steps'].append(step)
+        episode_data[episode_num]['values'].append(value)
+
+    # Analyser chaque épisode
+    episode_stats = []
+    for episode_num in sorted(episode_data.keys()):
+        data = episode_data[episode_num]
+        ep_steps = np.array(data['steps'])
+        ep_values = np.array(data['values'])
+
+        if len(ep_values) < 2:
+            continue
+
+        # Statistiques de l'épisode
+        start_step = int(ep_steps.min())
+        end_step = int(ep_steps.max())
+        start_value = ep_values[0]
+        end_value = ep_values[-1]
+        min_value = float(np.min(ep_values))
+        max_value = float(np.max(ep_values))
+        mean_value = float(np.mean(ep_values))
+
+        # Performance relative à la valeur initiale
+        # (combien a-t-on gagné/perdu par rapport à initial_value)
+        final_return = ((end_value - initial_value) / initial_value) * 100
+        max_return = ((max_value - initial_value) / initial_value) * 100
+        min_return = ((min_value - initial_value) / initial_value) * 100
+
+        # Drawdown max dans l'épisode
+        running_max = np.maximum.accumulate(ep_values)
+        drawdowns = (running_max - ep_values) / running_max * 100
+        max_drawdown = float(np.max(drawdowns))
+
+        episode_stats.append({
+            'episode': episode_num,
+            'start_step': start_step,
+            'end_step': end_step,
+            'n_points': len(ep_values),
+            'start_value': float(start_value),
+            'end_value': float(end_value),
+            'min_value': min_value,
+            'max_value': max_value,
+            'mean_value': mean_value,
+            'final_return_pct': final_return,
+            'max_return_pct': max_return,
+            'min_return_pct': min_return,
+            'max_drawdown_pct': max_drawdown,
+        })
+
+    if not episode_stats:
+        return {}
+
+    # Statistiques globales sur les épisodes
+    final_returns = [e['final_return_pct'] for e in episode_stats]
+    max_drawdowns = [e['max_drawdown_pct'] for e in episode_stats]
+
+    # Tendance des performances entre épisodes
+    n_episodes = len(episode_stats)
+    if n_episodes >= 3:
+        first_third = final_returns[:n_episodes // 3]
+        last_third = final_returns[-(n_episodes // 3):]
+        first_third_mean = np.mean(first_third) if first_third else 0
+        last_third_mean = np.mean(last_third) if last_third else 0
+
+        if first_third_mean != 0:
+            improvement = ((last_third_mean - first_third_mean) / abs(first_third_mean)) * 100
+        else:
+            improvement = float('inf') if last_third_mean != 0 else 0
+    else:
+        first_third_mean = final_returns[0] if final_returns else 0
+        last_third_mean = final_returns[-1] if final_returns else 0
+        improvement = 0
+
+    # Déterminer la convergence
+    # Si les N derniers épisodes ont des performances similaires (faible std)
+    if n_episodes >= 5:
+        last_5_returns = final_returns[-5:]
+        last_5_std = np.std(last_5_returns)
+        last_5_mean = np.mean(last_5_returns)
+        cv_last_5 = last_5_std / abs(last_5_mean) if last_5_mean != 0 else float('inf')
+        converged = cv_last_5 < 0.2  # CV < 20% = relativement stable
+    else:
+        cv_last_5 = None
+        converged = None
+
+    return {
+        'metric_name': metric_name,
+        'episode_steps': episode_steps,
+        'initial_value': initial_value,
+        'n_episodes': n_episodes,
+        'episodes': episode_stats,
+        'summary': {
+            'mean_final_return_pct': float(np.mean(final_returns)),
+            'std_final_return_pct': float(np.std(final_returns)),
+            'best_final_return_pct': float(np.max(final_returns)),
+            'worst_final_return_pct': float(np.min(final_returns)),
+            'mean_max_drawdown_pct': float(np.mean(max_drawdowns)),
+            'first_episodes_mean_return': first_third_mean,
+            'last_episodes_mean_return': last_third_mean,
+            'improvement_pct': improvement,
+            'cv_last_5_episodes': cv_last_5,
+            'converged': converged,
+        }
+    }
+
+
+def format_episodic_report(episodic_analysis: Dict[str, Any]) -> List[str]:
+    """Formate le rapport d'analyse épisodique."""
+    if not episodic_analysis:
+        return []
+
+    lines = []
+    lines.append("")
+    lines.append("  ANALYSE PAR ÉPISODES (métrique périodique):")
+    lines.append(f"    Période: {episodic_analysis['episode_steps']:,} steps/épisode")
+    lines.append(f"    Valeur initiale: {episodic_analysis['initial_value']:,.0f}")
+    lines.append(f"    Nombre d'épisodes: {episodic_analysis['n_episodes']}")
+
+    summary = episodic_analysis['summary']
+    lines.append("")
+    lines.append("    Résumé des performances:")
+    lines.append(f"      Return final moyen: {summary['mean_final_return_pct']:+.2f}%")
+    lines.append(f"      Return final std: {summary['std_final_return_pct']:.2f}%")
+    lines.append(f"      Meilleur épisode: {summary['best_final_return_pct']:+.2f}%")
+    lines.append(f"      Pire épisode: {summary['worst_final_return_pct']:+.2f}%")
+    lines.append(f"      Drawdown moyen: {summary['mean_max_drawdown_pct']:.2f}%")
+
+    lines.append("")
+    lines.append("    Évolution inter-épisodes:")
+    lines.append(f"      Premiers épisodes (mean return): {summary['first_episodes_mean_return']:+.2f}%")
+    lines.append(f"      Derniers épisodes (mean return): {summary['last_episodes_mean_return']:+.2f}%")
+
+    if summary['improvement_pct'] != float('inf'):
+        direction = "amélioration" if summary['improvement_pct'] > 5 else "dégradation" if summary['improvement_pct'] < -5 else "stable"
+        lines.append(f"      Évolution: {summary['improvement_pct']:+.1f}% ({direction})")
+
+    if summary['cv_last_5_episodes'] is not None:
+        lines.append("")
+        lines.append("    Convergence:")
+        lines.append(f"      CV des 5 derniers épisodes: {summary['cv_last_5_episodes']:.2%}")
+        status = "✅ OUI (stable)" if summary['converged'] else "❌ NON (instable)"
+        lines.append(f"      Convergé: {status}")
+
+    # Détail des derniers épisodes
+    episodes = episodic_analysis['episodes']
+    if len(episodes) > 0:
+        lines.append("")
+        lines.append("    Derniers épisodes:")
+        for ep in episodes[-5:]:
+            lines.append(
+                f"      Ep {ep['episode']:>3}: steps {ep['start_step']:>10,}-{ep['end_step']:>10,} | "
+                f"return: {ep['final_return_pct']:+7.2f}% | DD: {ep['max_drawdown_pct']:5.1f}%"
+            )
+
+    return lines
+
+
+# ============================================================================
 # Génération de rapport
 # ============================================================================
 
@@ -592,7 +801,9 @@ def group_metrics_by_category(metrics_dict: Dict[str, pd.Series]) -> Dict[str, L
 def generate_report(
     metrics_dict: Dict[str, pd.Series],
     output_file: Optional[str] = None,
-    n_checkpoints: int = 10
+    n_checkpoints: int = 10,
+    episode_steps: int = 2097152,
+    initial_nav: float = 10000.0
 ) -> str:
     """
     Génère un rapport statistique complet pour toutes les métriques.
@@ -601,6 +812,8 @@ def generate_report(
         metrics_dict: Dictionnaire {metric_name: pd.Series}
         output_file: Fichier de sortie optionnel
         n_checkpoints: Nombre de checkpoints pour l'analyse de trajectoire (défaut: 10)
+        episode_steps: Nombre de steps par épisode pour l'analyse NAV (défaut: 2097152)
+        initial_nav: Valeur initiale du NAV après reset (défaut: 10000.0)
 
     Returns:
         Rapport sous forme de string
@@ -759,6 +972,19 @@ def generate_report(
                         lines.append(f"      ... et {len(trajectory['inversions']) - 5} autres")
                 lines.append(f"    Stabilité (CV rolling moyen): {format_number(trajectory['avg_rolling_cv'])}")
 
+            # Analyse épisodique pour les métriques périodiques (NAV, etc.)
+            # Le NAV est réinitialisé tous les episode_steps (ex: 2048 steps/episode * 1024 envs = 2097152)
+            episodic_metrics = ['custom/nav', 'internal/portfolio_value']
+            if metric_name in episodic_metrics:
+                episodic = analyze_episodic_metric(
+                    series,
+                    episode_steps=episode_steps,
+                    initial_value=initial_nav,
+                    metric_name=metric_name
+                )
+                if episodic:
+                    lines.extend(format_episodic_report(episodic))
+
     lines.append("")
     lines.append("=" * 80)
     lines.append("FIN DE L'ANALYSE")
@@ -790,6 +1016,13 @@ Exemples:
   python scripts/analyze_tensorboard.py --log_dir logs/wfo/segment_0 --output report.txt
   python scripts/analyze_tensorboard.py --log_dir logs/tensorboard --run_name run_5
   python scripts/analyze_tensorboard.py --log_dir logs/tensorboard --checkpoints 20
+
+Analyse épisodique (pour métriques périodiques comme NAV):
+  Les métriques custom/nav et internal/portfolio_value sont analysées par épisode.
+  Par défaut: episode_steps=2097152 (2048 steps * 1024 envs), initial_value=10000.
+  
+  Utilisez --episode_steps et --n_envs pour ajuster si votre config diffère:
+    python scripts/analyze_tensorboard.py --log_dir logs/wfo/segment_0 --episode_steps 2048 --n_envs 512
         """
     )
 
@@ -821,6 +1054,27 @@ Exemples:
         help='Nombre de checkpoints pour l\'analyse de trajectoire (défaut: 10)'
     )
 
+    parser.add_argument(
+        '--episode_steps',
+        type=int,
+        default=2048,
+        help='Nombre de steps par épisode (défaut: 2048)'
+    )
+
+    parser.add_argument(
+        '--n_envs',
+        type=int,
+        default=1024,
+        help='Nombre d\'environnements parallèles (défaut: 1024)'
+    )
+
+    parser.add_argument(
+        '--initial_nav',
+        type=float,
+        default=10000.0,
+        help='Valeur initiale du NAV après reset (défaut: 10000.0)'
+    )
+
     args = parser.parse_args()
 
     # Vérifier que le dossier existe
@@ -835,10 +1089,21 @@ Exemples:
             print(f"[INFO] Run spécifique: {args.run_name}")
         metrics_dict = load_tensorboard_run(args.log_dir, args.run_name)
 
+        # Calculer les steps par épisode total (steps * n_envs)
+        total_episode_steps = args.episode_steps * args.n_envs
+
         # Générer le rapport
         print(f"\n[INFO] Génération du rapport statistique...")
         print(f"[INFO] Checkpoints pour trajectoire: {args.checkpoints}")
-        report = generate_report(metrics_dict, args.output, n_checkpoints=args.checkpoints)
+        print(f"[INFO] Analyse épisodique: {args.episode_steps} steps × {args.n_envs} envs = {total_episode_steps:,} steps/épisode")
+        print(f"[INFO] NAV initial: {args.initial_nav:,.0f}")
+        report = generate_report(
+            metrics_dict,
+            args.output,
+            n_checkpoints=args.checkpoints,
+            episode_steps=total_episode_steps,
+            initial_nav=args.initial_nav
+        )
 
         # Afficher le rapport
         print("\n" + report)
