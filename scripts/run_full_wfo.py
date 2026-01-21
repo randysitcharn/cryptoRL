@@ -1917,7 +1917,7 @@ class WFOPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description="Walk-Forward Optimization")
-    parser.add_argument("--raw-data", type=str, default="data/raw_training_data.parquet",
+    parser.add_argument("--raw-data", type=str, default="data/raw_historical/multi_asset_historical.csv",
                         help="Path to raw OHLCV data")
     parser.add_argument("--segments", type=int, default=None,
                         help="Max number of segments to run")
