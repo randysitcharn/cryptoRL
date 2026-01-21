@@ -844,6 +844,26 @@ class BatchCryptoEnv(VecEnv):
         self.prev_position_deltas[dones] = 0.0
         self.latest_jerks[dones] = 0.0
 
+        # ═══════════════════════════════════════════════════════════════════
+        # MORL: Resample w_cost for done envs (biased distribution)
+        # ═══════════════════════════════════════════════════════════════════
+        if self._eval_w_cost is not None:
+            # Evaluation mode: use fixed w_cost
+            self.w_cost[dones] = self._eval_w_cost
+        else:
+            # Training mode: sample with biased distribution (20%/60%/20%)
+            sample_type = torch.rand(n_done, device=self.device)
+            new_w_cost = torch.where(
+                sample_type.unsqueeze(1) < 0.2,
+                torch.zeros(n_done, 1, device=self.device),
+                torch.where(
+                    sample_type.unsqueeze(1) > 0.8,
+                    torch.ones(n_done, 1, device=self.device),
+                    torch.rand(n_done, 1, device=self.device)
+                )
+            )
+            self.w_cost[dones] = new_w_cost
+
     def _build_infos(
         self,
         dones: torch.Tensor,
@@ -899,12 +919,16 @@ class BatchCryptoEnv(VecEnv):
         churn_level = np.array([(self.churn_multiplier - 1.0) / 4.0], dtype=np.float32)
         smooth_level = np.array([(self.smooth_multiplier - 1.0) / 4.0], dtype=np.float32)
         
+        # MORL: w_cost preference parameter (MUST match _get_observations structure)
+        w_cost = self.w_cost[idx].cpu().numpy()
+        
         return {
             "market": market,
             "position": position,
             "risk_level": risk_level,
             "churn_level": churn_level,
             "smooth_level": smooth_level,
+            "w_cost": w_cost,
         }
 
     # =========================================================================
