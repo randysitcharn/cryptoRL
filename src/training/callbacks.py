@@ -12,14 +12,19 @@ Provides all training-related callbacks:
 import os
 import time
 import numpy as np
+import torch
 from collections import deque
 from typing import TYPE_CHECKING, Optional
 from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.common.vec_env import VecEnv
 
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
+    from typing import TYPE_CHECKING as _TYPE_CHECKING
+else:
+    _TYPE_CHECKING = False
 
 
 # ============================================================================
@@ -826,8 +831,32 @@ class EvalCallbackWithNoiseControl(EvalCallback):
                 if self.verbose > 0:
                     print(f"  [Noise Control] Disabled observation noise in eval env")
 
+            # 1. Sauvegarder les poids d'entraînement actuels (VITAL)
+            training_params = [p.clone() for p in self.model.policy.parameters()]
+            
+            # 2. Charger les poids EMA pour l'évaluation (si disponible)
+            ema_callback = None
+            for callback in self.model._callbacks:
+                # Import here to avoid forward reference issue
+                from src.training.callbacks import ModelEMACallback
+                if isinstance(callback, ModelEMACallback):
+                    ema_callback = callback
+                    ema_callback.load_ema_weights()
+                    break
+
         # Call parent evaluation (this will trigger evaluation if needed)
-        result = super()._on_step()
+        try:
+            result = super()._on_step()
+        finally:
+            # After evaluation: RESTAURER les poids d'entraînement (CRITIQUE)
+            # Sans cette restauration, l'entraînement continuerait avec les poids EMA
+            # (moyenne retardée), ce qui ralentirait massivement l'apprentissage
+            if will_eval and ema_callback is not None:
+                with torch.no_grad():
+                    for param, train_param in zip(self.model.policy.parameters(), training_params):
+                        param.data.copy_(train_param.data)
+                if self.verbose > 0:
+                    print("[EvalCallbackWithNoiseControl] Restored training weights after evaluation")
 
         # After evaluation: re-enable noise in training env
         if will_eval:
@@ -1792,3 +1821,141 @@ class OverfittingGuardCallbackV2(BaseCallback):
             print(f"  Signal 4 - Action saturation: {self.saturation_ratio_limit:.0%} @ |a|>{self.action_saturation_threshold}")
             print(f"  Signal 5 - Reward variance: <{self.reward_variance_threshold:.0e}")
             print(f"  Decision: patience={self.patience}, check_freq={self.check_freq:,}")
+
+
+# ============================================================================
+# Model EMA Callback (Polyak Averaging)
+# ============================================================================
+
+class ModelEMACallback(BaseCallback):
+    """
+    Maintient une copie 'Shadow' (EMA) du modèle pour éviter l'overfitting.
+    
+    Utilise stable_baselines3.common.utils.polyak_update pour la mise à jour.
+    Les poids EMA sont stockés séparément et peuvent être chargés pour l'évaluation.
+    
+    Formula: θ_ema = τ * θ + (1-τ) * θ_ema where τ = 1 - decay.
+    
+    References:
+    - Polyak & Juditsky (1992) - Stochastic Approximation
+    - Lillicrap et al. (2015) - DDPG (τ=0.001)
+    - TQC uses τ=0.005 by default (decay=0.995)
+    
+    Args:
+        decay: EMA decay factor (0.995 = slow, 0.99 = medium, 0.95 = fast)
+               Corresponds to τ = 1 - decay (0.005, 0.01, 0.05)
+        save_path: Optional path to save EMA model at end of training
+        verbose: Verbosity level
+    """
+    def __init__(self, decay: float = 0.995, save_path: str = None, verbose: int = 0):
+        super().__init__(verbose)
+        self.decay = decay
+        self.tau = 1.0 - decay  # Convert decay to tau for polyak_update
+        self.save_path = save_path
+        self.ema_params = None  # List of cloned parameter tensors
+        
+    def _on_training_start(self) -> None:
+        """Initialize EMA weights from current policy weights."""
+        if not hasattr(self.model, 'policy') or self.model.policy is None:
+            if self.verbose > 0:
+                print("[ModelEMACallback] Warning: Policy not available yet")
+            return
+        
+        policy = self.model.policy
+        if not hasattr(policy, 'actor'):
+            if self.verbose > 0:
+                print("[ModelEMACallback] Warning: No actor found, skipping EMA")
+            return
+        
+        # Clone and detach parameters (on correct device)
+        self.ema_params = [
+            param.clone().detach().to(param.device)
+            for param in policy.parameters()
+            if param.requires_grad
+        ]
+        
+        if self.verbose > 0:
+            n_params = sum(p.numel() for p in self.ema_params)
+            print(f"[ModelEMACallback] Initialized EMA with decay={self.decay} (τ={self.tau:.4f})")
+            print(f"  Parameters: {n_params:,}")
+        
+    def _on_step(self) -> bool:
+        """Update EMA weights using SB3's polyak_update."""
+        if self.ema_params is None:
+            return True
+        
+        if not hasattr(self.model, 'policy') or self.model.policy is None:
+            return True
+        
+        # Use SB3's native polyak_update function
+        with torch.no_grad():
+            polyak_update(
+                params=self.model.policy.parameters(),
+                target_params=self.ema_params,
+                tau=self.tau
+            )
+        
+        # Optional logging (every 10k steps to reduce overhead)
+        if self.num_timesteps % 10_000 == 0:
+            total_diff = sum(
+                (p.data - ema_p.data).norm().item()
+                for p, ema_p in zip(
+                    self.model.policy.parameters(),
+                    self.ema_params
+                )
+            )
+            self.logger.record("ema/weight_diff_l2", total_diff)
+        
+        return True
+
+    def load_ema_weights(self) -> None:
+        """
+        Charge les poids EMA dans le policy (pour évaluation).
+        
+        Appeler cette méthode avant l'évaluation pour utiliser les poids EMA
+        au lieu des poids actuels.
+        """
+        if self.ema_params is None:
+            if self.verbose > 0:
+                print("[ModelEMACallback] Warning: EMA not initialized, cannot load")
+            return
+        
+        if not hasattr(self.model, 'policy') or self.model.policy is None:
+            return
+        
+        with torch.no_grad():
+            for param, ema_param in zip(self.model.policy.parameters(), self.ema_params):
+                param.data.copy_(ema_param.data)
+        
+        if self.verbose > 0:
+            print("[ModelEMACallback] Loaded EMA weights into policy")
+
+    def _on_training_end(self) -> None:
+        """Sauvegarde le modèle EMA à la fin de l'entraînement."""
+        if self.save_path is None or self.ema_params is None:
+            return
+        
+        if not hasattr(self.model, 'policy') or self.model.policy is None:
+            return
+        
+        if self.verbose > 0:
+            print(f"[ModelEMACallback] Saving EMA model with decay {self.decay}...")
+        
+        # 1. Sauvegarde des poids actuels (overfittés ?)
+        original_params = [p.clone() for p in self.model.policy.parameters()]
+        
+        # 2. Chargement des poids EMA
+        for param, ema_param in zip(self.model.policy.parameters(), self.ema_params):
+            param.data.copy_(ema_param.data)
+        
+        # 3. Save
+        os.makedirs(self.save_path, exist_ok=True)
+        ema_path = os.path.join(self.save_path, "best_model_ema.zip")
+        self.model.save(ema_path)
+        
+        if self.verbose > 0:
+            print(f"  Saved EMA model to {ema_path}")
+        
+        # 4. Restauration des poids originaux (si training continue)
+        for param, orig_param in zip(self.model.policy.parameters(), original_params):
+            param.data.copy_(orig_param.data)

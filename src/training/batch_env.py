@@ -73,6 +73,13 @@ class BatchCryptoEnv(VecEnv):
         random_start: bool = True,  # If False, start at beginning (for evaluation)
         # Short selling
         funding_rate: float = 0.0001,  # 0.01% per step (~0.24%/day) for short positions
+        # Domain Randomization (anti-overfitting)
+        enable_domain_randomization: bool = True,
+        commission_min: float = 0.0002,  # 0.02%
+        commission_max: float = 0.0008,  # 0.08%
+        slippage_min: float = 0.00005,   # 0.005%
+        slippage_max: float = 0.00015,   # 0.015%
+        slippage_noise_std: float = 0.00002,  # Bruit additif pour market impact
     ):
         """
         Initialize the batch environment.
@@ -101,6 +108,12 @@ class BatchCryptoEnv(VecEnv):
             observation_noise: Noise level for observations (anti-overfitting).
             random_start: If False, start at beginning (for evaluation).
             funding_rate: Funding cost per step for short positions (perpetual futures style).
+            enable_domain_randomization: Enable domain randomization for fees (anti-overfitting).
+            commission_min: Minimum commission rate for randomization.
+            commission_max: Maximum commission rate for randomization.
+            slippage_min: Minimum slippage rate for randomization.
+            slippage_max: Maximum slippage rate for randomization.
+            slippage_noise_std: Standard deviation of execution slippage noise.
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.num_envs = n_envs  # Store locally, VecEnv.__init__ will set self.num_envs
@@ -125,6 +138,14 @@ class BatchCryptoEnv(VecEnv):
         self.funding_rate = funding_rate
         self.training = True  # Flag for observation noise (disable during eval)
         self._last_noise_scale = 0.0  # For TensorBoard logging (Dynamic Noise)
+        
+        # Domain Randomization params
+        self.enable_domain_randomization = enable_domain_randomization
+        self.commission_min = commission_min
+        self.commission_max = commission_max
+        self.slippage_min = slippage_min
+        self.slippage_max = slippage_max
+        self.slippage_noise_std = slippage_noise_std
 
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
         self.progress = 0.0           # Training progress [0, 1]
@@ -302,8 +323,46 @@ class BatchCryptoEnv(VecEnv):
         self._rew_smooth = torch.zeros(n, device=device)
         self._rew_downside = torch.zeros(n, device=device)  # Downside risk tracking
 
+        # Domain Randomization: per-env commission/slippage
+        self.commission_per_env = torch.zeros(n, device=device)
+        self.slippage_per_env = torch.zeros(n, device=device)
+
         # OPTIMIZATION: Pre-allocate window offsets to avoid torch.arange in hot path
         self.window_offsets = torch.arange(self.window_size, device=device)
+
+    def _sample_domain_params(self, env_indices: torch.Tensor) -> None:
+        """
+        Sample commission and slippage for specified environments.
+        
+        Uses Beta distribution for commission (skewed towards center) and
+        Uniform distribution for slippage. Per-episode sampling (not per-step)
+        to maintain realistic exchange behavior.
+        
+        Args:
+            env_indices: Tensor of environment indices to sample for.
+        """
+        n = env_indices.shape[0]
+        
+        if self.enable_domain_randomization and self.training:
+            # Beta distribution for commission (skewed towards center)
+            # α=2, β=2 gives bell curve centered at (α/(α+β)) = 0.5
+            from torch.distributions import Beta
+            alpha, beta = 2.0, 2.0
+            beta_dist = Beta(alpha, beta)
+            u = beta_dist.sample((n,)).to(self.device)
+            self.commission_per_env[env_indices] = (
+                self.commission_min + 
+                (self.commission_max - self.commission_min) * u
+            )
+            
+            # Uniform for slippage
+            self.slippage_per_env[env_indices] = torch.rand(
+                n, device=self.device
+            ) * (self.slippage_max - self.slippage_min) + self.slippage_min
+        else:
+            # Fixed values (eval mode or disabled)
+            self.commission_per_env[env_indices] = self.commission
+            self.slippage_per_env[env_indices] = self.slippage
 
     def _get_prices(self, steps: torch.Tensor) -> torch.Tensor:
         """Get prices at given steps for all envs. Shape: (n_envs,)"""
@@ -526,6 +585,10 @@ class BatchCryptoEnv(VecEnv):
         self.prev_position_deltas.zero_()
         self.latest_jerks.zero_()
 
+        # Domain Randomization: sample fees for all envs
+        if self.enable_domain_randomization:
+            self._sample_domain_params(torch.arange(self.num_envs, device=self.device))
+
         # ═══════════════════════════════════════════════════════════════════
         # MORL: Sample w_cost with biased distribution (Audit SOTA Fix)
         # 20% extremes (0 or 1) + 60% uniform to ensure agent explores
@@ -704,10 +767,26 @@ class BatchCryptoEnv(VecEnv):
         target_values = old_navs * target_exposures
         target_units = target_values / old_prices
 
-        # Calculate trade costs
+        # Calculate trade costs with domain-randomized fees
         units_delta = target_units - self.positions
         trade_values = torch.abs(units_delta * old_prices)
-        trade_costs = trade_values * (self.commission + self.slippage)
+        
+        # Base costs: commission + slippage (per-env randomized)
+        base_cost_rate = self.commission_per_env + self.slippage_per_env
+        
+        # Add execution slippage noise (market impact variability)
+        if self.enable_domain_randomization and self.training:
+            slippage_noise = torch.randn(self.num_envs, device=self.device) * self.slippage_noise_std
+            slippage_noise = torch.clamp(
+                slippage_noise,
+                -self.slippage_noise_std * 2,
+                self.slippage_noise_std * 2
+            )
+            effective_cost_rate = base_cost_rate + slippage_noise
+        else:
+            effective_cost_rate = base_cost_rate
+        
+        trade_costs = trade_values * effective_cost_rate
 
         # Apply trades where position changed
         self.cash = torch.where(
@@ -843,6 +922,12 @@ class BatchCryptoEnv(VecEnv):
         # Reset PLO Smoothness jerk tracking for done envs
         self.prev_position_deltas[dones] = 0.0
         self.latest_jerks[dones] = 0.0
+
+        # Domain Randomization: resample fees for done envs
+        if self.enable_domain_randomization:
+            done_indices = torch.nonzero(dones, as_tuple=True)[0]
+            if done_indices.numel() > 0:
+                self._sample_domain_params(done_indices)
 
         # ═══════════════════════════════════════════════════════════════════
         # MORL: Resample w_cost for done envs (biased distribution)

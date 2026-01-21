@@ -39,6 +39,7 @@ from src.training.callbacks import (
     PLOAdaptivePenaltyCallback,
     PLOChurnCallback,
     PLOSmoothnessCallback,
+    ModelEMACallback,
 )
 
 
@@ -434,6 +435,17 @@ def create_callbacks(
             verbose=1
         )
         callbacks.append(curriculum_callback)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Model EMA Callback (Polyak Averaging for Policy Weights)
+    # Maintains EMA of policy weights for robust evaluation
+    # ═══════════════════════════════════════════════════════════════════════
+    ema_callback = ModelEMACallback(
+        decay=0.995,  # Corresponds to τ=0.005 (match TQC's tau for target network)
+        save_path=config.checkpoint_dir,  # Optional: save EMA model at end
+        verbose=config.verbose
+    )
+    callbacks.append(ema_callback)
 
     # ═══════════════════════════════════════════════════════════════════════
     # PLO (Predictive Lagrangian Optimization) Callbacks

@@ -372,10 +372,109 @@ Entropie basse:   Le modèle est figé, toujours la même action
 | **Walk-Forward Optimization** | Entraîne sur segment N, teste sur segment N+1 |
 | **TQCDropoutPolicy** | Dropout + LayerNorm pour régularisation |
 | **OverfittingGuardV2** | Détecte et stoppe automatiquement l'overfitting |
+| **Polyak Averaging (EMA)** | Moyenne mobile exponentielle des poids pour généralisation |
 
 ---
 
-## 12. OverfittingGuardCallbackV2 (5 Signaux)
+## 12. Polyak Averaging (EMA) - Robustesse & Généralisation
+
+### Problème
+Les poids du policy network pendant l'entraînement sont **instables** et peuvent surajuster aux derniers batches vus. Un poids optimal à l'étape N peut être "perdu" si le modèle continue à s'entraîner.
+
+**Note importante** : SB3/TQC utilise déjà Polyak Averaging pour les **target networks des critics** (via `tau=0.005`), mais **pas** pour le policy network (actor). Cette section décrit une extension custom pour le policy.
+
+### Solution : Exponential Moving Average (EMA)
+
+Polyak Averaging maintient une **moyenne mobile exponentielle** des poids du réseau au fil du temps.
+
+#### Formule
+```python
+θ_ema = τ × θ_current + (1 - τ) × θ_ema
+```
+
+où :
+- `θ_current` : Poids actuels du policy network
+- `θ_ema` : Poids EMA (Exponential Moving Average)
+- `τ` : Coefficient de mise à jour (typiquement 0.005 = lent, 0.01 = moyen)
+
+#### Intuition
+```
+Étape 1000:  θ_ema = moyenne des poids [1..1000]
+Étape 2000:  θ_ema = moyenne des poids [1..2000] (pondéré récursivement)
+Étape 5000:  θ_ema = moyenne des poids [1..5000]
+```
+
+Les poids EMA "lissent" les fluctuations et capturent une **version robuste** du modèle qui généralise mieux.
+
+#### Analogie
+Imagine un trader qui change de stratégie chaque jour (poids actuels) vs un trader qui garde une **moyenne mobile** de ses stratégies récentes (poids EMA). La moyenne est plus stable et généralise mieux aux nouvelles situations.
+
+### Paramètre τ (Tau)
+
+| τ | Vitesse | Usage |
+|---|---------|-------|
+| **0.001** | Très lent | Modèles très stables, longue convergence |
+| **0.005** | Lent | **Défaut CryptoRL** (match TQC target network) |
+| **0.01** | Moyen | Équilibre stabilité/réactivité |
+| **0.05** | Rapide | Modèles instables, adaptation rapide |
+
+**Règle** : Plus τ est petit, plus l'EMA est stable mais moins réactif aux nouvelles améliorations.
+
+### Utilisation dans CryptoRL
+
+#### 1. Pendant l'entraînement
+- À chaque étape (ou N étapes), mise à jour de l'EMA
+- Les poids actuels continuent de s'entraîner normalement
+- L'EMA est une **copie en arrière-plan** qui ne perturbe pas le training
+
+#### 2. Pour l'évaluation
+- **Charger les poids EMA** dans le policy avant évaluation
+- Utiliser ces poids pour inférence (plus robustes)
+- Les poids actuels restent disponibles pour continuer l'entraînement
+
+#### 3. Avantages pour Trading RL
+
+| Problème | Solution EMA |
+|----------|--------------|
+| Policy "chase noise" en fin d'entraînement | EMA ignore les fluctuations récentes |
+| Variance élevée entre épisodes | EMA réduit la variance (weights smoothing) |
+| Overfitting aux dernières données vues | EMA pondère toutes les étapes d'entraînement |
+
+### Métriques TensorBoard
+
+```
+ema/weight_diff_relative  # Distance L2 entre θ_current et θ_ema (normalisée)
+```
+
+Si `weight_diff_relative` augmente :
+- Le modèle continue à apprendre (poids actuels divergent de l'EMA)
+- Normal en début d'entraînement
+- Anormal si l'augmentation persiste (signe d'instabilité)
+
+### Références
+
+- **Polyak & Juditsky (1992)** - "Acceleration of Stochastic Approximation by Averaging"
+  - Base théorique de la méthode
+- **Lillicrap et al. (2015)** - DDPG utilise τ=0.001 pour target networks
+- **TQC** - Utilise τ=0.005 pour les target critics (même valeur recommandée pour EMA policy)
+
+### Différence avec Target Network de SB3
+
+| Concept | Objectif | Réseau | Mise à jour | Implémenté dans SB3 ? |
+|---------|----------|--------|-------------|----------------------|
+| **Target Network** | Stabilité du critic (Q-function) | Critics | τ = 0.005 (lent) | ✅ **Oui** (automatique) |
+| **EMA Policy** | Robustesse du policy (actor) | Actor | τ = 0.005 (recommandé) | ❌ **Non** (custom callback) |
+
+**Détail** :
+- SB3/TQC utilise `tau` pour mettre à jour automatiquement les **target critics** :
+  ```python
+  θ_target_critic = τ × θ_critic + (1-τ) × θ_target_critic
+  ```
+- Mais **aucun mécanisme** n'existe pour l'actor. Le `EMACallback` proposé dans le plan est une **extension custom** qui applique la même logique au policy network.
+
+---
+
+## 13. OverfittingGuardCallbackV2 (5 Signaux)
 
 ### Problème
 La détection d'overfitting via un seul signal (NAV) est fragile.
@@ -414,7 +513,7 @@ overfit/violations_*, overfit/active_signals
 
 ---
 
-## 13. Séparation Données Train/Eval
+## 14. Séparation Données Train/Eval
 
 ### Problème : Data Leakage
 Si train et eval partagent les mêmes données, la mesure de généralisation est faussée.
@@ -454,7 +553,7 @@ Si train et eval partagent les mêmes données, la mesure de généralisation es
 
 ---
 
-## 14. Intégration WFO du Guard (Fail-over)
+## 15. Intégration WFO du Guard (Fail-over)
 
 ### Problème
 Sans Guard en WFO, le training peut continuer même si le modèle a divergé.
@@ -508,7 +607,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 15. Métriques de Performance
+## 16. Métriques de Performance
 
 ### Trading
 | Métrique | Formule | Cible |
@@ -527,7 +626,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 16. Fichiers Principaux
+## 17. Fichiers Principaux
 
 | Fichier | Rôle | Lignes |
 |---------|------|--------|
@@ -542,7 +641,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 17. Termes Techniques Courants
+## 18. Termes Techniques Courants
 
 | Terme | Définition |
 |-------|------------|
@@ -561,10 +660,11 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 | **Fail-over** | Stratégie de repli en cas d'échec (checkpoint ou stratégie passive) |
 | **Policy Collapse** | Dégénérescence de la policy (actions bloquées à ±1) |
 | **Weight Stagnation** | Poids du réseau qui ne bougent plus (signe de convergence/collapse) |
+| **Polyak Averaging (EMA)** | Moyenne mobile exponentielle des poids pour robustesse (τ=0.005) |
 
 ---
 
-## 18. Références Essentielles
+## 19. Références Essentielles
 
 1. **Lopez de Prado (2018)** - "Advances in Financial Machine Learning"
    - Fractional Differentiation, Meta-Labeling, Purged CV
@@ -592,6 +692,9 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 9. **Sparse-Reg (2025)** - arXiv:2506.17155
    - Variance rewards comme proxy généralisation (Signal 5)
+
+10. **Polyak & Juditsky (1992)** - "Acceleration of Stochastic Approximation by Averaging"
+    - Base théorique de Polyak Averaging (EMA) pour robustesse des poids
 
 ---
 
