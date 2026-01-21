@@ -1083,22 +1083,22 @@ class BatchCryptoEnv(VecEnv):
         """
         Update training progress and curriculum lambda.
 
-        Curriculum Schedule (AAAI 2024 Curriculum Learning for HFT):
-          Phase 1 (0-10%):   lambda = 0.0  (Pure Exploration)
-          Phase 2 (10-30%):  lambda = 0.0 -> 0.4 (Reality Ramp)
-          Phase 3 (30-100%): lambda = 0.4 (Stability)
+        Curriculum Schedule (extended to 75% of training):
+          Phase 1 (0-15%):   lambda = 0.0  (Pure Exploration)
+          Phase 2 (15-75%):  lambda = 0.0 -> 0.4 (Reality Ramp)
+          Phase 3 (75-100%): lambda = 0.4 (Stability)
 
         Args:
             progress: Training progress as fraction [0, 1].
         """
         self.progress = max(0.0, min(1.0, progress))
 
-        if self.progress <= 0.10:
+        if self.progress <= 0.15:
             # Phase 1: Pure Exploration - no penalties
             self.curriculum_lambda = 0.0
-        elif self.progress <= 0.30:
+        elif self.progress <= 0.75:
             # Phase 2: Reality Ramp - linear 0.0 -> 0.4
-            phase_progress = (self.progress - 0.10) / 0.20
+            phase_progress = (self.progress - 0.15) / 0.60
             self.curriculum_lambda = 0.4 * phase_progress
         else:
             # Phase 3: Stability - fixed discipline

@@ -615,10 +615,10 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     Three-Phase Curriculum Learning with IPC Fault Tolerance.
     Refactored 2026-01-16 to fix multiprocessing crashes.
     """
-    # Modified by CryptoRL: reduced smooth_coef 0.02 -> 0.005 to unblock trading
+    # Modified by CryptoRL: curriculum extended to 75% of training
     PHASES = [
-        {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-        {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.005)},
+        {'end_progress': 0.15, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
+        {'end_progress': 0.75, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.005)},
         {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.005, 0.005)},
     ]
 
