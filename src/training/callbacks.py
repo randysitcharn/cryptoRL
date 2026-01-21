@@ -1642,12 +1642,22 @@ class ModelEMACallback(BaseCallback):
         if self.verbose > 0:
             print(f"[ModelEMACallback] Saving EMA model with decay {self.decay}...")
         
-        # 1. Sauvegarde des poids actuels (overfittés ?)
-        original_params = [p.clone() for p in self.model.policy.parameters()]
+        # Get parameters with same filter as initialization
+        policy_params = [param for param in self.model.policy.parameters() if param.requires_grad]
         
-        # 2. Chargement des poids EMA
-        for param, ema_param in zip(self.model.policy.parameters(), self.ema_params):
-            param.data.copy_(ema_param.data)
+        # Validate shapes match
+        if len(policy_params) != len(self.ema_params):
+            if self.verbose > 0:
+                print(f"[ModelEMACallback] Warning: Cannot save EMA - parameter count mismatch")
+            return
+        
+        # 1. Sauvegarde des poids actuels (overfittés ?)
+        original_params = [p.clone() for p in policy_params]
+        
+        # 2. Chargement des poids EMA (using filtered parameters)
+        with torch.no_grad():
+            for param, ema_param in zip(policy_params, self.ema_params):
+                param.data.copy_(ema_param.data)
         
         # 3. Save
         os.makedirs(self.save_path, exist_ok=True)
@@ -1658,5 +1668,6 @@ class ModelEMACallback(BaseCallback):
             print(f"  Saved EMA model to {ema_path}")
         
         # 4. Restauration des poids originaux (si training continue)
-        for param, orig_param in zip(self.model.policy.parameters(), original_params):
-            param.data.copy_(orig_param.data)
+        with torch.no_grad():
+            for param, orig_param in zip(policy_params, original_params):
+                param.data.copy_(orig_param.data)
