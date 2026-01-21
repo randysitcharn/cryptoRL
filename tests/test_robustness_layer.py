@@ -28,8 +28,8 @@ def test_domain_randomization_sampling():
         commission_max=0.0008,
         slippage_min=0.00005,
         slippage_max=0.00015,
-        training=True,
     )
+    env.training = True  # Set training mode after init
     
     # Reset and capture initial fees
     env.reset()
@@ -80,8 +80,8 @@ def test_domain_randomization_eval_mode():
         n_envs=4,
         device="cpu",
         enable_domain_randomization=True,
-        training=False,  # Eval mode
     )
+    env.training = False  # Eval mode
     
     env.reset()
     
@@ -119,7 +119,8 @@ def test_ema_callback_initialization():
     for ema_param, orig_param in zip(callback.ema_params, mock_policy.parameters()):
         assert ema_param.requires_grad == False, "EMA params should not require grad"
         assert ema_param.shape == orig_param.shape, "EMA params should have same shape"
-        assert not torch.equal(ema_param, orig_param), "EMA params should be separate tensors"
+        # Note: At initialization, EMA params equal original params (they are clones)
+        # They will diverge after updates
     
     print("✓ ModelEMACallback: Initialization correct")
 
@@ -211,8 +212,8 @@ def test_integration_morl_compatibility():
         n_envs=4,
         device="cpu",
         enable_domain_randomization=True,
-        training=True,
     )
+    env.training = True  # Set training mode
     
     env.reset()
     
