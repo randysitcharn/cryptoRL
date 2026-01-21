@@ -797,14 +797,26 @@ class EvalCallbackWithNoiseControl(EvalCallback):
             training_params = [p.clone() for p in self.model.policy.parameters()]
             
             # 2. Charger les poids EMA pour l'évaluation (si disponible)
+            # Access callbacks via self.callback (CallbackList parent) instead of model._callbacks
             ema_callback = None
-            for callback in self.model._callbacks:
+            if hasattr(self, 'callback'):
                 # Import here to avoid forward reference issue
                 from src.training.callbacks import ModelEMACallback
-                if isinstance(callback, ModelEMACallback):
-                    ema_callback = callback
-                    ema_callback.load_ema_weights()
-                    break
+                # Try different ways to access callbacks list (SB3 version compatibility)
+                callbacks_list = None
+                if hasattr(self.callback, 'callbacks'):
+                    callbacks_list = self.callback.callbacks
+                elif hasattr(self.callback, '_callbacks'):
+                    callbacks_list = self.callback._callbacks
+                elif isinstance(self.callback, list):
+                    callbacks_list = self.callback
+                
+                if callbacks_list is not None:
+                    for callback in callbacks_list:
+                        if isinstance(callback, ModelEMACallback):
+                            ema_callback = callback
+                            ema_callback.load_ema_weights()
+                            break
 
         # Call parent evaluation (this will trigger evaluation if needed)
         try:
