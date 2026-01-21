@@ -376,6 +376,129 @@ def detect_anomalies(metric_series: pd.Series, iqr_factor: float = 1.5, std_thre
 
 
 # ============================================================================
+# Analyse par trajectoire (Rolling Stats)
+# ============================================================================
+
+def analyze_trajectory(metric_series: pd.Series, n_checkpoints: int = 10) -> Dict[str, Any]:
+    """
+    Analyse la trajectoire temporelle d'une métrique via rolling stats.
+
+    Permet de détecter :
+    - Phases d'amélioration puis dégradation (overfit)
+    - Points d'inflexion (changement de tendance)
+    - Instabilité locale vs globale
+
+    Args:
+        metric_series: pd.Series avec index=step et values=metric values
+        n_checkpoints: Nombre de points de contrôle (défaut: 10)
+
+    Returns:
+        Dictionnaire avec analyse de trajectoire
+    """
+    if len(metric_series) < n_checkpoints * 2:
+        return {}
+
+    n_points = len(metric_series)
+    window_size = max(10, n_points // n_checkpoints)
+
+    # Rolling mean et std
+    rolling_mean = metric_series.rolling(window=window_size, min_periods=window_size // 2).mean()
+    rolling_std = metric_series.rolling(window=window_size, min_periods=window_size // 2).std()
+
+    # Échantillonner aux checkpoints
+    checkpoint_indices = np.linspace(window_size, n_points - 1, n_checkpoints, dtype=int)
+    checkpoints = []
+
+    for idx in checkpoint_indices:
+        step = metric_series.index[idx]
+        checkpoints.append({
+            'step': int(step),
+            'mean': float(rolling_mean.iloc[idx]) if not np.isnan(rolling_mean.iloc[idx]) else None,
+            'std': float(rolling_std.iloc[idx]) if not np.isnan(rolling_std.iloc[idx]) else None,
+        })
+
+    # Filtrer les checkpoints valides
+    valid_checkpoints = [c for c in checkpoints if c['mean'] is not None]
+    if len(valid_checkpoints) < 3:
+        return {}
+
+    # Trouver le meilleur et pire point
+    means = [c['mean'] for c in valid_checkpoints]
+    best_idx = int(np.argmin(means))  # Pour loss (min = meilleur)
+    worst_idx = int(np.argmax(means))
+
+    # Détecter si best est avant worst (signe d'overfit pour loss)
+    # ou après (amélioration continue)
+    best_checkpoint = valid_checkpoints[best_idx]
+    worst_checkpoint = valid_checkpoints[worst_idx]
+
+    # Calculer les changements entre checkpoints consécutifs
+    changes = []
+    for i in range(1, len(valid_checkpoints)):
+        prev_mean = valid_checkpoints[i - 1]['mean']
+        curr_mean = valid_checkpoints[i]['mean']
+        if prev_mean != 0:
+            pct_change = ((curr_mean - prev_mean) / abs(prev_mean)) * 100
+        else:
+            pct_change = 0.0
+        changes.append({
+            'from_step': valid_checkpoints[i - 1]['step'],
+            'to_step': valid_checkpoints[i]['step'],
+            'change_pct': pct_change,
+            'direction': 'up' if pct_change > 1 else 'down' if pct_change < -1 else 'stable'
+        })
+
+    # Détecter les inversions de tendance
+    inversions = []
+    for i in range(1, len(changes)):
+        if changes[i - 1]['direction'] != changes[i]['direction'] and \
+           changes[i - 1]['direction'] != 'stable' and changes[i]['direction'] != 'stable':
+            inversions.append({
+                'step': changes[i]['from_step'],
+                'from': changes[i - 1]['direction'],
+                'to': changes[i]['direction']
+            })
+
+    # Classifier la trajectoire globale
+    first_third_mean = np.mean(means[:len(means) // 3])
+    middle_third_mean = np.mean(means[len(means) // 3:2 * len(means) // 3])
+    last_third_mean = np.mean(means[2 * len(means) // 3:])
+
+    if first_third_mean > middle_third_mean < last_third_mean:
+        trajectory_type = 'U-shape (overfit probable)'
+    elif first_third_mean < middle_third_mean > last_third_mean:
+        trajectory_type = 'inverse-U (pic puis chute)'
+    elif first_third_mean > middle_third_mean > last_third_mean:
+        trajectory_type = 'amélioration continue'
+    elif first_third_mean < middle_third_mean < last_third_mean:
+        trajectory_type = 'dégradation continue'
+    else:
+        trajectory_type = 'mixte/oscillant'
+
+    # Stabilité : ratio std/mean moyen
+    stds = [c['std'] for c in valid_checkpoints if c['std'] is not None]
+    if stds and np.mean(means) != 0:
+        avg_cv = np.mean(stds) / abs(np.mean(means))
+    else:
+        avg_cv = 0.0
+
+    return {
+        'checkpoints': valid_checkpoints,
+        'changes': changes,
+        'inversions': inversions,
+        'n_inversions': len(inversions),
+        'trajectory_type': trajectory_type,
+        'best_checkpoint': best_checkpoint,
+        'worst_checkpoint': worst_checkpoint,
+        'best_position': 'début' if best_idx < len(valid_checkpoints) // 3 else 'milieu' if best_idx < 2 * len(valid_checkpoints) // 3 else 'fin',
+        'avg_rolling_cv': avg_cv,
+        'first_third_mean': first_third_mean,
+        'middle_third_mean': middle_third_mean,
+        'last_third_mean': last_third_mean,
+    }
+
+
+# ============================================================================
 # Analyse par phases
 # ============================================================================
 
@@ -466,13 +589,18 @@ def group_metrics_by_category(metrics_dict: Dict[str, pd.Series]) -> Dict[str, L
     return dict(categories)
 
 
-def generate_report(metrics_dict: Dict[str, pd.Series], output_file: Optional[str] = None) -> str:
+def generate_report(
+    metrics_dict: Dict[str, pd.Series],
+    output_file: Optional[str] = None,
+    n_checkpoints: int = 10
+) -> str:
     """
     Génère un rapport statistique complet pour toutes les métriques.
 
     Args:
         metrics_dict: Dictionnaire {metric_name: pd.Series}
         output_file: Fichier de sortie optionnel
+        n_checkpoints: Nombre de checkpoints pour l'analyse de trajectoire (défaut: 10)
 
     Returns:
         Rapport sous forme de string
@@ -485,7 +613,11 @@ def generate_report(metrics_dict: Dict[str, pd.Series], output_file: Optional[st
 
     # Grouper par catégorie
     categories = group_metrics_by_category(metrics_dict)
-    category_order = ['train', 'rollout', 'env', 'rewards', 'custom', 'loss', 'eval', 'other']
+    category_order = [
+        'train', 'rollout', 'env', 'rewards', 'custom', 'loss', 'eval',
+        'curriculum', 'plo', 'plo_churn', 'plo_smooth', 'churn',
+        'overfit', 'observation_noise', 'internal', 'time', 'grad', 'other'
+    ]
 
     for category in category_order:
         if category not in categories:
@@ -590,6 +722,43 @@ def generate_report(metrics_dict: Dict[str, pd.Series], output_file: Optional[st
                 lines.append(f"    {comp['last_phase']}: moyenne = {format_number(comp['last_mean'])}")
                 lines.append(f"    Évolution: {comp['improvement_pct']:+.2f}% ({comp['direction']})")
 
+            # Analyse de trajectoire (Rolling Stats)
+            trajectory = analyze_trajectory(series, n_checkpoints=n_checkpoints)
+            if trajectory:
+                lines.append("")
+                lines.append("  TRAJECTOIRE (Rolling Stats):")
+                lines.append(f"    Type: {trajectory['trajectory_type']}")
+                lines.append(f"    Meilleur point: step {trajectory['best_checkpoint']['step']} "
+                           f"(mean={format_number(trajectory['best_checkpoint']['mean'])}) [{trajectory['best_position']}]")
+                lines.append(f"    Pire point: step {trajectory['worst_checkpoint']['step']} "
+                           f"(mean={format_number(trajectory['worst_checkpoint']['mean'])})")
+                
+                # Afficher tous les checkpoints
+                lines.append(f"    Checkpoints ({len(trajectory['checkpoints'])} points):")
+                for i, cp in enumerate(trajectory['checkpoints']):
+                    # Indicateur visuel de tendance
+                    if i == 0:
+                        trend_icon = "  "
+                    else:
+                        prev_mean = trajectory['checkpoints'][i - 1]['mean']
+                        if cp['mean'] > prev_mean * 1.01:
+                            trend_icon = "↑ "
+                        elif cp['mean'] < prev_mean * 0.99:
+                            trend_icon = "↓ "
+                        else:
+                            trend_icon = "→ "
+                    
+                    std_str = f"±{format_number(cp['std'])}" if cp['std'] is not None else ""
+                    lines.append(f"      {trend_icon}Step {cp['step']:>8}: mean={format_number(cp['mean']):>12} {std_str}")
+                
+                lines.append(f"    Inversions de tendance: {trajectory['n_inversions']}")
+                if trajectory['inversions']:
+                    for inv in trajectory['inversions'][:5]:
+                        lines.append(f"      Step {inv['step']}: {inv['from']} → {inv['to']}")
+                    if len(trajectory['inversions']) > 5:
+                        lines.append(f"      ... et {len(trajectory['inversions']) - 5} autres")
+                lines.append(f"    Stabilité (CV rolling moyen): {format_number(trajectory['avg_rolling_cv'])}")
+
     lines.append("")
     lines.append("=" * 80)
     lines.append("FIN DE L'ANALYSE")
@@ -620,6 +789,7 @@ Exemples:
   python scripts/analyze_tensorboard.py --log_dir logs/tensorboard/run_1
   python scripts/analyze_tensorboard.py --log_dir logs/wfo/segment_0 --output report.txt
   python scripts/analyze_tensorboard.py --log_dir logs/tensorboard --run_name run_5
+  python scripts/analyze_tensorboard.py --log_dir logs/tensorboard --checkpoints 20
         """
     )
 
@@ -644,6 +814,13 @@ Exemples:
         help='Fichier de sortie pour sauvegarder le rapport (optionnel)'
     )
 
+    parser.add_argument(
+        '--checkpoints',
+        type=int,
+        default=10,
+        help='Nombre de checkpoints pour l\'analyse de trajectoire (défaut: 10)'
+    )
+
     args = parser.parse_args()
 
     # Vérifier que le dossier existe
@@ -660,7 +837,8 @@ Exemples:
 
         # Générer le rapport
         print(f"\n[INFO] Génération du rapport statistique...")
-        report = generate_report(metrics_dict, args.output)
+        print(f"[INFO] Checkpoints pour trajectoire: {args.checkpoints}")
+        report = generate_report(metrics_dict, args.output, n_checkpoints=args.checkpoints)
 
         # Afficher le rapport
         print("\n" + report)
