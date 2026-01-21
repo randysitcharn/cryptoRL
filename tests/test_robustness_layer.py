@@ -8,28 +8,77 @@ Tests:
 3. Integration: Verify compatibility with MORL/PLO
 """
 
+import sys
+import os
+import tempfile
 import pytest
 import numpy as np
+import pandas as pd
 import torch
 from unittest.mock import Mock, MagicMock
+
+# Add the project root to the python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.training.batch_env import BatchCryptoEnv
 from src.training.callbacks import ModelEMACallback
 
 
+def create_dummy_data(n_rows: int = 1000) -> pd.DataFrame:
+    """
+    Crée des données factices pour les tests.
+    
+    Args:
+        n_rows (int): Nombre de lignes.
+    
+    Returns:
+        pd.DataFrame: DataFrame avec les mêmes colonnes que les données traitées.
+    """
+    np.random.seed(42)
+    
+    # Colonnes du processor (16 colonnes)
+    data = {
+        'open': np.random.uniform(90, 110, n_rows),
+        'high': np.random.uniform(100, 120, n_rows),
+        'low': np.random.uniform(80, 100, n_rows),
+        'close': np.random.uniform(90, 110, n_rows),
+        'RSI_14': np.random.uniform(0, 1, n_rows),
+        'MACD_12_26_9': np.random.uniform(-0.01, 0.01, n_rows),
+        'MACDh_12_26_9': np.random.uniform(-0.005, 0.005, n_rows),
+        'ATRr_14': np.random.uniform(0.01, 0.05, n_rows),
+        'BBP_20_2.0': np.random.uniform(-0.5, 1.5, n_rows),
+        'BBB_20_2.0': np.random.uniform(0, 0.1, n_rows),
+        'log_ret': np.random.uniform(-0.03, 0.03, n_rows),
+        'sin_hour': np.random.uniform(-1, 1, n_rows),
+        'cos_hour': np.random.uniform(-1, 1, n_rows),
+        'sin_day': np.random.uniform(-1, 1, n_rows),
+        'cos_day': np.random.uniform(-1, 1, n_rows),
+        'volume_rel': np.random.uniform(0.5, 2, n_rows),
+    }
+    
+    return pd.DataFrame(data)
+
+
 def test_domain_randomization_sampling():
     """Test that domain randomization samples fees per-episode."""
-    env = BatchCryptoEnv(
-        parquet_path="data/processed_data.parquet",
-        n_envs=4,
-        device="cpu",
-        enable_domain_randomization=True,
-        commission_min=0.0002,
-        commission_max=0.0008,
-        slippage_min=0.00005,
-        slippage_max=0.00015,
-    )
-    env.training = True  # Set training mode after init
+    # Create temporary data file
+    with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp_file:
+        df = create_dummy_data(n_rows=500)
+        df.to_parquet(tmp_file.name, index=False)
+        tmp_path = tmp_file.name
+    
+    try:
+        env = BatchCryptoEnv(
+            parquet_path=tmp_path,
+            n_envs=4,
+            device="cpu",
+            enable_domain_randomization=True,
+            commission_min=0.0002,
+            commission_max=0.0008,
+            slippage_min=0.00005,
+            slippage_max=0.00015,
+        )
+        env.training = True  # Set training mode after init
     
     # Reset and capture initial fees
     env.reset()
@@ -70,18 +119,29 @@ def test_domain_randomization_sampling():
     assert torch.all(env.slippage_per_env <= env.slippage_max), \
         "Slippages should be <= slippage_max"
     
-    print("✓ Domain Randomization: Fees sampled per-episode correctly")
+        print("✓ Domain Randomization: Fees sampled per-episode correctly")
+    finally:
+        # Cleanup
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def test_domain_randomization_eval_mode():
     """Test that domain randomization is disabled in eval mode."""
-    env = BatchCryptoEnv(
-        parquet_path="data/processed_data.parquet",
-        n_envs=4,
-        device="cpu",
-        enable_domain_randomization=True,
-    )
-    env.training = False  # Eval mode
+    # Create temporary data file
+    with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp_file:
+        df = create_dummy_data(n_rows=500)
+        df.to_parquet(tmp_file.name, index=False)
+        tmp_path = tmp_file.name
+    
+    try:
+        env = BatchCryptoEnv(
+            parquet_path=tmp_path,
+            n_envs=4,
+            device="cpu",
+            enable_domain_randomization=True,
+        )
+        env.training = False  # Eval mode
     
     env.reset()
     
@@ -91,7 +151,11 @@ def test_domain_randomization_eval_mode():
     assert torch.allclose(env.slippage_per_env, torch.full((env.num_envs,), env.slippage)), \
         "In eval mode, slippages should be fixed"
     
-    print("✓ Domain Randomization: Disabled in eval mode correctly")
+        print("✓ Domain Randomization: Disabled in eval mode correctly")
+    finally:
+        # Cleanup
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def test_ema_callback_initialization():
@@ -207,13 +271,20 @@ def test_ema_callback_load_weights():
 
 def test_integration_morl_compatibility():
     """Test that Domain Randomization works with MORL (w_cost)."""
-    env = BatchCryptoEnv(
-        parquet_path="data/processed_data.parquet",
-        n_envs=4,
-        device="cpu",
-        enable_domain_randomization=True,
-    )
-    env.training = True  # Set training mode
+    # Create temporary data file
+    with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp_file:
+        df = create_dummy_data(n_rows=500)
+        df.to_parquet(tmp_file.name, index=False)
+        tmp_path = tmp_file.name
+    
+    try:
+        env = BatchCryptoEnv(
+            parquet_path=tmp_path,
+            n_envs=4,
+            device="cpu",
+            enable_domain_randomization=True,
+        )
+        env.training = True  # Set training mode
     
     env.reset()
     
@@ -236,7 +307,11 @@ def test_integration_morl_compatibility():
     assert rewards.shape == (env.num_envs,), "Rewards should have correct shape"
     assert not np.isnan(rewards).any(), "Rewards should not contain NaN"
     
-    print("✓ Integration: Domain Randomization compatible with MORL")
+        print("✓ Integration: Domain Randomization compatible with MORL")
+    finally:
+        # Cleanup
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 if __name__ == "__main__":
