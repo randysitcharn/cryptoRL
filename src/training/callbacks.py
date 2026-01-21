@@ -619,20 +619,21 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     """
     Three-Phase Curriculum Learning with IPC Fault Tolerance.
     Refactored 2026-01-16 to fix multiprocessing crashes.
+    
+    NOTE: PLO Churn and Smoothness have been removed in favor of MORL.
+    This callback now only manages curriculum_lambda for the environment.
     """
     # Modified by CryptoRL: curriculum extended to 75% of training
+    # PLO Churn/Smoothness removed - only curriculum_lambda remains
     PHASES = [
-        {'end_progress': 0.15, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-        {'end_progress': 0.75, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.005)},
-        {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.005, 0.005)},
+        {'end_progress': 0.15},
+        {'end_progress': 0.75},
+        {'end_progress': 1.0},
     ]
 
-    def __init__(self, total_timesteps: int, shared_smooth: Optional["Synchronized"] = None, verbose: int = 0):
+    def __init__(self, total_timesteps: int, verbose: int = 0):
         super().__init__(verbose)
         self.total_timesteps = total_timesteps
-        self.shared_smooth = shared_smooth
-        self.current_smooth = 0.0
-        self.current_churn = 0.0
         self._phase = 1
 
     def _on_step(self) -> bool:
@@ -646,30 +647,9 @@ class ThreePhaseCurriculumCallback(BaseCallback):
                 self._phase = i + 1
                 break
 
-        # Interpolate
-        prev_end = 0.0 if self._phase == 1 else self.PHASES[self._phase - 2]['end_progress']
-        phase_progress = (progress - prev_end) / (phase_cfg['end_progress'] - prev_end)
-        phase_progress = max(0.0, min(1.0, phase_progress))
-
-        c_start, c_end = phase_cfg['churn']
-        s_start, s_end = phase_cfg['smooth']
-
-        self.current_churn = c_start + (c_end - c_start) * phase_progress
-        self.current_smooth = s_start + (s_end - s_start) * phase_progress
-
-        # Apply Logic with IPC Safety Net
-        if self.shared_smooth is not None:
-            try:
-                self.shared_smooth.value = self.current_smooth
-            except (ConnectionResetError, BrokenPipeError, FileNotFoundError, OSError):
-                # Fail gracefully. Do not kill the training run for a metric update.
-                pass
-
-        # ALWAYS update env (for BatchCryptoEnv penalties + curriculum_lambda)
+        # ALWAYS update env (for BatchCryptoEnv curriculum_lambda)
         self._update_envs()
 
-        self.logger.record("curriculum/smooth_coef", self.current_smooth)
-        self.logger.record("curriculum/churn_coef", self.current_churn)
         self.logger.record("curriculum/phase", self._phase)
         self.logger.record("curriculum/progress", progress)
 
@@ -685,41 +665,23 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         return True
 
     def _update_envs(self):
-        """Update penalties on all environments (unwrap for BatchCryptoEnv)."""
+        """Update curriculum progress on all environments (unwrap for BatchCryptoEnv)."""
         # Unwrap pour atteindre BatchCryptoEnv sous les wrappers SB3
         real_env = get_underlying_batch_env(self.model.env)
 
         # Calculate progress for curriculum lambda
         progress = self.num_timesteps / self.total_timesteps
 
-        # Appel direct (contourne le Wrapper Hell de SB3)
-        if hasattr(real_env, 'set_smoothness_penalty'):
-            real_env.set_smoothness_penalty(self.current_smooth)
-            real_env.set_churn_penalty(self.current_churn)
-            # Sync progress for curriculum_lambda (AAAI 2024 Curriculum Learning)
-            if hasattr(real_env, 'set_progress'):
-                real_env.set_progress(progress)
-            return
-
-        # Fallback: DummyVecEnv path (CPU envs)
-        if isinstance(self.model.env, VecEnv) and hasattr(self.model.env, 'envs'):
-            for i in range(self.model.env.num_envs):
-                base_env = self.model.env.envs[i]
-                while hasattr(base_env, 'env'):
-                    base_env = base_env.env
-                if hasattr(base_env, 'set_smooth_coef'):
-                    base_env.set_smooth_coef(self.current_smooth)
-                if hasattr(base_env, 'set_churn_coef'):
-                    base_env.set_churn_coef(self.current_churn)
+        # Sync progress for curriculum_lambda (AAAI 2024 Curriculum Learning)
+        if hasattr(real_env, 'set_progress'):
+            real_env.set_progress(progress)
 
     def _on_training_start(self) -> None:
         if self.verbose > 0:
-            print(f"\n[3-Phase Curriculum] Configuration (IPC-safe):")
+            print(f"\n[3-Phase Curriculum] Configuration (PLO removed, MORL active):")
             for i, phase in enumerate(self.PHASES):
                 pct = int(phase['end_progress'] * 100)
-                churn_str = f"{phase['churn'][0]:.2f}→{phase['churn'][1]:.2f}"
-                smooth_str = f"{phase['smooth'][0]:.4f}→{phase['smooth'][1]:.4f}"
-                print(f"  Phase {i+1} (0-{pct}%): churn={churn_str}, smooth={smooth_str}")
+                print(f"  Phase {i+1} (0-{pct}%): curriculum_lambda only")
 
 
 # ============================================================================
@@ -1071,300 +1033,6 @@ class PLOAdaptivePenaltyCallback(BaseCallback):
             print(f"  Wake-up Shock protection: enabled")
 
 
-class PLOChurnCallback(BaseCallback):
-    """
-    Predictive Lagrangian Optimization (PLO) for Churn-based Adaptive Penalties.
-
-    This callback implements a PID controller that dynamically adjusts the
-    churn penalty multiplier based on current and predicted turnover rate.
-
-    Includes prediction because turnover has inertia (persistent trading patterns).
-
-    VERSION: Production - Includes:
-    1. Robust prediction via np.polyfit with minimum slope threshold
-    2. "Leak Minimum" fix for "Profit Gate Paradox"
-    3. Curriculum protection (churn_coef < 0.05)
-    """
-
-    def __init__(
-        self,
-        # Turnover Constraint
-        turnover_threshold: float = 0.08,  # 8% avg change per step (~2 repos/day)
-        turnover_lambda_min: float = 1.0,
-        turnover_lambda_max: float = 5.0,
-        # PID Gains
-        turnover_Kp: float = 2.5,
-        turnover_Ki: float = 0.08,
-        turnover_Kd: float = 0.4,
-        # Prediction
-        prediction_horizon: int = 50,
-        use_prediction: bool = True,
-        # Stability
-        integral_max: float = 2.0,
-        decay_rate: float = 0.995,
-        max_lambda_change: float = 0.08,
-        # Logging
-        log_freq: int = 100,
-        verbose: int = 0,
-    ):
-        super().__init__(verbose)
-
-        self.turnover_threshold = turnover_threshold
-        self.turnover_lambda_min = turnover_lambda_min
-        self.turnover_lambda_max = turnover_lambda_max
-        self.turnover_Kp = turnover_Kp
-        self.turnover_Ki = turnover_Ki
-        self.turnover_Kd = turnover_Kd
-        self.prediction_horizon = prediction_horizon
-        self.use_prediction = use_prediction
-        self.integral_max = integral_max
-        self.decay_rate = decay_rate
-        self.max_lambda_change = max_lambda_change
-        self.log_freq = log_freq
-
-        # Controller state
-        self.turnover_integral = 0.0
-        self.turnover_prev_violation = 0.0
-        self.turnover_lambda = 1.0
-
-        # Buffer for prediction
-        self.turnover_history = []
-
-    def _on_step(self) -> bool:
-        real_env = get_underlying_batch_env(self.model.env)
-
-        if not hasattr(real_env, 'current_position_deltas'):
-            return True
-
-        # ═══════════════════════════════════════════════════════════════════
-        # CURRICULUM PROTECTION
-        # Don't activate PLO if churn_coef ≈ 0
-        # ═══════════════════════════════════════════════════════════════════
-        curriculum_active = True
-        if hasattr(real_env, '_current_churn_coef'):
-            if real_env._current_churn_coef < 0.05:
-                self.turnover_integral *= 0.9  # Fast decay
-                curriculum_active = False
-
-        # ═══════════════════════════════════════════════════════════════════
-        # TURNOVER MEASUREMENT
-        # ═══════════════════════════════════════════════════════════════════
-        current_deltas = real_env.current_position_deltas
-        avg_turnover = current_deltas.mean().item()
-
-        self.turnover_history.append(avg_turnover)
-        if len(self.turnover_history) > self.prediction_horizon:
-            self.turnover_history.pop(0)
-
-        # Average turnover over window
-        metric_turnover = np.mean(self.turnover_history[-20:]) if len(self.turnover_history) >= 20 else avg_turnover
-        max_turnover = current_deltas.max().item()
-        violation = max(0.0, metric_turnover - self.turnover_threshold)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PREDICTION (if curriculum active)
-        # ═══════════════════════════════════════════════════════════════════
-        predicted_violation = 0.0
-        slope = 0.0
-
-        if curriculum_active and self.use_prediction and len(self.turnover_history) >= 15:
-            y = np.array(self.turnover_history[-15:])
-            x = np.arange(len(y))
-            slope, intercept = np.polyfit(x, y, 1)
-
-            # AUDIT FIX: Minimum threshold to ignore noise
-            # Only predict if turnover rising significantly (> 0.1% per step)
-            MIN_SLOPE = 0.001
-            if slope > MIN_SLOPE:
-                future_turnover = slope * (len(y) + 10) + intercept
-                predicted_violation = max(0.0, future_turnover - self.turnover_threshold)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PID CONTROLLER
-        # ═══════════════════════════════════════════════════════════════════
-        if curriculum_active:
-            if violation > 0 or predicted_violation > 0:
-                effective_violation = max(violation, 0.6 * predicted_violation)
-
-                P = self.turnover_Kp * effective_violation
-                self.turnover_integral += self.turnover_Ki * violation
-                self.turnover_integral = np.clip(self.turnover_integral, 0, self.integral_max)
-                I = self.turnover_integral
-                D = self.turnover_Kd * (violation - self.turnover_prev_violation)
-
-                target_lambda = self.turnover_lambda_min + P + I + D
-                target_lambda = np.clip(target_lambda, self.turnover_lambda_min, self.turnover_lambda_max)
-            else:
-                # Decay towards λ_min
-                target_lambda = max(self.turnover_lambda_min, self.turnover_lambda * self.decay_rate)
-                self.turnover_integral *= 0.995
-
-            # Smoothing
-            change = np.clip(target_lambda - self.turnover_lambda,
-                             -self.max_lambda_change, self.max_lambda_change)
-            self.turnover_lambda = self.turnover_lambda + change
-
-        self.turnover_prev_violation = violation
-
-        # Apply to environment
-        if hasattr(real_env, 'set_churn_multiplier'):
-            real_env.set_churn_multiplier(self.turnover_lambda)
-
-        # Logging
-        if self.num_timesteps % self.log_freq == 0:
-            self.logger.record("plo_churn/turnover_violation", violation)
-            self.logger.record("plo_churn/turnover_predicted", predicted_violation)
-            self.logger.record("plo_churn/turnover_multiplier", self.turnover_lambda)
-            self.logger.record("plo_churn/turnover_integral", self.turnover_integral)
-            self.logger.record("plo_churn/turnover_slope", slope)
-            self.logger.record("plo_churn/metric_turnover", metric_turnover)
-            self.logger.record("plo_churn/max_turnover", max_turnover)
-            self.logger.record("plo_churn/curriculum_active", float(curriculum_active))
-
-        return True
-
-    def _on_training_start(self) -> None:
-        if self.verbose > 0:
-            print(f"\n[PLO Churn] Configuration:")
-            print(f"  Turnover threshold: {self.turnover_threshold:.2f}")
-            print(f"  Lambda range: [{self.turnover_lambda_min}, {self.turnover_lambda_max}]")
-            print(f"  PID gains: Kp={self.turnover_Kp}, Ki={self.turnover_Ki}, Kd={self.turnover_Kd}")
-            print(f"  Prediction: {'polyfit (robust)' if self.use_prediction else 'disabled'}")
-
-
-class PLOSmoothnessCallback(BaseCallback):
-    """
-    Predictive Lagrangian Optimization (PLO) for Smoothness-based Adaptive Penalties.
-
-    This callback implements a PID controller that dynamically adjusts the
-    smoothness penalty multiplier based on current jerk (position change acceleration).
-
-    Differences from PLO Drawdown:
-    - NO prediction (jerk is instantaneous)
-    - Faster decay (0.99 vs 0.995)
-    - More reactive (max_lambda_change = 0.1)
-
-    VERSION: Production - Includes:
-    1. Curriculum protection (smooth_coef < 0.001)
-    2. Adaptive quantile (90%) or LogSumExp
-    3. Off-by-one fix: reads jerk from buffer filled during step
-    """
-
-    def __init__(
-        self,
-        # Jerk Constraint
-        jerk_threshold: float = 0.40,  # 40% of position range (tolerates normal adjustments)
-        jerk_lambda_min: float = 1.0,
-        jerk_lambda_max: float = 5.0,
-        # PID Gains
-        jerk_Kp: float = 3.0,
-        jerk_Ki: float = 0.1,
-        jerk_Kd: float = 0.5,
-        # Stability
-        integral_max: float = 2.0,
-        decay_rate: float = 0.99,  # Faster decay than drawdown
-        max_lambda_change: float = 0.1,  # More reactive
-        # Risk measurement
-        jerk_quantile: float = 0.9,
-        # Logging
-        log_freq: int = 100,
-        verbose: int = 0,
-    ):
-        super().__init__(verbose)
-
-        self.jerk_threshold = jerk_threshold
-        self.jerk_lambda_min = jerk_lambda_min
-        self.jerk_lambda_max = jerk_lambda_max
-        self.jerk_Kp = jerk_Kp
-        self.jerk_Ki = jerk_Ki
-        self.jerk_Kd = jerk_Kd
-        self.integral_max = integral_max
-        self.decay_rate = decay_rate
-        self.max_lambda_change = max_lambda_change
-        self.jerk_quantile = jerk_quantile
-        self.log_freq = log_freq
-
-        # Controller state
-        self.jerk_integral = 0.0
-        self.jerk_prev_violation = 0.0
-        self.jerk_lambda = 1.0
-
-    def _on_step(self) -> bool:
-        import torch
-        real_env = get_underlying_batch_env(self.model.env)
-
-        if not hasattr(real_env, 'current_jerks'):
-            return True
-
-        # ═══════════════════════════════════════════════════════════════════
-        # CURRICULUM PROTECTION
-        # Don't activate PLO if smooth_coef == 0
-        # ═══════════════════════════════════════════════════════════════════
-        if hasattr(real_env, '_current_smooth_coef'):
-            if real_env._current_smooth_coef < 0.001:
-                self.jerk_integral *= 0.9  # Fast decay
-                return True
-
-        # ═══════════════════════════════════════════════════════════════════
-        # JERK MEASUREMENT
-        # ═══════════════════════════════════════════════════════════════════
-        current_jerks = real_env.current_jerks
-
-        if real_env.num_envs >= 16:
-            metric_jerk = torch.quantile(current_jerks, self.jerk_quantile).item()
-        else:
-            # LogSumExp for small batches
-            temperature = 10.0
-            metric_jerk = (torch.logsumexp(current_jerks * temperature, dim=0) / temperature).item()
-
-        max_jerk = current_jerks.max().item()
-        violation = max(0.0, metric_jerk - self.jerk_threshold)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PID CONTROLLER (no prediction - jerk is instantaneous)
-        # ═══════════════════════════════════════════════════════════════════
-        if violation > 0:
-            P = self.jerk_Kp * violation
-            self.jerk_integral += self.jerk_Ki * violation
-            self.jerk_integral = np.clip(self.jerk_integral, 0, self.integral_max)
-            I = self.jerk_integral
-            D = self.jerk_Kd * (violation - self.jerk_prev_violation)
-
-            target_lambda = self.jerk_lambda_min + P + I + D
-            target_lambda = np.clip(target_lambda, self.jerk_lambda_min, self.jerk_lambda_max)
-        else:
-            # Decay towards λ_min
-            target_lambda = max(self.jerk_lambda_min, self.jerk_lambda * self.decay_rate)
-            self.jerk_integral *= 0.99
-
-        # Smoothing
-        change = np.clip(target_lambda - self.jerk_lambda,
-                         -self.max_lambda_change, self.max_lambda_change)
-        self.jerk_lambda = self.jerk_lambda + change
-
-        self.jerk_prev_violation = violation
-
-        # Apply to environment
-        if hasattr(real_env, 'set_smooth_multiplier'):
-            real_env.set_smooth_multiplier(self.jerk_lambda)
-
-        # Logging
-        if self.num_timesteps % self.log_freq == 0:
-            self.logger.record("plo_smooth/jerk_violation", violation)
-            self.logger.record("plo_smooth/jerk_multiplier", self.jerk_lambda)
-            self.logger.record("plo_smooth/jerk_integral", self.jerk_integral)
-            self.logger.record("plo_smooth/metric_jerk", metric_jerk)
-            self.logger.record("plo_smooth/max_jerk", max_jerk)
-
-        return True
-
-    def _on_training_start(self) -> None:
-        if self.verbose > 0:
-            print(f"\n[PLO Smoothness] Configuration:")
-            print(f"  Jerk threshold: {self.jerk_threshold:.2f}")
-            print(f"  Lambda range: [{self.jerk_lambda_min}, {self.jerk_lambda_max}]")
-            print(f"  PID gains: Kp={self.jerk_Kp}, Ki={self.jerk_Ki}, Kd={self.jerk_Kd}")
-            print(f"  No prediction (jerk is instantaneous)")
 
 
 # ============================================================================
@@ -1853,6 +1521,7 @@ class ModelEMACallback(BaseCallback):
         self.tau = 1.0 - decay  # Convert decay to tau for polyak_update
         self.save_path = save_path
         self.ema_params = None  # List of cloned parameter tensors
+        self.param_shapes = None  # Track parameter shapes for validation
         
     def _on_training_start(self) -> None:
         """Initialize EMA weights from current policy weights."""
@@ -1868,11 +1537,15 @@ class ModelEMACallback(BaseCallback):
             return
         
         # Clone and detach parameters (on correct device)
+        # Filter to only trainable parameters (same filter used in _on_step)
+        policy_params = [param for param in policy.parameters() if param.requires_grad]
         self.ema_params = [
             param.clone().detach().to(param.device)
-            for param in policy.parameters()
-            if param.requires_grad
+            for param in policy_params
         ]
+        
+        # Store parameter shapes for validation
+        self.param_shapes = [tuple(p.shape) for p in policy_params]
         
         if self.verbose > 0:
             n_params = sum(p.numel() for p in self.ema_params)
@@ -1887,10 +1560,29 @@ class ModelEMACallback(BaseCallback):
         if not hasattr(self.model, 'policy') or self.model.policy is None:
             return True
         
-        # Use SB3's native polyak_update function
+        # Get current parameters with same filter as initialization
+        policy_params = [param for param in self.model.policy.parameters() if param.requires_grad]
+        
+        # Validate shapes match (safety check for model architecture changes)
+        if len(policy_params) != len(self.ema_params):
+            if self.verbose > 0:
+                print(f"[ModelEMACallback] Warning: Parameter count mismatch "
+                      f"({len(policy_params)} vs {len(self.ema_params)}). Reinitializing EMA.")
+            self._on_training_start()  # Reinitialize
+            return True
+        
+        # Validate shapes match
+        current_shapes = [tuple(p.shape) for p in policy_params]
+        if current_shapes != self.param_shapes:
+            if self.verbose > 0:
+                print(f"[ModelEMACallback] Warning: Parameter shape mismatch. Reinitializing EMA.")
+            self._on_training_start()  # Reinitialize
+            return True
+        
+        # Use SB3's native polyak_update function with filtered parameters
         with torch.no_grad():
             polyak_update(
-                params=self.model.policy.parameters(),
+                params=policy_params,
                 target_params=self.ema_params,
                 tau=self.tau
             )
@@ -1900,7 +1592,7 @@ class ModelEMACallback(BaseCallback):
             total_diff = sum(
                 (p.data - ema_p.data).norm().item()
                 for p, ema_p in zip(
-                    self.model.policy.parameters(),
+                    policy_params,
                     self.ema_params
                 )
             )
@@ -1923,8 +1615,17 @@ class ModelEMACallback(BaseCallback):
         if not hasattr(self.model, 'policy') or self.model.policy is None:
             return
         
+        # Get parameters with same filter as initialization
+        policy_params = [param for param in self.model.policy.parameters() if param.requires_grad]
+        
+        # Validate shapes match
+        if len(policy_params) != len(self.ema_params):
+            if self.verbose > 0:
+                print(f"[ModelEMACallback] Warning: Cannot load EMA - parameter count mismatch")
+            return
+        
         with torch.no_grad():
-            for param, ema_param in zip(self.model.policy.parameters(), self.ema_params):
+            for param, ema_param in zip(policy_params, self.ema_params):
                 param.data.copy_(ema_param.data)
         
         if self.verbose > 0:

@@ -68,8 +68,6 @@ class EnvConfig:
     downside_coef: float = 1.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    churn_coef: float = 0.0
-    smooth_coef: float = 0.0
 
     # Volatility scaling
     target_volatility: float = 0.01

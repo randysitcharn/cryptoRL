@@ -44,8 +44,6 @@ class TQCTrainingConfig:
     downside_coef: float = 1.0
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    churn_coef: float = 0.5       # Max target après curriculum (réduit)
-    smooth_coef: float = 1e-5     # Très bas par défaut (curriculum monte à 0.001 max)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol

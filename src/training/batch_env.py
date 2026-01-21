@@ -58,8 +58,6 @@ class BatchCryptoEnv(VecEnv):
         downside_coef: float = 10.0,
         upside_coef: float = 0.0,
         action_discretization: float = 0.1,
-        churn_coef: float = 0.0,
-        smooth_coef: float = 0.0,
         # Volatility scaling
         target_volatility: float = 0.01,
         vol_window: int = 24,
@@ -98,8 +96,6 @@ class BatchCryptoEnv(VecEnv):
             downside_coef: Sortino downside penalty coefficient.
             upside_coef: Upside bonus coefficient.
             action_discretization: Action discretization step (0.1 = 21 levels).
-            churn_coef: Churn penalty coefficient.
-            smooth_coef: Smoothness penalty coefficient.
             target_volatility: Target vol for position scaling.
             vol_window: Rolling window for volatility.
             max_leverage: Max vol scaling factor.
@@ -128,8 +124,6 @@ class BatchCryptoEnv(VecEnv):
         self.downside_coef = downside_coef
         self.upside_coef = upside_coef
         self.action_discretization = action_discretization
-        self.churn_coef = churn_coef
-        self.smooth_coef = smooth_coef
         self.target_volatility = target_volatility
         self.vol_window = vol_window
         self.max_leverage = max_leverage
@@ -153,13 +147,10 @@ class BatchCryptoEnv(VecEnv):
         self.last_gate_mean = 0.0     # Mean gate opening for logging
 
         # ═══════════════════════════════════════════════════════════════════
-        # PLO (Predictive Lagrangian Optimization) Multipliers
-        # Each PLO controller adjusts its multiplier based on constraint violations
-        # λ ∈ [1.0, 5.0] where 1.0 = neutral, 5.0 = max penalty
+        # PLO Drawdown Multiplier (kept for backward compatibility)
+        # Note: PLO Churn and Smoothness have been removed in favor of MORL
         # ═══════════════════════════════════════════════════════════════════
         self.downside_multiplier = 1.0  # PLO Drawdown: scales downside risk penalty
-        self.churn_multiplier = 1.0     # PLO Churn: scales churn penalty
-        self.smooth_multiplier = 1.0    # PLO Smoothness: scales smoothness penalty
 
         # Load and preprocess data
         df = pd.read_parquet(parquet_path)
@@ -195,9 +186,7 @@ class BatchCryptoEnv(VecEnv):
 
         # Define spaces (SB3 requirement)
         # ═══════════════════════════════════════════════════════════════════
-        # OBSERVATION SPACE with PLO augmentation
-        # Agent MUST see PLO levels for Markov property to hold
-        # Without this, same state + action gives different rewards (non-stationary)
+        # OBSERVATION SPACE with MORL preference parameter
         # ═══════════════════════════════════════════════════════════════════
         self.observation_space = spaces.Dict({
             "market": spaces.Box(
@@ -211,19 +200,8 @@ class BatchCryptoEnv(VecEnv):
                 dtype=np.float32
             ),
             # PLO Drawdown: Risk level (λ_dd normalized to [0, 1])
+            # Kept for backward compatibility with PLO Drawdown callback
             "risk_level": spaces.Box(
-                low=0.0, high=1.0,
-                shape=(1,),
-                dtype=np.float32
-            ),
-            # PLO Churn: Churn pressure level (λ_churn normalized to [0, 1])
-            "churn_level": spaces.Box(
-                low=0.0, high=1.0,
-                shape=(1,),
-                dtype=np.float32
-            ),
-            # PLO Smoothness: Smoothness pressure level (λ_smooth normalized to [0, 1])
-            "smooth_level": spaces.Box(
                 low=0.0, high=1.0,
                 shape=(1,),
                 dtype=np.float32
@@ -287,10 +265,6 @@ class BatchCryptoEnv(VecEnv):
         # Drawdown tracking (GPU)
         self.peak_navs = torch.full((n,), self.initial_balance, device=device)
         self.current_drawdowns = torch.zeros(n, device=device)
-
-        # Shared penalty values (for curriculum)
-        self._current_smooth_coef = self.smooth_coef
-        self._current_churn_coef = self.churn_coef
 
         # Pre-allocated action buffer (avoids tensor creation each step)
         self._action_buffer = torch.zeros(n, device=device)
@@ -650,33 +624,13 @@ class BatchCryptoEnv(VecEnv):
         position = self.position_pcts.unsqueeze(1)
 
         # ═══════════════════════════════════════════════════════════════════
-        # PLO OBSERVATION AUGMENTATION
-        # Agent MUST see PLO levels for Value Function to converge
-        # Without this, environment becomes non-stationary (breaks Markov)
+        # PLO Drawdown: Risk level (kept for backward compatibility)
         # Normalization: λ ∈ [1, 5] → level ∈ [0, 1]
         # ═══════════════════════════════════════════════════════════════════
-        
-        # Risk level (PLO Drawdown λ_dd normalized)
         risk_level_value = (self.downside_multiplier - 1.0) / 4.0
         risk_level = torch.full(
             (self.num_envs, 1),
             risk_level_value,
-            device=self.device
-        )
-
-        # Churn level (PLO Churn λ_churn normalized)
-        churn_level_value = (self.churn_multiplier - 1.0) / 4.0
-        churn_level = torch.full(
-            (self.num_envs, 1),
-            churn_level_value,
-            device=self.device
-        )
-
-        # Smooth level (PLO Smoothness λ_smooth normalized)
-        smooth_level_value = (self.smooth_multiplier - 1.0) / 4.0
-        smooth_level = torch.full(
-            (self.num_envs, 1),
-            smooth_level_value,
             device=self.device
         )
 
@@ -685,8 +639,6 @@ class BatchCryptoEnv(VecEnv):
             "market": market.cpu().numpy(),
             "position": position.cpu().numpy(),
             "risk_level": risk_level.cpu().numpy(),
-            "churn_level": churn_level.cpu().numpy(),
-            "smooth_level": smooth_level.cpu().numpy(),
             "w_cost": self.w_cost.cpu().numpy(),  # MORL preference parameter
         }
 
@@ -999,10 +951,8 @@ class BatchCryptoEnv(VecEnv):
         market = self.data[start:step+1].cpu().numpy()
         position = np.array([self.position_pcts[idx].item()], dtype=np.float32)
         
-        # PLO levels (same for all envs, use current multipliers)
+        # PLO Drawdown: Risk level (kept for backward compatibility)
         risk_level = np.array([(self.downside_multiplier - 1.0) / 4.0], dtype=np.float32)
-        churn_level = np.array([(self.churn_multiplier - 1.0) / 4.0], dtype=np.float32)
-        smooth_level = np.array([(self.smooth_multiplier - 1.0) / 4.0], dtype=np.float32)
         
         # MORL: w_cost preference parameter (MUST match _get_observations structure)
         w_cost = self.w_cost[idx].cpu().numpy()
@@ -1011,8 +961,6 @@ class BatchCryptoEnv(VecEnv):
             "market": market,
             "position": position,
             "risk_level": risk_level,
-            "churn_level": churn_level,
-            "smooth_level": smooth_level,
             "w_cost": w_cost,
         }
 
@@ -1139,30 +1087,11 @@ class BatchCryptoEnv(VecEnv):
 
     def env_method(self, method_name: str, *args, indices=None, **kwargs):
         """Call method on envs (limited support for batch env)."""
-        if method_name == "update_penalties":
-            if "smooth_coef" in kwargs:
-                self._current_smooth_coef = kwargs["smooth_coef"]
-            if "churn_coef" in kwargs:
-                self._current_churn_coef = kwargs["churn_coef"]
-            return [None] * self.num_envs
         raise NotImplementedError(f"env_method '{method_name}' not supported")
 
     def set_attr(self, attr_name: str, value, indices=None) -> None:
         """Set attribute on envs."""
-        if attr_name == "smooth_coef":
-            self._current_smooth_coef = value
-        elif attr_name == "churn_coef":
-            self._current_churn_coef = value
-        else:
-            raise NotImplementedError(f"set_attr '{attr_name}' not supported")
-
-    def set_churn_penalty(self, value: float) -> None:
-        """Direct setter for curriculum learning (bypasses wrapper issues)."""
-        self._current_churn_coef = value
-
-    def set_smoothness_penalty(self, value: float) -> None:
-        """Direct setter for curriculum learning (bypasses wrapper issues)."""
-        self._current_smooth_coef = value
+        raise NotImplementedError(f"set_attr '{attr_name}' not supported")
 
     def set_progress(self, progress: float) -> None:
         """
@@ -1202,21 +1131,6 @@ class BatchCryptoEnv(VecEnv):
         """
         self.downside_multiplier = max(1.0, min(value, 10.0))
 
-    def set_churn_multiplier(self, value: float) -> None:
-        """
-        Setter for PLO Churn callback.
-        
-        Clamps value to [1.0, 10.0] for safety.
-        """
-        self.churn_multiplier = max(1.0, min(value, 10.0))
-
-    def set_smooth_multiplier(self, value: float) -> None:
-        """
-        Setter for PLO Smoothness callback.
-        
-        Clamps value to [1.0, 10.0] for safety.
-        """
-        self.smooth_multiplier = max(1.0, min(value, 10.0))
 
     @property
     def current_jerks(self) -> torch.Tensor:
@@ -1244,11 +1158,7 @@ class BatchCryptoEnv(VecEnv):
 
     def get_attr(self, attr_name: str, indices=None):
         """Get attribute from envs."""
-        if attr_name == "smooth_coef":
-            return [self._current_smooth_coef] * self.num_envs
-        elif attr_name == "churn_coef":
-            return [self._current_churn_coef] * self.num_envs
-        elif attr_name == "render_mode":
+        if attr_name == "render_mode":
             return [None] * self.num_envs  # No rendering
         elif attr_name == "spec":
             return [None] * self.num_envs  # No gym spec

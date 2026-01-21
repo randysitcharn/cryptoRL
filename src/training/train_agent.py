@@ -37,8 +37,6 @@ from src.training.callbacks import (
     OverfittingGuardCallback,
     OverfittingGuardCallbackV2,
     PLOAdaptivePenaltyCallback,
-    PLOChurnCallback,
-    PLOSmoothnessCallback,
     ModelEMACallback,
 )
 
@@ -270,13 +268,11 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         Tuple of (train_vec_env, eval_vec_env, None, None, None).
         Last three values are None (kept for backward compatibility).
     """
-    # Curriculum Learning: start with 0 fees/smoothness if enabled
+    # Curriculum Learning: start with 0 fees if enabled
     if config.use_curriculum:
         initial_commission = 0.0
-        initial_smooth = 0.0
     else:
         initial_commission = config.commission
-        initial_smooth = config.smooth_coef
 
     # ==================== Training Environment ====================
     # GPU-Vectorized Batch Environment
@@ -296,8 +292,6 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
-        churn_coef=config.churn_coef,
-        smooth_coef=initial_smooth,
         target_volatility=config.target_volatility,
         vol_window=config.vol_window,
         max_leverage=config.max_leverage,
@@ -323,8 +317,6 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
             downside_coef=config.downside_coef,
             upside_coef=config.upside_coef,
             action_discretization=config.action_discretization,
-            churn_coef=config.churn_coef,
-            smooth_coef=config.smooth_coef,
             target_volatility=config.target_volatility,
             vol_window=config.vol_window,
             max_leverage=config.max_leverage,
@@ -337,14 +329,13 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         eval_vec_env = None
         print("      [WFO Mode] Eval environment disabled (eval_data_path=None)")
 
-    return train_vec_env, eval_vec_env, None, None, None
+    return train_vec_env, eval_vec_env, None, None
 
 
 def create_callbacks(
     config: TrainingConfig,
     eval_env,
     shared_fee=None,
-    shared_smooth=None,
 ) -> tuple[list, DetailTensorboardCallback]:
     """
     Create training callbacks.
@@ -353,7 +344,6 @@ def create_callbacks(
         config: Training configuration.
         eval_env: Evaluation environment (None in WFO mode).
         shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
-        shared_smooth: Shared memory Value for curriculum smooth_coef (SubprocVecEnv).
 
     Returns:
         Tuple of (callbacks_list, detail_callback).
@@ -431,7 +421,6 @@ def create_callbacks(
     if config.use_curriculum:
         curriculum_callback = ThreePhaseCurriculumCallback(
             total_timesteps=config.total_timesteps,
-            shared_smooth=shared_smooth,
             verbose=1
         )
         callbacks.append(curriculum_callback)
@@ -470,35 +459,8 @@ def create_callbacks(
     )
     callbacks.append(plo_dd_callback)
 
-    # PLO Churn: Increase churn penalty when turnover > 8%
-    plo_churn_callback = PLOChurnCallback(
-        turnover_threshold=0.08,
-        turnover_lambda_min=1.0,
-        turnover_lambda_max=5.0,
-        turnover_Kp=2.5,
-        turnover_Ki=0.08,
-        turnover_Kd=0.4,
-        use_prediction=True,
-        max_lambda_change=0.08,
-        log_freq=config.log_freq,
-        verbose=1
-    )
-    callbacks.append(plo_churn_callback)
-
-    # PLO Smoothness: Increase smoothness penalty when jerk > 0.40
-    plo_smooth_callback = PLOSmoothnessCallback(
-        jerk_threshold=0.40,
-        jerk_lambda_min=1.0,
-        jerk_lambda_max=5.0,
-        jerk_Kp=3.0,
-        jerk_Ki=0.1,
-        jerk_Kd=0.5,
-        decay_rate=0.99,
-        max_lambda_change=0.1,
-        log_freq=config.log_freq,
-        verbose=1
-    )
-    callbacks.append(plo_smooth_callback)
+    # NOTE: PLO Churn and Smoothness callbacks have been removed.
+    # The MORL architecture (w_cost) now handles cost penalties directly.
 
     # Overfitting guard - DISABLED (OOS Sharpe 4.75 shows model generalizes well)
     # overfitting_guard = OverfittingGuardCallback(
@@ -607,7 +569,7 @@ def train(
 
     # ==================== Environment Setup ====================
     print("\n[1/4] Creating environments...")
-    train_env, eval_env, shared_fee, shared_smooth, manager = create_environments(
+    train_env, eval_env, shared_fee, manager = create_environments(
         config, n_envs=n_envs, use_batch_env=use_batch_env
     )
 
@@ -781,7 +743,7 @@ def train(
     print("\n" + "=" * 70)
 
     callbacks, detail_callback = create_callbacks(
-        config, eval_env, shared_fee=shared_fee, shared_smooth=shared_smooth
+        config, eval_env, shared_fee=shared_fee
     )
 
     # Note: is_resume was set earlier in Model Creation section
@@ -789,8 +751,6 @@ def train(
 
     # ==================== Initialize Curriculum State (Gemini safeguard) ====================
     # Prevents "First Step" lag where shared values might be uninitialized
-    if shared_smooth is not None:
-        shared_smooth.value = 0.0
     if shared_fee is not None:
         shared_fee.value = 0.0
 
@@ -904,8 +864,6 @@ if __name__ == "__main__":
     parser.add_argument("--downside-coef", type=float, default=None, help="Sortino downside penalty coefficient")
     parser.add_argument("--upside-coef", type=float, default=None, help="Symmetric upside bonus coefficient")
     parser.add_argument("--action-disc", type=float, default=None, help="Action discretization (0.1 = 21 positions, 0 = disabled)")
-    parser.add_argument("--churn-coef", type=float, default=None, help="Churn penalty coefficient (0.1 = 10x amplified trading cost)")
-    parser.add_argument("--smooth-coef", type=float, default=None, help="Smoothness penalty coefficient (quadratic penalty on position changes)")
     parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coefficient (None = auto)")
     parser.add_argument("--name", type=str, default=None, help="Run name (appears in TensorBoard)")
     parser.add_argument("--gradient-steps", type=int, default=None, help="Gradient steps per update (default: 1)")
@@ -947,10 +905,6 @@ if __name__ == "__main__":
         config.upside_coef = args.upside_coef
     if args.action_disc is not None:
         config.action_discretization = args.action_disc
-    if args.churn_coef is not None:
-        config.churn_coef = args.churn_coef
-    if args.smooth_coef is not None:
-        config.smooth_coef = args.smooth_coef
     if args.ent_coef is not None:
         config.ent_coef = args.ent_coef
     if args.name is not None:
