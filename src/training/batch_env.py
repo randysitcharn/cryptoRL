@@ -656,13 +656,14 @@ class BatchCryptoEnv(VecEnv):
         )
         effective_actions = torch.clamp(raw_actions * self.vol_scalars, -1.0, 1.0)
 
-        # DEBUG: Log vol scaling values (every 10000 steps)
+        # DEBUG: Log vol scaling values (every 10000 steps) to file
         if self._step_counter % 10000 == 0:
-            print(f"[VOL_DEBUG] step={self._step_counter} | "
-                  f"raw_action={raw_actions[0].item():.4f} | "
-                  f"current_vol={current_vol[0].item():.4f} | "
-                  f"vol_scalar={self.vol_scalars[0].item():.4f} | "
-                  f"effective_action={effective_actions[0].item():.4f}")
+            with open("/workspace/cryptoRL/logs/vol_debug.txt", "a") as f:
+                f.write(f"step={self._step_counter} | "
+                        f"raw={raw_actions[0].item():.4f} | "
+                        f"vol={current_vol[0].item():.4f} | "
+                        f"scalar={self.vol_scalars[0].item():.4f} | "
+                        f"eff={effective_actions[0].item():.4f}\n")
 
         # 4. Discretize actions
         if self.action_discretization > 0:
