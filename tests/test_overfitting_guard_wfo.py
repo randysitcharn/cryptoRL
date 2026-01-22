@@ -219,7 +219,8 @@ class TestWFOConfigIntegration:
         
         config = WFOConfig()
         
-        assert config.use_warm_start == True
+        # MORL: Cold start par défaut (architecture change between segments)
+        assert config.use_warm_start == False
         assert config.pretrained_model_path is None
         assert config.cleanup_failed_checkpoints == True
 

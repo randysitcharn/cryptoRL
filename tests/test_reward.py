@@ -56,9 +56,6 @@ def create_test_env_with_prices(prices: list, window_size: int = 10):
         episode_length=len(prices) - window_size - 1,
         price_column='close',
         random_start=False,
-        # Disable curriculum for predictable rewards
-        churn_coef=0.0,
-        smooth_coef=0.0,
     )
     
     return env, tmp_file.name

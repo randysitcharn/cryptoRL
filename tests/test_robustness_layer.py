@@ -5,7 +5,7 @@ test_robustness_layer.py - Tests for Robustness & Generalization Layer.
 Tests:
 1. Domain Randomization: Verify fees are sampled per-episode
 2. ModelEMACallback: Verify EMA weights are updated correctly
-3. Integration: Verify compatibility with MORL/PLO
+3. Integration: Verify compatibility with MORL
 """
 
 import sys
