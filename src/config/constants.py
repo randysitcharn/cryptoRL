@@ -61,6 +61,8 @@ EXCLUDE_COLS: List[str] = [
     'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
     'HMM_Funding',  # Removed from features (audit P1.2), kept here for backward compatibility
     'HMM_RiskOnOff', 'HMM_VolRatio',
+    # Synthetic/problematic features (audit P1.2)
+    'Funding_Rate',  # Synthetic funding rate - removed for data integrity
 ]
 
 # Ticker configurations
