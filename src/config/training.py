@@ -29,7 +29,7 @@ class TQCTrainingConfig:
 
     # --- Environment ---
     window_size: int = 64
-    commission: float = 0.0015  # 0.15% - Higher cost during training (penalty)
+    commission: float = 0.0005  # 0.05% - Reduced to encourage trading (was 0.15%)
     train_ratio: float = 0.8
     episode_length: int = 2048
     eval_episode_length: int = 600  # Safe value < (720 - window_size - 1)
@@ -74,7 +74,7 @@ class TQCTrainingConfig:
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
     gamma: float = 0.95  # Shorter horizon for faster learning
     tau: float = 0.005
-    ent_coef: Union[str, float] = "auto"
+    ent_coef: Union[str, float] = "auto_1.0"  # Boosted exploration (was "auto")
     train_freq: int = 1
     gradient_steps: int = 1  # GS=1 with 1024 envs for max diversity
     top_quantiles_to_drop: int = 2
@@ -204,7 +204,7 @@ class WFOTrainingConfig(TQCTrainingConfig):
     Inherits from TQCTrainingConfig and overrides values for Walk-Forward Optimization:
     - Slower learning (LR 1e-4) for better generalization OOS
     - Aggressive regularization (dropout 0.1) to prevent overfitting on short windows
-    - Boosted exploration (ent_coef auto_0.5) for diverse policy discovery
+    - Boosted exploration (ent_coef auto_1.0) for diverse policy discovery
     - OverfittingGuard enabled with permissive thresholds for long WFO runs
     
     Rationale documented in: docs/design/WFO_CONFIG_RATIONALE.md
@@ -215,7 +215,7 @@ class WFOTrainingConfig(TQCTrainingConfig):
     buffer_size: int = 2_500_000          # 2.5M replay buffer
     n_envs: int = 1024                    # GPU-optimized (power of 2)
     batch_size: int = 512                 # Smaller batch for more updates
-    ent_coef: Union[str, float] = "auto_0.5"  # Boosted exploration
+    ent_coef: Union[str, float] = "auto_1.0"  # Force more exploration (was auto_0.5)
     
     # --- Regularization (aggressive for OOS generalization) ---
     critic_dropout: float = 0.1           # 10% dropout (DroQ max)

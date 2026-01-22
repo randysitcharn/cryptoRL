@@ -245,14 +245,22 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
 
         # 1. Encode market data using pretrained MAE encoder
         # Output: (batch, seq_len, d_model) = (B, 64, 128)
-        # Note: Use AMP only if enabled AND tensor is actually on CUDA
-        use_amp_now = self._use_amp and market_obs.is_cuda
-        if use_amp_now:
-            # Use autocast for mixed precision inference
-            with torch.amp.autocast('cuda'):
-                encoded = self.mae.encode(market_obs.half())
-            encoded = encoded.float()  # Convert back to float32 for fusion
+        # Note: Handle dtype matching - encoder may be in half precision from training
+        encoder_dtype = next(self.mae.embedding.parameters()).dtype
+        if encoder_dtype == torch.float16:
+            # Encoder is in half precision (from GPU training)
+            if market_obs.is_cuda:
+                # On GPU: use autocast for efficiency
+                with torch.amp.autocast('cuda'):
+                    encoded = self.mae.encode(market_obs.half())
+                encoded = encoded.float()  # Convert back to float32 for fusion
+            else:
+                # On CPU: convert encoder back to float32 (half not well supported on CPU)
+                self.mae.embedding = self.mae.embedding.float()
+                self.mae.encoder = self.mae.encoder.float()
+                encoded = self.mae.encode(market_obs.float())
         else:
+            # Encoder is in float32
             encoded = self.mae.encode(market_obs.float())
 
         # 2. Flatten and normalize market features
