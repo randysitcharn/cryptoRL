@@ -12,3 +12,4 @@ ccxt
 statsmodels
 hmmlearn
 pyarrow
+tenacity
