@@ -1,165 +1,170 @@
-# Curriculum Learning - Tuning Guide
+# Curriculum Learning - Tuning Guide (MORL Architecture)
 
-> **Date:** 2026-01-16 | **Branch:** `feat/training-speed-optimization`
-
----
-
-## 1. Probleme Observe
-
-Avec la configuration initiale (ramp jusqu'a 60%), l'agent apprenait a **minimiser le churn plutot qu'a maximiser le profit**.
-
-### Symptomes
-```
-Ratio |Churn|/|PnL| = 0.12  <- semblait OK
-NAV en baisse constante (-5.4% puis crash a -51.8% drawdown)
-Position moyenne proche de 0 (38% du temps < 5%)
-```
-
-### Diagnostic
-L'agent a appris trop tot a eviter le churn, AVANT de maitriser le trading rentable. Le signal de penalite churn dominait l'apprentissage pendant la phase critique.
+> **Date:** 2026-01-21 | **Architecture:** MORL avec curriculum_lambda
 
 ---
 
-## 2. Configuration Actuelle
+## 1. Architecture Actuelle
+
+L'architecture MORL utilise deux paramètres indépendants :
+- `w_cost ∈ [0, 1]`: Paramètre MORL dans l'observation (vu par l'agent)
+- `curriculum_lambda ∈ [0, 0.4]`: Progression du curriculum (contrôle noise annealing et futures pénalités)
+
+**Note importante** : Dans l'implémentation actuelle (v1.0), `curriculum_lambda` n'est **pas** utilisé directement dans la formule de récompense MORL. Ces deux paramètres sont indépendants.
+
+### Formule de Reward (Implémentation Actuelle)
+```python
+reward = r_perf + w_cost * r_cost * MAX_PENALTY_SCALE
+```
+
+où:
+- `r_perf`: Log-returns (objectif performance)
+- `r_cost`: Pénalité de changement de position
+- `w_cost ∈ [0, 1]`: Paramètre MORL dans l'observation (conditioned network)
+- `MAX_PENALTY_SCALE = 2.0`: Facteur de calibration fixe
+
+**Pourquoi cette séparation ?**
+- `w_cost` (vu par l'agent) module déjà dynamiquement l'importance des coûts
+- Ajouter `curriculum_lambda` créerait une double modulation potentiellement instable
+- Le curriculum actuel se concentre sur l'exploration progressive (noise decay)
+
+**Roadmap v2.0** : Si nécessaire, envisager:
+```python
+effective_scale = MAX_PENALTY_SCALE * curriculum_lambda
+reward = r_perf + (w_cost * r_cost * effective_scale)
+```
+Ceci introduirait les coûts progressivement pendant le training.
+
+---
+
+## 2. Configuration des Phases
 
 ```python
 PHASES = [
-    # Phase 1: Discovery (0% -> 10%) - exploration libre
-    {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-    # Phase 2: Discipline (10% -> 30%) - ramp-up rapide vers max
-    {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.02)},
-    # Phase 3: Consolidation (30% -> 100%) - LONG PLATEAU at max
-    {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.02, 0.02)},
+    # Phase 1: Pure Exploration (0% -> 15%)
+    # curriculum_lambda = 0.0 - Exploration pure, noise maximal
+    {'end_progress': 0.15, 'lambda': (0.0, 0.0)},
+    
+    # Phase 2: Discipline (15% -> 75%)
+    # curriculum_lambda: 0.0 -> 0.4 - Ramp progressif (noise decay)
+    {'end_progress': 0.75, 'lambda': (0.0, 0.4)},
+    
+    # Phase 3: Consolidation (75% -> 100%)
+    # curriculum_lambda = 0.4 - Valeur finale stable
+    {'end_progress': 1.0, 'lambda': (0.4, 0.4)},
 ]
 ```
+
+**Note** : Les phases ont été étendues (15% → 75% pour Phase 2) pour un ramping plus progressif.
 
 ### Visualisation
 
 ```
-churn_coef
-    0.50 |                   ************************************
-    0.40 |                  *
-    0.30 |                 *
-    0.20 |                *
-    0.10 |     ***********
-    0.00 |*****
+curriculum_lambda
+    0.40 |                   ************************************
+    0.30 |                  *
+    0.20 |                 *
+    0.10 |                *
+    0.00 |***************
          +----------------------------------------------------
-         0%   10%         30%                              100%
-         |     |           |                                 |
-      Discovery Discipline        Consolidation (70%)
+         0%   15%        30%                              100%
+         |     |          |                                 |
+      Pure  Discipline        Consolidation (70%)
+    Exploration
 ```
 
-| Phase | Progress | churn_coef | smooth_coef | Objectif |
-|-------|----------|------------|-------------|----------|
-| Discovery | 0% - 10% | 0.00 -> 0.10 | 0.00 | Explorer librement |
-| Discipline | 10% - 30% | 0.10 -> 0.50 | 0.00 -> 0.02 | Apprendre les contraintes |
-| Consolidation | 30% - 100% | 0.50 (fixe) | 0.02 (fixe) | Optimiser profit+contraintes |
+| Phase | Progress | curriculum_lambda | Objectif |
+|-------|----------|-------------------|----------|
+| Pure Exploration | 0% - 15% | 0.0 | Apprendre à trader profitablement |
+| Discipline | 15% - 30% | 0.0 -> 0.4 | Introduire les coûts progressivement |
+| Consolidation | 30% - 100% | 0.4 | Optimiser profit+coûts |
 
 ---
 
-## 3. Indicateurs de Diagnostic
+## 3. MORL: Paramètre w_cost
 
-### Churn_coef trop eleve si:
+L'agent voit `w_cost` dans son observation et apprend à adapter son comportement:
 
-| Indicateur | Seuil Critique | Comment Verifier |
-|------------|----------------|------------------|
-| Ratio Churn/PnL | > 0.5 | `mean(|churn_penalty|) / mean(|pnl|)` |
-| Position near-zero | > 80% | `sum(|pos| < 0.05) / total` |
-| Entropy collapse | < 0.05 | `train/ent_coef` dans TensorBoard |
-| Std position | < 0.02 | Agent ne bouge plus |
+| w_cost | Comportement | Usage |
+|--------|--------------|-------|
+| 0.0 | Scalping (ignorer coûts) | Trading haute fréquence |
+| 0.5 | Équilibré | Comportement standard |
+| 1.0 | B&H (minimiser coûts) | Trading conservateur |
+
+### Distribution pendant l'entraînement
+```python
+# 20% extremes + 60% uniform pour exploration complète
+if random() < 0.2:
+    w_cost = 0.0  # 10%: scalping pur
+elif random() < 0.4:
+    w_cost = 1.0  # 10%: B&H pur
+else:
+    w_cost = uniform(0, 1)  # 80%: exploration
+```
+
+---
+
+## 4. Indicateurs de Diagnostic
+
+### Problèmes potentiels
+
+| Indicateur | Seuil | Action |
+|------------|-------|--------|
+| Position near-zero (>80%) | `sum(|pos| < 0.05) / total` | Réduire curriculum_lambda max |
+| Entropy collapse (<0.05) | `train/ent_coef` | Augmenter ent_coef |
+| NAV négatif constant | | Vérifier r_perf domine |
 
 ### Script de Diagnostic
 
 ```python
-# Extraire depuis TensorBoard
 from tensorboard.backend.event_processing import event_accumulator
 
 ea = event_accumulator.EventAccumulator('logs/wfo/segment_0/WFO_seg0_1')
 ea.Reload()
 
+# Vérifier que performance domine
 pnls = [e.value for e in ea.Scalars('rewards/pnl')]
-churns = [abs(e.value) for e in ea.Scalars('rewards/churn_penalty')]
+costs = [abs(e.value) for e in ea.Scalars('rewards/cost_penalty')]
 
-ratio = np.mean(churns) / np.mean([abs(p) for p in pnls])
-print(f'Ratio |Churn|/|PnL|: {ratio:.2f}')
+ratio = np.mean(costs) / np.mean([abs(p) for p in pnls])
+print(f'Ratio |Cost|/|PnL|: {ratio:.2f}')
 
 if ratio > 0.5:
-    print('WARNING: Churn penalty trop dominant')
+    print('WARNING: Cost penalty domine - réduire curriculum_lambda')
 else:
     print('OK: PnL domine le signal de reward')
 ```
 
 ---
 
-## 4. Alternatives Considerees
+## 5. Avantages de MORL vs PLO (Architecture Précédente)
 
-### Option A: Baisser le max churn_coef
-
-```python
-# Churn comme regularizer leger (pas signal dominant)
-PHASES = [
-    {'end_progress': 0.1, 'churn': (0.0, 0.05), 'smooth': (0.0, 0.0)},
-    {'end_progress': 0.3, 'churn': (0.05, 0.25), 'smooth': (0.0, 0.02)},
-    {'end_progress': 1.0, 'churn': (0.25, 0.25), 'smooth': (0.02, 0.02)},
-]
-```
-
-**Avantage:** PnL reste toujours dominant
-**Inconvenient:** Agent peut churner excessivement
-
-### Option B: Curriculum Adaptatif
-
-```python
-# N'augmente churn que si l'agent est profitable
-def _on_step(self):
-    avg_pnl = self.get_recent_pnl()
-    if avg_pnl > 0:
-        self.current_churn = min(self.current_churn + 0.001, self.max_churn)
-    # else: garde churn bas pour laisser l'agent apprendre
-```
-
-**Avantage:** S'adapte au niveau de l'agent
-**Inconvenient:** Complexite, risque de ne jamais augmenter si agent faible
-
-### Option C: Ratio Fixe (Clipping)
-
-```python
-# Dans env.py - churn penalty toujours < 20% du |PnL|
-churn_penalty = min(raw_churn_penalty, 0.2 * abs(pnl_reward))
-```
-
-**Avantage:** Garantit que PnL domine toujours
-**Inconvenient:** Peut rendre churn inefficace sur gros PnL
+| Aspect | MORL Actuel | PLO (Ancien) |
+|--------|-------------|--------------|
+| Hyperparamètres | 1 (MAX_PENALTY_SCALE) | 10+ (λ, seuils, PID gains) |
+| Adaptabilité | w_cost ajustable post-training | Fixe après training |
+| Complexité | Simple | 3 contrôleurs PID |
+| Robustesse | Agent apprend toutes préférences | Sensible aux seuils |
 
 ---
 
-## 5. Recommandations
+## 6. Recommandations
 
-### Pour WFO Segment 0 (config actuelle)
+### Pour nouveaux runs WFO
 
-1. **Garder** la ramp rapide (30%) pour long plateau
-2. **Monitorer** le ratio Churn/PnL pendant le training
-3. **Si ratio > 0.3**: considerer baisser max churn a 0.30
+1. **Garder** curriculum_lambda max à 0.4 (équilibre profit/coûts)
+2. **Monitorer** le ratio Cost/PnL pendant le training
+3. **Ajuster** w_cost en inférence selon les conditions de marché
 
-### Ajustements Futurs
+### Ajustements en Inférence
 
-| Si Observation | Action |
-|----------------|--------|
-| Agent ne trade pas (pos ~0) | Baisser max churn a 0.30 |
-| Agent churne trop (>50 trades/episode) | Augmenter max churn a 0.60 |
-| NAV stable mais pas de profit | Reduire smooth_coef |
-| Entropy collapse (<0.05) | Reduire tous les coefs de penalite |
-
----
-
-## 6. Historique des Configurations
-
-| Date | Config | Resultat |
-|------|--------|----------|
-| 2026-01-13 | ramp 80%, max 0.50 | Non teste (change avant run) |
-| 2026-01-15 | ramp 60%, max 0.50 | -9.4% PnL, agent passif |
-| 2026-01-16 | ramp 30%, max 0.50 | En cours de test |
+| Condition Marché | w_cost Recommandé |
+|------------------|-------------------|
+| Bull fort | 0.2 (plus de trading) |
+| Range/Volatile | 0.5 (équilibré) |
+| Bear/Crash | 0.8 (conservateur) |
 
 ---
 
-*Fichier: docs/CURRICULUM_TUNING.md*
+*Fichier: docs/design/CURRICULUM_TUNING.md*
+*Mise à jour: 2026-01-21 (Transition vers MORL)*

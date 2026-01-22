@@ -193,7 +193,7 @@ run_full_wfo.py
       │               └── model.learn(callback=[
       │                       CheckpointCallback,    ✅
       │                       CurriculumCallback,    ✅
-      │                       PLOCallbacks,          ✅
+      │                       ModelEMACallback,      ✅
       │                       # PAS de OverfittingGuard ❌
       │                   ])
       │
@@ -212,7 +212,7 @@ run_full_wfo.py
       │               └── model.learn(callback=[
       │                       CheckpointCallback,         ✅
       │                       CurriculumCallback,         ✅
-      │                       PLOCallbacks,               ✅
+      │                       ModelEMACallback,           ✅
       │                       OverfittingGuardCallbackV2, ✅ NOUVEAU
       │                   ])
       │
@@ -910,7 +910,6 @@ def test_failed_segment_checkpoints_cleaned():
 
 - `docs/OVERFITTING_GUARD_V2.md` - Détails des 5 signaux
 - `docs/EVAL_DATA_SPLIT.md` - Split train/eval (mode standard)
-- `docs/PLO_ADAPTIVE_PENALTIES.md` - Callbacks PLO (compatibles)
 
 ---
 

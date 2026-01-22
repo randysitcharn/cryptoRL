@@ -157,7 +157,7 @@ if max_nav > initial_nav * 5.0:
 # Utilisation standard avec Stable-Baselines3
 callbacks = [
     ThreePhaseCurriculumCallback(...),
-    PLOAdaptivePenaltyCallback(...),
+    ModelEMACallback(...),
     OverfittingGuardCallbackV2(     # ← Nouveau
         nav_threshold=5.0,
         grad_variance_threshold=1e-6,
@@ -863,8 +863,8 @@ def test_graceful_degradation_no_eval_callback():
 
 ### 9.2 Contexte Safe RL
 
-5. **PLO - Predictive Lagrangian Optimization** (Janvier 2025)  
-   Zhang et al., "Predictive Lagrangian Optimization for Constrained RL"  
+5. **MORL - Multi-Objective RL** (ICML 2019)  
+   Abels et al., "Dynamic Weights in Multi-Objective Deep RL"  
    arXiv:2501.15217  
    https://arxiv.org/abs/2501.15217
 
