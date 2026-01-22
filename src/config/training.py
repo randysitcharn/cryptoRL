@@ -58,7 +58,7 @@ class TQCTrainingConfig:
     # --- Spectral Normalization (Stability) ---
     # See audit: Spectral norm crucial for Critic (Lipschitz constraint),
     # more debatable for Actor (may constrain policy too much)
-    use_spectral_norm_critic: bool = False  # Default False for reproducibility
+    use_spectral_norm_critic: bool = True   # Lipschitz constraint for critic stability
     use_spectral_norm_actor: bool = False    # Default False (conservative)
 
     # --- Foundation Model ---
