@@ -244,6 +244,7 @@ class BatchCryptoEnv(VecEnv):
         # Tracking
         self.total_trades = torch.zeros(n, dtype=torch.long, device=device)
         self.total_commissions = torch.zeros(n, device=device)
+        self._step_counter = 0  # DEBUG: Global step counter for logging
 
         # Episode tracking for SB3 monitoring (GPU tensors)
         self.episode_rewards = torch.zeros(n, device=device)
@@ -632,6 +633,7 @@ class BatchCryptoEnv(VecEnv):
         Returns:
             Tuple of (observations, rewards, dones, infos).
         """
+        self._step_counter += 1  # DEBUG: Increment global step counter
         actions = self._action_buffer  # Shape: (n_envs,) - pre-allocated buffer
 
         # 1. Clip raw actions
@@ -653,6 +655,14 @@ class BatchCryptoEnv(VecEnv):
             max=self.max_leverage
         )
         effective_actions = torch.clamp(raw_actions * self.vol_scalars, -1.0, 1.0)
+
+        # DEBUG: Log vol scaling values (every 10000 steps)
+        if self._step_counter % 10000 == 0:
+            print(f"[VOL_DEBUG] step={self._step_counter} | "
+                  f"raw_action={raw_actions[0].item():.4f} | "
+                  f"current_vol={current_vol[0].item():.4f} | "
+                  f"vol_scalar={self.vol_scalars[0].item():.4f} | "
+                  f"effective_action={effective_actions[0].item():.4f}")
 
         # 4. Discretize actions
         if self.action_discretization > 0:
