@@ -339,7 +339,7 @@ class TQCDropoutPolicy(TQCPolicy):
         use_spectral_norm_critic: bool = False,  # Default False for reproducibility
         use_spectral_norm_actor: bool = False,    # Default False (conservative)
         # ====== Exploration Init (FIX for small positions) ======
-        log_std_init: float = -3.0,     # Default SB3 value (-3 gives std≈0.05)
+        log_std_init: float = -1.0,     # FIX: -1 gives std≈0.37 (vs SB3 default -3 giving std≈0.05)
         **kwargs
     ):
         """
