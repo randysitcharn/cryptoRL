@@ -45,6 +45,7 @@ def create_mlp_with_dropout(
     activation_fn: Type[nn.Module] = nn.ReLU,
     dropout_rate: float = 0.0,
     use_layer_norm: bool = True,
+    use_spectral_norm: bool = False,
     squash_output: bool = False,
 ) -> nn.Sequential:
     """
@@ -56,6 +57,7 @@ def create_mlp_with_dropout(
     Cette séquence est validée par l'audit:
     - LayerNorm AVANT activation = données centrées-réduites pour ReLU (évite Dead ReLU)
     - Dropout APRÈS activation = préserve la sparsité du ReLU
+    - Spectral Normalization (optionnel) wrapper les couches Linear cachées pour stabilité
     
     Args:
         input_dim: Dimension d'entrée
@@ -64,6 +66,7 @@ def create_mlp_with_dropout(
         activation_fn: Fonction d'activation (ReLU par défaut)
         dropout_rate: Taux de dropout (0.01 recommandé en finance)
         use_layer_norm: Critique pour la stabilité avec dropout
+        use_spectral_norm: Appliquer spectral normalization aux couches Linear (sauf dernière)
         squash_output: Ajouter Tanh en sortie (pour actor)
     
     Returns:
@@ -73,7 +76,13 @@ def create_mlp_with_dropout(
     last_dim = input_dim
     
     for hidden_dim in net_arch:
-        layers.append(nn.Linear(last_dim, hidden_dim))
+        linear = nn.Linear(last_dim, hidden_dim)
+        
+        # Apply spectral normalization if enabled (only on hidden layers, not output)
+        if use_spectral_norm:
+            linear = nn.utils.spectral_norm(linear, n_power_iterations=1)
+        
+        layers.append(linear)
         
         # LayerNorm avant l'activation (Post-Norm standard en RL moderne)
         if use_layer_norm:
@@ -87,7 +96,7 @@ def create_mlp_with_dropout(
         
         last_dim = hidden_dim
     
-    # Couche de sortie finale (Raw projection, sans dropout ni LayerNorm)
+    # Couche de sortie finale (Raw projection, sans dropout, LayerNorm, ni spectral norm)
     layers.append(nn.Linear(last_dim, output_dim))
     
     if squash_output:
@@ -128,11 +137,13 @@ class DropoutActor(Actor):
         # Paramètres custom DroQ
         dropout_rate: float = 0.0,
         use_layer_norm: bool = True,
+        use_spectral_norm: bool = False,
         **kwargs,  # Absorb any extra args from SB3
     ):
         # Stocker les paramètres AVANT super().__init__
         self._dropout_rate = dropout_rate
         self._use_layer_norm = use_layer_norm
+        self._use_spectral_norm = use_spectral_norm
 
         # Use ONLY keyword args to avoid positional conflicts
         super().__init__(
@@ -168,7 +179,8 @@ class DropoutActor(Actor):
             net_arch=self.net_arch[:-1],  # Tous sauf le dernier qui est output du latent
             activation_fn=self.activation_fn,
             dropout_rate=self._dropout_rate,
-            use_layer_norm=self._use_layer_norm
+            use_layer_norm=self._use_layer_norm,
+            use_spectral_norm=self._use_spectral_norm
         )
 
 
@@ -187,6 +199,7 @@ class SingleQuantileNet(nn.Module):
         activation_fn: Type[nn.Module],
         dropout_rate: float,
         use_layer_norm: bool,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
         self.net = create_mlp_with_dropout(
@@ -195,7 +208,8 @@ class SingleQuantileNet(nn.Module):
             net_arch=net_arch,
             activation_fn=activation_fn,
             dropout_rate=dropout_rate,
-            use_layer_norm=use_layer_norm
+            use_layer_norm=use_layer_norm,
+            use_spectral_norm=use_spectral_norm
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -223,6 +237,7 @@ class DropoutCritic(nn.Module):
         activation_fn: Type[nn.Module],
         dropout_rate: float = 0.0,
         use_layer_norm: bool = True,
+        use_spectral_norm: bool = False,
         features_extractor: Optional[nn.Module] = None,
     ):
         super().__init__()
@@ -244,7 +259,8 @@ class DropoutCritic(nn.Module):
                 net_arch=net_arch,
                 activation_fn=activation_fn,
                 dropout_rate=dropout_rate,
-                use_layer_norm=use_layer_norm
+                use_layer_norm=use_layer_norm,
+                use_spectral_norm=use_spectral_norm
             )
             for _ in range(n_critics)
         ])
@@ -319,6 +335,9 @@ class TQCDropoutPolicy(TQCPolicy):
         critic_dropout: float = 0.01,   # Défaut DroQ (conservateur)
         actor_dropout: float = 0.005,   # Défaut STAC (très faible)
         use_layer_norm: bool = True,    # CRITIQUE pour stabilité
+        # ====== Spectral Normalization (Stability) ======
+        use_spectral_norm_critic: bool = False,  # Default False for reproducibility
+        use_spectral_norm_actor: bool = False,    # Default False (conservative)
         **kwargs
     ):
         """
@@ -336,7 +355,12 @@ class TQCDropoutPolicy(TQCPolicy):
             critic_dropout: Dropout rate for critics (0.01 recommended)
             actor_dropout: Dropout rate for actor (0.005, auto-disabled with gSDE)
             use_layer_norm: Use LayerNorm (CRITICAL for stability)
+            use_spectral_norm_critic: Apply spectral normalization to critic Linear layers
+            use_spectral_norm_actor: Apply spectral normalization to actor Linear layers
             **kwargs: Additional arguments passed to TQCPolicy
+            
+        ⚠️ WARNING: Checkpoints are NOT compatible if `use_spectral_norm_*` flags change.
+        See plan spectral_normalization_implementation for details.
         """
         # ====== SÉCURITÉ gSDE (AUDIT FIX) ======
         # gSDE apprend une matrice de bruit dépendant de l'état.
@@ -353,6 +377,8 @@ class TQCDropoutPolicy(TQCPolicy):
         self.critic_dropout = critic_dropout
         self.actor_dropout = actor_dropout
         self.use_layer_norm = use_layer_norm
+        self.use_spectral_norm_critic = use_spectral_norm_critic
+        self.use_spectral_norm_actor = use_spectral_norm_actor
         self.n_quantiles = n_quantiles
         self.n_critics = n_critics
 
@@ -379,6 +405,7 @@ class TQCDropoutPolicy(TQCPolicy):
         return DropoutActor(
             dropout_rate=self.actor_dropout,
             use_layer_norm=self.use_layer_norm,
+            use_spectral_norm=self.use_spectral_norm_actor,
             **actor_kwargs
         ).to(self.device)
 
@@ -414,6 +441,7 @@ class TQCDropoutPolicy(TQCPolicy):
             activation_fn=self.activation_fn,
             dropout_rate=self.critic_dropout,
             use_layer_norm=self.use_layer_norm,
+            use_spectral_norm=self.use_spectral_norm_critic,
             features_extractor=critic_features_extractor,
         ).to(self.device)
 

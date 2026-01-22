@@ -10,7 +10,7 @@ orchestrating the complete data pipeline.
 """
 
 from src.data_engineering.processor import DataProcessor
-from src.data_engineering.splitter import TimeSeriesSplitter
+from src.data_engineering.splitter import TimeSeriesSplitter, validate_purge_window
 from src.data_engineering.loader import MultiAssetDownloader
 from src.data_engineering.features import FeatureEngineer
 from src.data_engineering.manager import RegimeDetector, DataManager
@@ -18,6 +18,7 @@ from src.data_engineering.manager import RegimeDetector, DataManager
 __all__ = [
     'DataProcessor',
     'TimeSeriesSplitter',
+    'validate_purge_window',
     'MultiAssetDownloader',
     'FeatureEngineer',
     'RegimeDetector',

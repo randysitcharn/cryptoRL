@@ -6,7 +6,7 @@ Exports all configuration classes and global settings.
 
 Usage:
     from src.config import SEED, DEVICE, TQCTrainingConfig
-    from src.config import TuningConfig, FoundationTrainingConfig
+    from src.config import FoundationTrainingConfig
 """
 
 # Global settings (backward compatibility with src.config)
@@ -26,12 +26,14 @@ from src.config.constants import (
     CRYPTO_TICKERS,
     MACRO_TICKERS,
     TICKER_MAPPING,
+    MAX_LOOKBACK_WINDOW,
+    DEFAULT_PURGE_WINDOW,
 )
 
 # Training configurations
 from src.config.training import (
     TQCTrainingConfig,
-    TuningConfig,
+    WFOTrainingConfig,
     FoundationTrainingConfig,
     linear_schedule,
 )
@@ -50,14 +52,16 @@ __all__ = [
     "CRYPTO_TICKERS",
     "MACRO_TICKERS",
     "TICKER_MAPPING",
+    "MAX_LOOKBACK_WINDOW",
+    "DEFAULT_PURGE_WINDOW",
     # Base configs
     "PathConfig",
     "EnvConfig",
     "FoundationModelConfig",
     # Training configs
     "TQCTrainingConfig",
+    "WFOTrainingConfig",
     "TrainingConfig",  # Alias
-    "TuningConfig",
     "FoundationTrainingConfig",
     "linear_schedule",
 ]

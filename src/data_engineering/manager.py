@@ -53,10 +53,10 @@ class RegimeDetector:
     """
 
     # Features dédiées au HMM (calculées en interne)
-    # Quick Wins: +Funding, +RiskOnOff, +VolRatio pour anticipation régimes
+    # Quick Wins: +RiskOnOff, +VolRatio pour anticipation régimes
+    # NOTE: HMM_Funding removed (synthetic funding causes spurious correlations - see audit P1.2)
     HMM_FEATURES = [
         'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
-        'HMM_Funding',      # Leading indicator (monte avant pumps)
         'HMM_RiskOnOff',    # SPX - DXY (risk-on/off signal)
         'HMM_VolRatio',     # Vol court/long (early warning)
     ]
@@ -159,14 +159,15 @@ class RegimeDetector:
         rsi = 100 - (100 / (1 + rs))
         df_result['HMM_Momentum'] = rsi / 100  # Normaliser [0, 1]
 
-        # 4. Funding Rate (leading indicator - monte avant pumps)
-        # Smooth sur 24h car c'est déjà un indicateur synthétique
-        if 'Funding_Rate' in df.columns:
+        # 4. Funding Rate - DEPRECATED (see audit P1.2)
+        # Synthetic funding removed from HMM_FEATURES to avoid spurious correlations
+        # Only compute if real funding data is available (non-zero variance)
+        if 'Funding_Rate' in df.columns and df['Funding_Rate'].std() > 1e-8:
             df_result['HMM_Funding'] = df['Funding_Rate'].rolling(
                 window=24, min_periods=24
             ).mean()
-        else:
-            df_result['HMM_Funding'] = 0.0
+            print("  [INFO] HMM_Funding computed (real data detected)")
+        # else: HMM_Funding not created - not in HMM_FEATURES anymore
 
         # 5. Risk-On/Off via SPX vs DXY
         # SPX monte + DXY baisse = Risk-On (bon pour crypto)
@@ -188,11 +189,14 @@ class RegimeDetector:
         df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-0.05, 0.05)  # ±5%/h max
         df_result['HMM_Vol'] = df_result['HMM_Vol'].clip(0, 0.2)  # Vol max 20%/h
         df_result['HMM_Momentum'] = df_result['HMM_Momentum'].clip(0, 1)  # RSI strict [0,1]
-        df_result['HMM_Funding'] = df_result['HMM_Funding'].clip(-0.005, 0.005)  # ±0.5%
         df_result['HMM_RiskOnOff'] = df_result['HMM_RiskOnOff'].clip(-0.02, 0.02)  # ±2%
         df_result['HMM_VolRatio'] = df_result['HMM_VolRatio'].clip(0.2, 5.0)  # Ratio [0.2x, 5x]
+        # HMM_Funding clip only if it exists (real funding data)
+        if 'HMM_Funding' in df_result.columns:
+            df_result['HMM_Funding'] = df_result['HMM_Funding'].clip(-0.005, 0.005)  # ±0.5%
 
-        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, 6 features: Trend/Vol/Mom/Funding/RiskOnOff/VolRatio)")
+        n_features = len(self.HMM_FEATURES)
+        print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, {n_features} features: {', '.join(self.HMM_FEATURES)})")
 
         return df_result
 
@@ -853,7 +857,8 @@ class DataManager:
         self,
         save_path: Optional[str] = None,
         scaler_path: Optional[str] = None,
-        use_cached_data: bool = True
+        use_cached_data: bool = True,
+        train_end_idx: Optional[int] = None
     ) -> pd.DataFrame:
         """
         Exécute le pipeline complet de préparation des données.
@@ -867,6 +872,10 @@ class DataManager:
             save_path: Chemin de sauvegarde du parquet (défaut: data/processed_data.parquet).
             scaler_path: Chemin de sauvegarde du scaler (défaut: data/scaler.pkl).
             use_cached_data: Si True, utilise les données CSV existantes.
+            train_end_idx: Index de fin du train set pour fit scaler on train only.
+                          Si None, utilise fit_transform sur tout le dataset (legacy mode avec warning).
+                          IMPORTANT: Pour éviter le data leakage, toujours spécifier ce paramètre
+                          en production. Voir audit DATA_PIPELINE_AUDIT_REPORT.md P0.1.
 
         Returns:
             DataFrame final prêt pour l'entraînement.
@@ -936,7 +945,7 @@ class DataManager:
         print(f"  Dropped {dropped} rows with NaN ({len(df)} remaining)")
 
         # =====================================================================
-        # ÉTAPE 5: Global Scaling
+        # ÉTAPE 5: Global Scaling (Leak-Free)
         # =====================================================================
         print("\n[5/6] Applying RobustScaler...")
 
@@ -949,8 +958,22 @@ class DataManager:
 
         print(f"  Scaling {len(cols_to_scale)} columns")
 
-        # Appliquer le scaler
-        df[cols_to_scale] = self.scaler.fit_transform(df[cols_to_scale])
+        # Appliquer le scaler - LEAK-FREE MODE
+        if train_end_idx is not None:
+            # Fit on train only, transform all (prevents data leakage)
+            print(f"  [LEAK-FREE] Fitting scaler on train only (first {train_end_idx} rows)")
+            self.scaler.fit(df.iloc[:train_end_idx][cols_to_scale])
+            df[cols_to_scale] = self.scaler.transform(df[cols_to_scale])
+        else:
+            # Legacy mode - fit_transform on full dataset (DATA LEAKAGE WARNING)
+            import warnings
+            warnings.warn(
+                "Scaler fit on full dataset - this causes data leakage! "
+                "Use train_end_idx parameter for production. See audit P0.1.",
+                UserWarning
+            )
+            print("  [WARNING] Legacy mode: fit_transform on full dataset (data leakage risk)")
+            df[cols_to_scale] = self.scaler.fit_transform(df[cols_to_scale])
 
         # Sauvegarder le scaler
         with open(scaler_path, 'wb') as f:

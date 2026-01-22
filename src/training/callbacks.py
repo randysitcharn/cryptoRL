@@ -620,11 +620,10 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     Three-Phase Curriculum Learning with IPC Fault Tolerance.
     Refactored 2026-01-16 to fix multiprocessing crashes.
     
-    NOTE: PLO Churn and Smoothness have been removed in favor of MORL.
-    This callback now only manages curriculum_lambda for the environment.
+    This callback manages curriculum_lambda for the environment, controlling
+    the gradual introduction of cost penalties during training (MORL architecture).
     """
     # Modified by CryptoRL: curriculum extended to 75% of training
-    # PLO Churn/Smoothness removed - only curriculum_lambda remains
     PHASES = [
         {'end_progress': 0.15},
         {'end_progress': 0.75},
@@ -678,10 +677,10 @@ class ThreePhaseCurriculumCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         if self.verbose > 0:
-            print(f"\n[3-Phase Curriculum] Configuration (PLO removed, MORL active):")
+            print(f"\n[3-Phase Curriculum] Configuration (MORL architecture):")
             for i, phase in enumerate(self.PHASES):
                 pct = int(phase['end_progress'] * 100)
-                print(f"  Phase {i+1} (0-{pct}%): curriculum_lambda only")
+                print(f"  Phase {i+1} (0-{pct}%): curriculum_lambda={0.4 * min(1.0, max(0, (phase['end_progress'] - 0.15) / 0.60)):.2f}")
 
 
 # ============================================================================
@@ -860,191 +859,6 @@ class EvalCallbackWithNoiseControl(EvalCallback):
             BatchCryptoEnv instance if found, None otherwise.
         """
         return get_underlying_batch_env(env)
-
-
-# ============================================================================
-# PLO (Predictive Lagrangian Optimization) Callbacks
-# ============================================================================
-
-class PLOAdaptivePenaltyCallback(BaseCallback):
-    """
-    Predictive Lagrangian Optimization (PLO) for Drawdown-based Adaptive Penalties.
-
-    This callback implements a PID controller that dynamically adjusts the
-    downside risk penalty multiplier based on current and predicted drawdown.
-
-    VERSION: Production - Includes all protections:
-    1. Robust prediction via np.polyfit (instead of naive difference)
-    2. Adaptive quantile (90% if num_envs >= 16, else LogSumExp)
-    3. Lambda smoothing (max ±0.05/step)
-    4. Prediction only if slope positive (worsening)
-    5. "Wake-up Shock" protection (freeze PID in Phase 1 curriculum)
-
-    Reference: "Predictive Lagrangian Optimization" (2025)
-    """
-
-    def __init__(
-        self,
-        # Drawdown Constraint
-        dd_threshold: float = 0.10,
-        dd_lambda_min: float = 1.0,
-        dd_lambda_max: float = 5.0,
-        # PID Gains
-        dd_Kp: float = 2.0,
-        dd_Ki: float = 0.05,
-        dd_Kd: float = 0.3,
-        # PLO Prediction
-        prediction_horizon: int = 50,
-        use_prediction: bool = True,
-        # Anti-windup, decay and smoothing
-        integral_max: float = 2.0,
-        decay_rate: float = 0.995,
-        max_lambda_change: float = 0.05,
-        # Risk measurement
-        dd_quantile: float = 0.9,
-        # Logging
-        log_freq: int = 100,
-        verbose: int = 0,
-    ):
-        super().__init__(verbose)
-
-        # Parameters
-        self.dd_threshold = dd_threshold
-        self.dd_lambda_min = dd_lambda_min
-        self.dd_lambda_max = dd_lambda_max
-        self.dd_Kp = dd_Kp
-        self.dd_Ki = dd_Ki
-        self.dd_Kd = dd_Kd
-        self.prediction_horizon = prediction_horizon
-        self.use_prediction = use_prediction
-        self.integral_max = integral_max
-        self.decay_rate = decay_rate
-        self.max_lambda_change = max_lambda_change
-        self.dd_quantile = dd_quantile
-        self.log_freq = log_freq
-
-        # PID Controller State
-        self.dd_integral = 0.0
-        self.dd_prev_violation = 0.0
-        self.dd_lambda = 1.0
-
-        # Buffer for prediction
-        self.dd_history = []
-
-    def _on_step(self) -> bool:
-        real_env = get_underlying_batch_env(self.model.env)
-
-        if not hasattr(real_env, 'current_drawdowns'):
-            return True
-
-        # ═══════════════════════════════════════════════════════════════════
-        # "WAKE-UP SHOCK" PROTECTION
-        # Don't accumulate integral if curriculum is not yet active
-        # Prevents λ from rising to 5.0 while agent can't react
-        # ═══════════════════════════════════════════════════════════════════
-        curriculum_active = True
-        if hasattr(real_env, 'curriculum_lambda'):
-            if real_env.curriculum_lambda < 0.05:  # Phase 1: curriculum ≈ 0
-                # Fast decay of integral to avoid saturation
-                self.dd_integral *= 0.9
-                curriculum_active = False
-
-        # ═══════════════════════════════════════════════════════════════════
-        # ADAPTIVE MEASUREMENT (based on num_envs)
-        # Quantile unstable if few envs → use LogSumExp
-        # ═══════════════════════════════════════════════════════════════════
-        import torch
-        current_dd = real_env.current_drawdowns
-
-        if real_env.num_envs >= 16:
-            # Enough envs for stable quantile
-            metric_dd = torch.quantile(current_dd, self.dd_quantile).item()
-        else:
-            # Few envs: LogSumExp (smooth approximation of max)
-            temperature = 10.0
-            metric_dd = (torch.logsumexp(current_dd * temperature, dim=0) / temperature).item()
-
-        max_dd = current_dd.max().item()
-        violation = max(0.0, metric_dd - self.dd_threshold)
-
-        # Store for prediction
-        self.dd_history.append(metric_dd)
-        if len(self.dd_history) > self.prediction_horizon:
-            self.dd_history.pop(0)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # ROBUST PREDICTION (only if curriculum active)
-        # Polyfit on 15 points, only if slope positive
-        # ═══════════════════════════════════════════════════════════════════
-        predicted_violation = 0.0
-        slope = 0.0
-
-        if curriculum_active and self.use_prediction and len(self.dd_history) >= 15:
-            y = np.array(self.dd_history[-15:])
-            x = np.arange(len(y))
-            slope, intercept = np.polyfit(x, y, 1)
-
-            # STRICT: Only predict if slope POSITIVE (worsening)
-            if slope > 0:
-                future_dd = slope * (len(y) + 10) + intercept
-                predicted_violation = max(0.0, future_dd - self.dd_threshold)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PID CONTROLLER (conditioned by curriculum)
-        # ═══════════════════════════════════════════════════════════════════
-        if curriculum_active:
-            if violation > 0 or predicted_violation > 0:
-                effective_violation = max(violation, 0.7 * predicted_violation)
-
-                P = self.dd_Kp * effective_violation
-                self.dd_integral += self.dd_Ki * violation
-                self.dd_integral = np.clip(self.dd_integral, 0, self.integral_max)
-                I = self.dd_integral
-                D = self.dd_Kd * (violation - self.dd_prev_violation)
-
-                target_lambda = self.dd_lambda_min + P + I + D
-                target_lambda = np.clip(target_lambda, self.dd_lambda_min, self.dd_lambda_max)
-            else:
-                # Decay towards λ_min
-                target_lambda = max(self.dd_lambda_min, self.dd_lambda * self.decay_rate)
-                self.dd_integral *= 0.995
-
-            # Smoothing: limit change per step
-            change = np.clip(target_lambda - self.dd_lambda,
-                             -self.max_lambda_change, self.max_lambda_change)
-            self.dd_lambda = self.dd_lambda + change
-
-        self.dd_prev_violation = violation
-
-        # Apply to environment
-        if hasattr(real_env, 'set_downside_multiplier'):
-            real_env.set_downside_multiplier(self.dd_lambda)
-
-        # Logging
-        if self.num_timesteps % self.log_freq == 0:
-            self.logger.record("plo/dd_violation", violation)
-            self.logger.record("plo/dd_predicted_violation", predicted_violation)
-            self.logger.record("plo/dd_multiplier", self.dd_lambda)
-            self.logger.record("plo/dd_integral", self.dd_integral)
-            self.logger.record("plo/dd_slope", slope)
-            self.logger.record("plo/metric_drawdown", metric_dd)
-            self.logger.record("plo/max_drawdown", max_dd)
-            self.logger.record("plo/curriculum_active", float(curriculum_active))
-
-        return True
-
-    def _on_training_start(self) -> None:
-        if self.verbose > 0:
-            print(f"\n[PLO] Predictive Lagrangian Optimization (Drawdown):")
-            print(f"  DD threshold: {self.dd_threshold:.1%}")
-            print(f"  Lambda range: [{self.dd_lambda_min}, {self.dd_lambda_max}]")
-            print(f"  PID gains: Kp={self.dd_Kp}, Ki={self.dd_Ki}, Kd={self.dd_Kd}")
-            print(f"  Prediction: {'polyfit (robust)' if self.use_prediction else 'disabled'}")
-            print(f"  DD Quantile: {self.dd_quantile:.0%} (adaptive by num_envs)")
-            print(f"  Max λ change/step: ±{self.max_lambda_change}")
-            print(f"  Wake-up Shock protection: enabled")
-
-
 
 
 # ============================================================================

@@ -32,11 +32,9 @@ from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
     StepLoggingCallback,
     DetailTensorboardCallback,
-    CurriculumFeesCallback,
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallback,
     OverfittingGuardCallbackV2,
-    PLOAdaptivePenaltyCallback,
     ModelEMACallback,
 )
 
@@ -211,6 +209,46 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str:
 from src.config import TQCTrainingConfig as TrainingConfig, linear_schedule
 
 
+def _validate_spectral_norm_compatibility(model: TQC, config: TrainingConfig) -> None:
+    """
+    Validate spectral normalization compatibility between checkpoint and config.
+    
+    Checks if the loaded model's SN configuration matches the current config.
+    Raises ValueError if mismatch is detected.
+    
+    Args:
+        model: Loaded TQC model
+        config: Current training configuration
+        
+    Raises:
+        ValueError: If SN configuration mismatch detected
+    """
+    # Only validate if using TQCDropoutPolicy
+    if not config.use_dropout_policy:
+        return
+    
+    # Check if policy has SN attributes
+    if not hasattr(model.policy, 'use_spectral_norm_critic'):
+        return  # Not using TQCDropoutPolicy or old version
+    
+    # Extract SN config from loaded model
+    loaded_sn_critic = getattr(model.policy, 'use_spectral_norm_critic', False)
+    loaded_sn_actor = getattr(model.policy, 'use_spectral_norm_actor', False)
+    
+    # Compare with current config
+    config_sn_critic = config.use_spectral_norm_critic
+    config_sn_actor = config.use_spectral_norm_actor
+    
+    if loaded_sn_critic != config_sn_critic or loaded_sn_actor != config_sn_actor:
+        raise ValueError(
+            f"Checkpoint SN mismatch detected!\n"
+            f"  Checkpoint: critic={loaded_sn_critic}, actor={loaded_sn_actor}\n"
+            f"  Config:     critic={config_sn_critic}, actor={config_sn_actor}\n"
+            f"  Checkpoints are NOT compatible if `use_spectral_norm_*` flags change.\n"
+            f"  Solution: Re-train with matching SN configuration or use a compatible checkpoint."
+        )
+
+
 def create_policy_kwargs(config: TrainingConfig) -> dict:
     """
     Create policy kwargs with FoundationFeatureExtractor.
@@ -250,6 +288,8 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
             critic_dropout=config.critic_dropout,
             actor_dropout=config.actor_dropout,
             use_layer_norm=config.use_layer_norm,
+            use_spectral_norm_critic=config.use_spectral_norm_critic,
+            use_spectral_norm_actor=config.use_spectral_norm_actor,
         )
 
     return policy_kwargs
@@ -436,32 +476,6 @@ def create_callbacks(
     )
     callbacks.append(ema_callback)
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # PLO (Predictive Lagrangian Optimization) Callbacks
-    # Adaptive penalties based on drawdown, churn, and smoothness constraints
-    # ═══════════════════════════════════════════════════════════════════════
-
-    # PLO Drawdown: Increase downside penalty when DD > 10%
-    # All PLO callbacks use config.log_freq for consistent logging
-    plo_dd_callback = PLOAdaptivePenaltyCallback(
-        dd_threshold=0.10,
-        dd_lambda_min=1.0,
-        dd_lambda_max=5.0,
-        dd_Kp=2.0,
-        dd_Ki=0.05,
-        dd_Kd=0.3,
-        prediction_horizon=50,
-        use_prediction=True,
-        max_lambda_change=0.05,
-        dd_quantile=0.9,
-        log_freq=config.log_freq,
-        verbose=1
-    )
-    callbacks.append(plo_dd_callback)
-
-    # NOTE: PLO Churn and Smoothness callbacks have been removed.
-    # The MORL architecture (w_cost) now handles cost penalties directly.
-
     # Overfitting guard - DISABLED (OOS Sharpe 4.75 shows model generalizes well)
     # overfitting_guard = OverfittingGuardCallback(
     #     nav_threshold=5.0,
@@ -630,6 +644,14 @@ def train(
             device=DEVICE,
             tensorboard_log=config.tensorboard_log,
         )
+        
+        # Validate spectral normalization compatibility (if model loaded successfully)
+        # Note: If SN config mismatch, TQC.load() may fail with state_dict error before this point
+        try:
+            _validate_spectral_norm_compatibility(model, config)
+        except ValueError as e:
+            print(f"\n[ERROR] {e}")
+            raise
 
         # CRITICAL: Cold Start Warmup - fill buffer before training
         model.learning_starts = config.resume_learning_starts

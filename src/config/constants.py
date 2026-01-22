@@ -7,6 +7,38 @@ Centralizes column definitions to ensure consistency across modules.
 
 from typing import List
 
+# =============================================================================
+# Window Sizes (for features and purge calculation)
+# =============================================================================
+ZSCORE_WINDOW: int = 720       # 30 jours (prix Z-Score)
+VOL_ZSCORE_WINDOW: int = 336   # 14 jours (volume Z-Score)
+HMM_SMOOTHING_WINDOW: int = 168  # 7 jours (HMM feature smoothing)
+FFD_WINDOW: int = 100          # ~4 jours (Fractional Differentiation)
+VOL_WINDOW: int = 24           # 1 jour (Parkinson/GK volatility)
+
+# =============================================================================
+# Purge & Embargo Configuration
+# =============================================================================
+# Purge window must be >= max indicator window to prevent data leakage
+# See audit AUDIT_MODELES_RL_RESULTATS.md - Contre-Audit section for rationale
+
+# Compute MAX_LOOKBACK_WINDOW as the maximum of all feature windows
+# This ensures purge window covers all lookback dependencies
+MAX_LOOKBACK_WINDOW: int = max(
+    ZSCORE_WINDOW,           # 720h - price Z-Score
+    VOL_ZSCORE_WINDOW,       # 336h - volume Z-Score
+    HMM_SMOOTHING_WINDOW,    # 168h - HMM feature smoothing
+    FFD_WINDOW,              # 100h - Fractional Differentiation
+    VOL_WINDOW,              # 24h  - Parkinson/GK volatility
+)
+
+# Backward compatibility alias
+MAX_INDICATOR_WINDOW: int = MAX_LOOKBACK_WINDOW
+
+# Default purge must be >= max lookback to prevent data leakage
+DEFAULT_PURGE_WINDOW: int = MAX_LOOKBACK_WINDOW  # 720h
+DEFAULT_EMBARGO_WINDOW: int = 24  # Gap after test before next train (for label correlation decay)
+
 # Standard OHLCV column names
 OHLCV_COLS: List[str] = ['Open', 'High', 'Low', 'Close', 'Volume']
 

@@ -146,12 +146,6 @@ class BatchCryptoEnv(VecEnv):
         self.curriculum_lambda = 0.0  # Dynamic penalty weight
         self.last_gate_mean = 0.0     # Mean gate opening for logging
 
-        # ═══════════════════════════════════════════════════════════════════
-        # PLO Drawdown Multiplier (kept for backward compatibility)
-        # Note: PLO Churn and Smoothness have been removed in favor of MORL
-        # ═══════════════════════════════════════════════════════════════════
-        self.downside_multiplier = 1.0  # PLO Drawdown: scales downside risk penalty
-
         # Load and preprocess data
         df = pd.read_parquet(parquet_path)
 
@@ -196,13 +190,6 @@ class BatchCryptoEnv(VecEnv):
             ),
             "position": spaces.Box(
                 low=-1.0, high=1.0,
-                shape=(1,),
-                dtype=np.float32
-            ),
-            # PLO Drawdown: Risk level (λ_dd normalized to [0, 1])
-            # Kept for backward compatibility with PLO Drawdown callback
-            "risk_level": spaces.Box(
-                low=0.0, high=1.0,
                 shape=(1,),
                 dtype=np.float32
             ),
@@ -274,14 +261,6 @@ class BatchCryptoEnv(VecEnv):
         self._final_total_trades = None  # Captured before reset for evaluation
         self._final_navs = None  # Captured before reset for evaluation
         self._final_positions = None  # Captured before reset for evaluation
-
-        # ═══════════════════════════════════════════════════════════════════
-        # PLO Smoothness: Jerk tracking buffers
-        # Jerk = |Δpos(t) - Δpos(t-1)| = acceleration of position changes
-        # Must be calculated DURING _calculate_rewards BEFORE updating prev
-        # ═══════════════════════════════════════════════════════════════════
-        self.prev_position_deltas = torch.zeros(n, device=device)
-        self.latest_jerks = torch.zeros(n, device=device)
 
         # ═══════════════════════════════════════════════════════════════════
         # MORL: w_cost preference parameter per environment
@@ -373,6 +352,9 @@ class BatchCryptoEnv(VecEnv):
             "curriculum/lambda": self.curriculum_lambda,
             "curriculum/progress": self.progress,
             "curriculum/gate_open": self.last_gate_mean,
+            # MORL metrics (Audit 2026-01-22)
+            "morl/w_cost_mean": self.w_cost.mean().item(),
+            "morl/w_cost_std": self.w_cost.std().item(),
         }
 
     def _get_batch_windows(self, steps: torch.Tensor) -> torch.Tensor:
@@ -429,7 +411,7 @@ class BatchCryptoEnv(VecEnv):
             - w_cost = 0: Scalping mode (ignore costs, max profit)
             - w_cost = 1: B&H mode (minimize costs, conservative)
 
-        This replaces the old PLO + Curriculum architecture with a single
+        This is the MORL (Multi-Objective RL) architecture with a single
         preference parameter that the agent learns to condition on.
 
         Args:
@@ -455,12 +437,6 @@ class BatchCryptoEnv(VecEnv):
         COST_PENALTY_CAP = 20.0
 
         # ═══════════════════════════════════════════════════════════════════
-        # 0. JERK TRACKING (for backward compatibility with PLO logging)
-        # ═══════════════════════════════════════════════════════════════════
-        jerks = torch.abs(position_deltas - self.prev_position_deltas)
-        self.latest_jerks = jerks.detach().clone()
-
-        # ═══════════════════════════════════════════════════════════════════
         # 1. OBJECTIVE 1: Performance (Log Returns)
         # Always active, this is what we want to maximize
         # ═══════════════════════════════════════════════════════════════════
@@ -476,7 +452,8 @@ class BatchCryptoEnv(VecEnv):
         r_cost = -position_deltas * SCALE
 
         # Safety clip to prevent extreme penalties during high volatility
-        r_cost = torch.clamp(r_cost, min=-COST_PENALTY_CAP)
+        # Safety clip: min prevents extreme penalties, max=0 ensures costs are never positive
+        r_cost = torch.clamp(r_cost, min=-COST_PENALTY_CAP, max=0.0)
 
         # ═══════════════════════════════════════════════════════════════════
         # 3. MORL SCALARIZATION: Dynamic weighting by w_cost
@@ -501,11 +478,6 @@ class BatchCryptoEnv(VecEnv):
 
         # Legacy compatibility: store gate mean (always 1.0 in MORL - no gating)
         self.last_gate_mean = 1.0
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 5. UPDATE JERK TRACKER (must be AFTER jerk calculation)
-        # ═══════════════════════════════════════════════════════════════════
-        self.prev_position_deltas = position_deltas.clone()
 
         return reward * self.reward_scaling
 
@@ -554,10 +526,6 @@ class BatchCryptoEnv(VecEnv):
         # Reset drawdown tracking
         self.peak_navs.fill_(self.initial_balance)
         self.current_drawdowns.zero_()
-
-        # Reset PLO Smoothness jerk tracking
-        self.prev_position_deltas.zero_()
-        self.latest_jerks.zero_()
 
         # Domain Randomization: sample fees for all envs
         if self.enable_domain_randomization:
@@ -623,22 +591,10 @@ class BatchCryptoEnv(VecEnv):
         # Position: (n_envs, 1) - NO noise on position (agent's own state)
         position = self.position_pcts.unsqueeze(1)
 
-        # ═══════════════════════════════════════════════════════════════════
-        # PLO Drawdown: Risk level (kept for backward compatibility)
-        # Normalization: λ ∈ [1, 5] → level ∈ [0, 1]
-        # ═══════════════════════════════════════════════════════════════════
-        risk_level_value = (self.downside_multiplier - 1.0) / 4.0
-        risk_level = torch.full(
-            (self.num_envs, 1),
-            risk_level_value,
-            device=self.device
-        )
-
         # Transfer to CPU numpy for SB3
         return {
             "market": market.cpu().numpy(),
             "position": position.cpu().numpy(),
-            "risk_level": risk_level.cpu().numpy(),
             "w_cost": self.w_cost.cpu().numpy(),  # MORL preference parameter
         }
 
@@ -871,10 +827,6 @@ class BatchCryptoEnv(VecEnv):
         self.peak_navs[dones] = self.initial_balance
         self.current_drawdowns[dones] = 0.0
 
-        # Reset PLO Smoothness jerk tracking for done envs
-        self.prev_position_deltas[dones] = 0.0
-        self.latest_jerks[dones] = 0.0
-
         # Domain Randomization: resample fees for done envs
         if self.enable_domain_randomization:
             done_indices = torch.nonzero(dones, as_tuple=True)[0]
@@ -951,16 +903,12 @@ class BatchCryptoEnv(VecEnv):
         market = self.data[start:step+1].cpu().numpy()
         position = np.array([self.position_pcts[idx].item()], dtype=np.float32)
         
-        # PLO Drawdown: Risk level (kept for backward compatibility)
-        risk_level = np.array([(self.downside_multiplier - 1.0) / 4.0], dtype=np.float32)
-        
         # MORL: w_cost preference parameter (MUST match _get_observations structure)
         w_cost = self.w_cost[idx].cpu().numpy()
         
         return {
             "market": market,
             "position": position,
-            "risk_level": risk_level,
             "w_cost": w_cost,
         }
 
@@ -1117,44 +1065,6 @@ class BatchCryptoEnv(VecEnv):
         else:
             # Phase 3: Stability - fixed discipline
             self.curriculum_lambda = 0.4
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # PLO (Predictive Lagrangian Optimization) Setters and Properties
-    # ═══════════════════════════════════════════════════════════════════════
-
-    def set_downside_multiplier(self, value: float) -> None:
-        """
-        Setter for PLO Drawdown callback.
-        
-        Clamps value to [1.0, 10.0] for safety.
-        λ=1.0 is neutral, λ=5.0 is typical max, λ=10.0 is hard cap.
-        """
-        self.downside_multiplier = max(1.0, min(value, 10.0))
-
-
-    @property
-    def current_jerks(self) -> torch.Tensor:
-        """
-        Returns jerks calculated during the last step.
-        
-        IMPORTANT (Audit v1.1 fix):
-        - Does NOT calculate jerk here (would always be 0 due to execution order)
-        - Simply reads the buffer filled during _calculate_rewards
-        
-        Returns:
-            Tensor of shape (n_envs,) with jerk values for each env.
-        """
-        return self.latest_jerks
-
-    @property
-    def current_position_deltas(self) -> torch.Tensor:
-        """
-        Returns absolute position deltas for PLO Churn callback.
-        
-        Returns:
-            Tensor of shape (n_envs,) with |Δposition| for each env.
-        """
-        return torch.abs(self.position_pcts - self.prev_position_pcts)
 
     def get_attr(self, attr_name: str, indices=None):
         """Get attribute from envs."""

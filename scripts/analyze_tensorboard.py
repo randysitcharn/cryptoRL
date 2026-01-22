@@ -1083,8 +1083,8 @@ def generate_report(
     categories = group_metrics_by_category(metrics_dict)
     category_order = [
         'train', 'rollout', 'env', 'rewards', 'custom', 'loss', 'eval',
-        'curriculum', 'plo', 'plo_churn', 'plo_smooth', 'churn',
-        'overfit', 'observation_noise', 'internal', 'time', 'grad', 'other'
+        'curriculum', 'churn',
+        'overfit', 'observation_noise', 'internal', 'time', 'grad', 'ema', 'other'
     ]
 
     for category in category_order:

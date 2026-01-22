@@ -15,6 +15,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from src.config import OHLCV_COLS, CRYPTO_TICKERS, MACRO_TICKERS, TICKER_MAPPING
 
 
@@ -39,9 +41,40 @@ class MultiAssetDownloader:
         self.processed_data_dir = processed_data_dir
         os.makedirs(self.processed_data_dir, exist_ok=True)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception)),
+        reraise=True
+    )
+    def _download_with_retry(self, ticker: str, start_date: datetime) -> pd.DataFrame:
+        """
+        Internal method with retry logic for yfinance download.
+
+        Uses tenacity for exponential backoff on network errors.
+        See audit DATA_PIPELINE_AUDIT_REPORT.md P1.3.
+
+        Args:
+            ticker: Symbol to download.
+            start_date: Start date for data.
+
+        Returns:
+            Raw DataFrame from yfinance.
+
+        Raises:
+            Exception: After 3 failed attempts.
+        """
+        return yf.download(
+            ticker,
+            start=start_date,
+            interval='1h',
+            progress=False,
+            auto_adjust=True
+        )
+
     def _download_asset(self, ticker: str, days: int = 730) -> pd.DataFrame:
         """
-        Télécharge les données horaires d'un actif via yfinance.
+        Télécharge les données horaires d'un actif via yfinance avec retry automatique.
 
         Args:
             ticker: Symbole de l'actif (ex: 'BTC-USD', '^GSPC').
@@ -56,15 +89,9 @@ class MultiAssetDownloader:
         print(f"[INFO] Downloading {ticker}...")
 
         try:
-            df = yf.download(
-                ticker,
-                start=start_date,
-                interval='1h',
-                progress=False,
-                auto_adjust=True
-            )
+            df = self._download_with_retry(ticker, start_date)
         except Exception as e:
-            print(f"[ERROR] Failed to download {ticker}: {e}")
+            print(f"[ERROR] Failed to download {ticker} after 3 retries: {e}")
             return pd.DataFrame()
 
         if df.empty:
@@ -309,9 +336,15 @@ class MultiAssetDownloader:
 
         return result
 
-    def download_multi_asset(self) -> pd.DataFrame:
+    def download_multi_asset(self, use_synthetic_funding: bool = False) -> pd.DataFrame:
         """
         Pipeline complet: Download -> Synchronize -> Add Funding -> Clean -> Save.
+
+        Args:
+            use_synthetic_funding: If True, generate synthetic funding rate via O-U process.
+                                   Default is False (disabled) because synthetic funding
+                                   can cause the agent to learn spurious correlations.
+                                   See audit DATA_PIPELINE_AUDIT_REPORT.md P1.2.
 
         Returns:
             DataFrame multi-actifs synchronisé et nettoyé.
@@ -340,15 +373,21 @@ class MultiAssetDownloader:
         print("\n[PHASE 3] Synchronizing on Master Index (BTC-USD)...")
         df = self._synchronize_dataframes(crypto_dfs, macro_dfs)
 
-        # 4. Générer le Funding Rate synthétique
-        print("\n[PHASE 4] Generating synthetic Funding Rate (Ornstein-Uhlenbeck)...")
-        btc_close_col = 'BTC_Close'
-        if btc_close_col in df.columns:
-            funding_rate = self._generate_synthetic_funding(df[btc_close_col])
-            df['Funding_Rate'] = funding_rate
-            print(f"[SUCCESS] Funding Rate generated: mean={funding_rate.mean():.6f}, std={funding_rate.std():.6f}")
+        # 4. Générer le Funding Rate synthétique (DISABLED BY DEFAULT - See audit P1.2)
+        if use_synthetic_funding:
+            print("\n[PHASE 4] Generating synthetic Funding Rate (Ornstein-Uhlenbeck)...")
+            print("  [WARNING] Synthetic funding can cause spurious correlations!")
+            btc_close_col = 'BTC_Close'
+            if btc_close_col in df.columns:
+                funding_rate = self._generate_synthetic_funding(df[btc_close_col])
+                df['Funding_Rate'] = funding_rate
+                print(f"  [SUCCESS] Funding Rate generated: mean={funding_rate.mean():.6f}, std={funding_rate.std():.6f}")
+            else:
+                print("  [WARNING] BTC_Close not found, skipping Funding Rate generation")
         else:
-            print("[WARNING] BTC_Close not found, skipping Funding Rate generation")
+            print("\n[PHASE 4] Synthetic Funding Rate DISABLED (use_synthetic_funding=False)")
+            print("  [INFO] To enable, set use_synthetic_funding=True (not recommended)")
+            print("  [INFO] Better: use real funding rates from Binance API if available")
 
         # 5. Nettoyer les NaN (uniquement au début à cause du lag ffill)
         initial_rows = len(df)

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-training.py - Training configurations for TQC agent and hyperparameter tuning.
+training.py - Training configurations for TQC agent.
 
 Centralizes all training-related settings for consistency across the codebase.
 """
@@ -16,11 +16,7 @@ from typing import Optional, Union, List, Dict, Callable
 
 @dataclass
 class TQCTrainingConfig:
-    """
-    Complete configuration for TQC agent training.
-
-    Inherits base settings and adds TQC-specific parameters.
-    """
+    """Complete configuration for TQC agent training."""
 
     # --- Paths ---
     data_path: str = "data/processed_data.parquet"
@@ -40,8 +36,7 @@ class TQCTrainingConfig:
 
     # Reward function (x100 SCALE applied in env.py)
     reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
-    # TODO: Monitor for risk paralysis (0 trades). Decrease to 2.0 if needed.
-    downside_coef: float = 1.0
+    downside_coef: float = 1.0    # Asymmetric penalty for losses (1.0 = symmetric)
     upside_coef: float = 0.0
     action_discretization: float = 0.1
 
@@ -54,11 +49,17 @@ class TQCTrainingConfig:
     observation_noise: float = 0.01  # 1% Gaussian noise on market observations
 
     # --- Dropout Regularization (DroQ/STAC style) ---
-    # See docs/DROPOUT_TQC_DESIGN.md for details
+    # See docs/design/DROPOUT_TQC_DESIGN.md for details
     use_dropout_policy: bool = True   # Use TQCDropoutPolicy instead of standard
     critic_dropout: float = 0.01      # DroQ recommends 0.01-0.1 (conservative)
     actor_dropout: float = 0.0        # Phase 1: critics only (0.005 for Phase 2)
     use_layer_norm: bool = True       # CRITICAL for stability with dropout
+    
+    # --- Spectral Normalization (Stability) ---
+    # See audit: Spectral norm crucial for Critic (Lipschitz constraint),
+    # more debatable for Actor (may constrain policy too much)
+    use_spectral_norm_critic: bool = False  # Default False for reproducibility
+    use_spectral_norm_actor: bool = False    # Default False (conservative)
 
     # --- Foundation Model ---
     d_model: int = 256  # Increased capacity for complex patterns
@@ -88,11 +89,11 @@ class TQCTrainingConfig:
     sde_sample_freq: int = -1  # -1 = resample once per episode
     use_sde_at_warmup: bool = True
 
-    # Actor Noise (alternative to gSDE when use_sde=False)
+    # Actor Noise (fallback when use_sde=False, ignored otherwise)
     # OrnsteinUhlenbeck noise for temporally correlated exploration
-    use_action_noise: bool = True   # Enable OU noise when use_sde=False
-    action_noise_sigma: float = 0.1  # Noise standard deviation (0.05-0.3)
-    action_noise_theta: float = 0.15  # Mean reversion rate (higher = less correlated)
+    use_action_noise: bool = True    # Enable OU noise (only active when use_sde=False)
+    action_noise_sigma: float = 0.1  # Noise std dev (0.05-0.3)
+    action_noise_theta: float = 0.15 # Mean reversion rate (higher = less correlated)
 
     # --- Callbacks ---
     eval_freq: int = 5_000
@@ -130,48 +131,26 @@ class TQCTrainingConfig:
     n_envs: Optional[int] = None  # Auto-detect from CPU cores (HardwareManager)
                                   # Set to 1 to disable (use DummyVecEnv)
 
+    # --- Ensemble RL (Design Doc 2026-01-22) ---
+    # Reference: docs/design/ENSEMBLE_RL_DESIGN.md
+    use_ensemble: bool = False
+    ensemble_n_members: int = 3
+    ensemble_seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
+    ensemble_aggregation: str = 'confidence'  # 'mean', 'median', 'confidence', 'conservative', 'pessimistic_bound'
+    ensemble_parallel: bool = True  # Train on multiple GPUs
+    ensemble_parallel_gpus: List[int] = field(default_factory=lambda: [0, 1])
 
-# =============================================================================
-# Hyperparameter Tuning Configuration
-# =============================================================================
+    # Seed for single-model training (used by ensemble trainer per member)
+    seed: int = 42
 
-@dataclass
-class TuningConfig:
-    """Configuration for Optuna hyperparameter tuning."""
-
-    # --- Paths ---
-    data_path: str = "data/processed_data.parquet"
-    encoder_path: str = "weights/pretrained_encoder.pth"
-    output_dir: str = "results/"
-    study_db: str = "sqlite:///optuna_study.db"
-
-    # --- Environment ---
-    window_size: int = 64
-    commission: float = 0.0006
-    train_ratio: float = 0.8
-    episode_length: int = 2048
-
-    # --- Foundation Model ---
-    d_model: int = 128
-    n_heads: int = 4
-    n_layers: int = 2
-    freeze_encoder: bool = True
-
-    # --- Fixed TQC Parameters ---
-    buffer_size: int = 100_000
-    top_quantiles_to_drop: int = 2
-    n_critics: int = 2
-    n_quantiles: int = 25
-    net_arch: List[int] = field(default_factory=lambda: [256, 256])
-    use_sde: bool = True
-    sde_sample_freq: int = -1
-    use_sde_at_warmup: bool = True
-
-    # --- Tuning Settings ---
-    trial_timesteps: int = 60_000
-    n_trials: int = 50
-    eval_freq: int = 5_000
-    n_eval_episodes: int = 1
+    def __post_init__(self):
+        """Validate configuration consistency."""
+        # Ensemble seeds validation
+        if self.use_ensemble and len(self.ensemble_seeds) < self.ensemble_n_members:
+            raise ValueError(
+                f"ensemble_seeds ({len(self.ensemble_seeds)}) must have at least "
+                f"ensemble_n_members ({self.ensemble_n_members}) values"
+            )
 
 
 # =============================================================================
@@ -212,6 +191,48 @@ class FoundationTrainingConfig:
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+# =============================================================================
+# WFO-Specific Training Configuration
+# =============================================================================
+
+@dataclass
+class WFOTrainingConfig(TQCTrainingConfig):
+    """
+    WFO-specific training configuration with optimized hyperparameters.
+    
+    Inherits from TQCTrainingConfig and overrides values for Walk-Forward Optimization:
+    - Slower learning (LR 1e-4) for better generalization OOS
+    - Aggressive regularization (dropout 0.1) to prevent overfitting on short windows
+    - Boosted exploration (ent_coef auto_0.5) for diverse policy discovery
+    - OverfittingGuard enabled with permissive thresholds for long WFO runs
+    
+    Rationale documented in: docs/design/WFO_CONFIG_RATIONALE.md
+    """
+    
+    # --- TQC Hyperparameters (WFO-optimized) ---
+    learning_rate: float = 1e-4           # Slow & stable (vs 3e-4 default)
+    buffer_size: int = 2_500_000          # 2.5M replay buffer
+    n_envs: int = 1024                    # GPU-optimized (power of 2)
+    batch_size: int = 512                 # Smaller batch for more updates
+    ent_coef: Union[str, float] = "auto_0.5"  # Boosted exploration
+    
+    # --- Regularization (aggressive for OOS generalization) ---
+    critic_dropout: float = 0.1           # 10% dropout (DroQ max)
+    
+    # --- Overfitting Guard (enabled for WFO) ---
+    use_overfitting_guard: bool = True
+    guard_nav_threshold: float = 10.0     # 10x (permissive for long WFO)
+    guard_patience: int = 5               # Increased patience
+    guard_check_freq: int = 25_000        # ~6 weeks of data
+    guard_reward_variance: float = 1e-5   # Lower threshold
+    
+    # --- WFO-specific timesteps ---
+    total_timesteps: int = 30_000_000     # 30M (vs 90M default)
+    
+    # --- Evaluation commission (lower for realistic backtesting) ---
+    eval_commission: float = 0.0004       # 0.04% for test evaluation
+
 
 def linear_schedule(initial_value: float, floor_ratio: float = 0.1) -> Callable[[float], float]:
     """

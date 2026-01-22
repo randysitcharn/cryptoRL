@@ -27,7 +27,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,11 +39,18 @@ sys.path.insert(0, ROOT_DIR)
 
 from src.data_engineering.features import FeatureEngineer
 from src.data_engineering.manager import RegimeDetector
+from src.config import WFOTrainingConfig
 
 
 # =============================================================================
 # Configuration
 # =============================================================================
+
+# MORL: w_cost values for Pareto front evaluation (Audit 2026-01-22)
+# 5 points provide good resolution: scalping -> B&H continuum
+EVAL_W_COST_VALUES = [0.0, 0.25, 0.5, 0.75, 1.0]
+DEFAULT_EVAL_W_COST = 0.5  # Balanced mode for standard evaluation
+
 
 @dataclass
 class WFOConfig:
@@ -68,29 +75,18 @@ class WFOConfig:
     hours_per_month: int = 720   # 30 days * 24 hours
     window_size: int = 64        # Observation window for transformer encoder
 
+    # Purge & Embargo (Leak Prevention) - See audit P0.2
+    purge_window: int = 720      # Gap between train and eval/test (>= max indicator window)
+    embargo_window: int = 24     # Gap after test before next train (label correlation decay)
+
     # Training Parameters
     mae_epochs: int = 90
-    tqc_timesteps: int = 30_000_000  # 30M steps (MORL: réduit pour convergence stable)
-
-    # TQC Hyperparameters
-    learning_rate: float = 1e-4      # Réduit (était 3e-4) - Slow Down & Explore
-    buffer_size: int = 2_500_000  # 2.5M replay buffer
-    n_envs: int = 1024  # GPU-optimized (power of 2 for BatchCryptoEnv)
-    batch_size: int = 512  # Smaller batch for more frequent updates
-    gradient_steps: int = 1  # GS=1 with 1024 envs for max diversity
-    gamma: float = 0.95    # Shorter horizon for faster learning
-    ent_coef: Union[str, float] = "auto_0.5"  # Boost exploration (était "auto")
-    churn_coef: float = 0.5    # Max target après curriculum (réduit)
-    smooth_coef: float = 1e-5  # Très bas (curriculum monte à 0.00005 max)
-
-    # Regularization (anti-overfitting)
-    observation_noise: float = 0.01  # 1% Gaussian noise on market observations
-    critic_dropout: float = 0.1      # 10% dropout (DroQ max) - Slow Down & Explore
-
-    # Volatility Scaling (Target Volatility)
-    target_volatility: float = 0.05  # 5% target vol
-    vol_window: int = 24  # 24h rolling window
-    max_leverage: float = 2.0  # Conservative max scaling
+    
+    # === TQC Training Configuration (centralized in WFOTrainingConfig) ===
+    # All TQC hyperparameters are now in src/config/training.py:WFOTrainingConfig
+    # This ensures single source of truth and eliminates config divergence.
+    # See docs/design/WFO_CONFIG_RATIONALE.md for parameter rationale.
+    training_config: WFOTrainingConfig = field(default_factory=WFOTrainingConfig)
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
@@ -112,13 +108,8 @@ class WFOConfig:
         'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
     ])
 
-    # === Overfitting Guard (Protection intra-train) ===
-    use_overfitting_guard: bool = True
-    guard_nav_threshold: float = 10.0       # 10x (plus permissif pour WFO long)
-    guard_patience: int = 5                 # Patience accrue en WFO
-    guard_check_freq: int = 25_000          # ~6 semaines de données
-    guard_action_saturation: float = 0.95   # 95% saturation = policy collapse
-    guard_reward_variance: float = 1e-5     # Seuil minimal de variance
+    # === Overfitting Guard parameters are now in WFOTrainingConfig ===
+    # Access via: self.training_config.use_overfitting_guard, etc.
 
     # === Fail-over Strategy (Gestion des échecs) ===
     use_checkpoint_on_failure: bool = True  # Tenter recovery via checkpoint
@@ -129,6 +120,14 @@ class WFOConfig:
     use_warm_start: bool = False            # MORL: Cold start par défaut (architecture change)
     pretrained_model_path: Optional[str] = None  # Modèle de départ pour Seg 0
     cleanup_failed_checkpoints: bool = True # Supprimer checkpoints des segments FAILED
+
+    # === Ensemble RL (Design Doc 2026-01-22) ===
+    # Reference: docs/design/ENSEMBLE_RL_DESIGN.md
+    use_ensemble: bool = False
+    ensemble_n_members: int = 3
+    ensemble_seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
+    ensemble_aggregation: str = 'confidence'  # 'mean', 'median', 'confidence', 'conservative', 'pessimistic_bound'
+    ensemble_parallel: bool = True  # Train on multiple GPUs
 
     @property
     def train_rows(self) -> int:
@@ -225,21 +224,33 @@ class WFOPipeline:
 
     def calculate_segments(self, total_rows: int) -> List[Dict[str, int]]:
         """
-        Calculate segment boundaries for rolling WFO.
+        Calculate segment boundaries for rolling WFO with purge and embargo windows.
 
-        Segment structure:
-            [train_start ... train_end] [eval_start ... eval_end] [test_start ... test_end]
-            |<------- train_months ---->|<-- eval_months -->|<----- test_months ----->|
+        Segment structure (Leak-Free):
+            [train] [PURGE] [eval] [PURGE] [test] [EMBARGO]
+            |<-train_months->|      |<-eval->|      |<-test->|
 
-        The eval window is the last month(s) of the training period, used for
-        in-train evaluation (EvalCallback) to detect overfitting early.
+        - PURGE (720h): Gap between train→eval and eval→test to prevent indicator leakage
+        - EMBARGO (24h): Gap after test before next segment's train (label correlation decay)
+
+        See audit DATA_PIPELINE_AUDIT_REPORT.md P0.2 for details.
 
         Returns:
             List of dicts with train_start, train_end, eval_start, eval_end, test_start, test_end
         """
         segments = []
-        # Total segment size: train + eval + test
-        segment_size = self.config.train_rows + self.config.eval_rows + self.config.test_rows
+        purge = self.config.purge_window
+        embargo = self.config.embargo_window
+
+        # Total segment size: train + purge + eval + purge + test + embargo
+        segment_size = (
+            self.config.train_rows +
+            purge +  # Purge before eval
+            self.config.eval_rows +
+            purge +  # Purge before test
+            self.config.test_rows +
+            embargo  # Embargo after test
+        )
 
         start = 0
         segment_id = 0
@@ -247,10 +258,13 @@ class WFOPipeline:
         while start + segment_size <= total_rows:
             train_start = start
             train_end = start + self.config.train_rows
-            eval_start = train_end
+            # Purge gap after train
+            eval_start = train_end + purge
             eval_end = eval_start + self.config.eval_rows
-            test_start = eval_end
+            # Purge gap after eval
+            test_start = eval_end + purge
             test_end = test_start + self.config.test_rows
+            # Embargo gap after test (accounted for in step)
 
             segments.append({
                 'id': segment_id,
@@ -260,11 +274,15 @@ class WFOPipeline:
                 'eval_end': eval_end,
                 'test_start': test_start,
                 'test_end': test_end,
+                'purge_window': purge,
+                'embargo_window': embargo,
             })
 
+            # Step includes embargo from previous segment
             start += self.config.step_rows
             segment_id += 1
 
+        print(f"[WFO] Calculated {len(segments)} segments with purge={purge}h, embargo={embargo}h")
         return segments
 
     def preprocess_segment(
@@ -564,38 +582,24 @@ class WFOPipeline:
 
         # Import here to avoid circular imports
         import torch
-        from src.training.train_agent import train, TrainingConfig
+        from src.training.train_agent import train
+        from dataclasses import replace
 
-        # Configure TQC training
-        config = TrainingConfig()
-        config.data_path = train_path
-        config.encoder_path = encoder_path
-        config.total_timesteps = self.config.tqc_timesteps
-        config.learning_rate = self.config.learning_rate
-        config.buffer_size = self.config.buffer_size  # 2.5M replay buffer
-        config.gradient_steps = self.config.gradient_steps  # GS=1 for max diversity
-        config.gamma = self.config.gamma
-        config.ent_coef = self.config.ent_coef
-        config.churn_coef = self.config.churn_coef
-        config.smooth_coef = self.config.smooth_coef
-        config.observation_noise = self.config.observation_noise  # Anti-overfitting
-        config.critic_dropout = self.config.critic_dropout  # Régularisation renforcée
-        config.target_volatility = self.config.target_volatility
-        config.vol_window = self.config.vol_window
-        config.max_leverage = self.config.max_leverage
-
-        # 3-Phase Curriculum: Discovery → Discipline → Refinement (Gemini 2026-01-13)
-        config.use_curriculum = True
-
-        # === Overfitting Guard V2 (WFO mode) ===
-        if self.config.use_overfitting_guard:
-            config.use_overfitting_guard = True
-            config.guard_nav_threshold = self.config.guard_nav_threshold
-            config.guard_patience = self.config.guard_patience
-            config.guard_check_freq = self.config.guard_check_freq
-            config.guard_action_saturation = self.config.guard_action_saturation
-            config.guard_reward_variance = self.config.guard_reward_variance
-            print(f"  [Guard] OverfittingGuardV2 enabled (NAV>{self.config.guard_nav_threshold}x, patience={self.config.guard_patience})")
+        # Use WFOTrainingConfig from centralized config (no hardcodes!)
+        # This ensures single source of truth for all TQC hyperparameters.
+        tc = self.config.training_config  # WFOTrainingConfig instance
+        
+        # Create a copy with segment-specific paths
+        config = replace(
+            tc,
+            data_path=train_path,
+            encoder_path=encoder_path,
+            use_curriculum=True,  # 3-Phase Curriculum enabled
+        )
+        
+        # Log overfitting guard status
+        if config.use_overfitting_guard:
+            print(f"  [Guard] OverfittingGuardV2 enabled (NAV>{config.guard_nav_threshold}x, patience={config.guard_patience})")
 
         # Set segment-specific paths
         weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
@@ -620,8 +624,8 @@ class WFOPipeline:
         # Train - now returns (model, train_metrics)
         # Pass n_envs and batch_size overrides for GPU-optimized parallelism
         hw_overrides = {
-            'n_envs': self.config.n_envs,
-            'batch_size': self.config.batch_size
+            'n_envs': config.n_envs,
+            'batch_size': config.batch_size
         } if use_batch_env else None
 
         # Resume logic: Priority order:
@@ -670,6 +674,318 @@ class WFOPipeline:
             gc.collect()
 
         return config.save_path, train_metrics
+
+    def train_tqc_ensemble(
+        self,
+        train_path: str,
+        encoder_path: str,
+        segment_id: int,
+        eval_path: Optional[str] = None,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        """
+        Train TQC ensemble for a segment.
+
+        Trains multiple TQC models with different seeds for ensemble inference.
+        Supports both sequential (single GPU) and parallel (multi-GPU) training.
+
+        Args:
+            train_path: Path to training data.
+            encoder_path: Path to encoder weights.
+            segment_id: Segment identifier.
+            eval_path: Path to eval data (optional).
+
+        Returns:
+            Tuple of (model_paths, aggregated_metrics).
+        """
+        import copy
+        import torch
+        from src.training.train_agent import train
+        from src.evaluation.ensemble import EnsembleConfig, EnsembleTrainer
+        from dataclasses import replace
+
+        print(f"\n[Segment {segment_id}] Training TQC Ensemble...")
+        print(f"  Members: {self.config.ensemble_n_members}")
+        print(f"  Seeds: {self.config.ensemble_seeds[:self.config.ensemble_n_members]}")
+        print(f"  Parallel: {self.config.ensemble_parallel}")
+        print(f"  Aggregation: {self.config.ensemble_aggregation}")
+
+        # Use WFOTrainingConfig from centralized config (no hardcodes!)
+        tc = self.config.training_config
+        base_config = replace(
+            tc,
+            data_path=train_path,
+            encoder_path=encoder_path,
+            use_curriculum=True,
+            eval_data_path=eval_path if eval_path and os.path.exists(eval_path) else None,
+        )
+
+        # Ensemble config
+        ensemble_config = EnsembleConfig(
+            n_members=self.config.ensemble_n_members,
+            seeds=self.config.ensemble_seeds[:self.config.ensemble_n_members],
+            aggregation=self.config.ensemble_aggregation,
+            # Détection automatique des GPUs disponibles
+            parallel_gpus=list(range(torch.cuda.device_count())) if torch.cuda.is_available() else [0],
+            use_diverse_hyperparams=True,
+        )
+
+        # Output directory
+        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+        ensemble_dir = os.path.join(weights_dir, "ensemble")
+        os.makedirs(ensemble_dir, exist_ok=True)
+
+        # Set base paths for trainer
+        base_config.tensorboard_log = f"logs/wfo/segment_{segment_id}/"
+        os.makedirs(base_config.tensorboard_log, exist_ok=True)
+
+        # Create trainer
+        trainer = EnsembleTrainer(
+            base_config=base_config,
+            ensemble_config=ensemble_config,
+            verbose=1,
+        )
+
+        # Train
+        try:
+            if self.config.ensemble_parallel:
+                model_paths = trainer.train_parallel(ensemble_dir)
+            else:
+                model_paths = trainer.train_sequential(ensemble_dir)
+        except Exception as e:
+            print(f"\n[CRITICAL] Ensemble training failed: {e}")
+            raise e
+
+        # Load aggregated metrics
+        metrics_path = os.path.join(ensemble_dir, "ensemble_summary.json")
+        if os.path.exists(metrics_path):
+            with open(metrics_path, 'r') as f:
+                aggregated_metrics = json.load(f)
+        else:
+            aggregated_metrics = {'n_members': len(model_paths)}
+
+        # Add ensemble-specific info
+        aggregated_metrics['segment_status'] = 'SUCCESS'
+        aggregated_metrics['guard_early_stop'] = False
+        aggregated_metrics['completion_ratio'] = 1.0
+
+        # Create symlink for backward compatibility (first member as "best")
+        if model_paths:
+            best_model = model_paths[0]
+            tqc_symlink = os.path.join(weights_dir, "tqc.zip")
+            if os.path.exists(tqc_symlink):
+                os.remove(tqc_symlink)
+            # On Windows, use copy instead of symlink
+            if os.name == 'nt':
+                import shutil
+                shutil.copy2(best_model, tqc_symlink)
+            else:
+                os.symlink(best_model, tqc_symlink)
+
+        print(f"  Ensemble trained: {len(model_paths)} models")
+        print(f"  Models saved to: {ensemble_dir}")
+
+        # Cleanup
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        return model_paths, aggregated_metrics
+
+    def evaluate_ensemble_segment(
+        self,
+        test_path: str,
+        encoder_path: str,
+        ensemble_dir: str,
+        segment_id: int,
+        context_rows: int = 0,
+        train_metrics: Optional[Dict] = None,
+        train_path: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], np.ndarray]:
+        """
+        Evaluate ensemble on test data.
+
+        Compares:
+        1. Ensemble with configured aggregation
+
+        Args:
+            test_path: Path to test data parquet.
+            encoder_path: Path to encoder weights.
+            ensemble_dir: Directory containing ensemble models.
+            segment_id: Segment identifier.
+            context_rows: Number of warmup rows to skip.
+            train_metrics: Optional training metrics.
+            train_path: Path to train data for baseline_vol.
+
+        Returns:
+            Tuple of (metrics dict, navs array).
+        """
+        print(f"\n[Segment {segment_id}] Evaluating Ensemble (skipping {context_rows} warmup rows)...")
+
+        import torch
+        from src.training.batch_env import BatchCryptoEnv
+        from src.evaluation.ensemble import load_ensemble
+
+        # Calculate baseline_vol from TRAIN data
+        if train_path and os.path.exists(train_path):
+            train_df = pd.read_parquet(train_path)
+            baseline_vol = train_df['BTC_Close'].pct_change().std()
+        else:
+            baseline_vol = 0.01
+
+        # Load ensemble
+        ensemble = load_ensemble(ensemble_dir, device='cuda', verbose=1)
+
+        # Calculate episode length from test data
+        test_df = pd.read_parquet(test_path)
+        test_episode_length = len(test_df) - self.config.window_size - 1
+
+        # Create test env
+        env = BatchCryptoEnv(
+            parquet_path=test_path,
+            n_envs=1,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            window_size=self.config.window_size,
+            episode_length=test_episode_length,
+            commission=self.config.training_config.eval_commission,
+            slippage=0.0001,
+            target_volatility=self.config.training_config.target_volatility,
+            vol_window=self.config.training_config.vol_window,
+            max_leverage=self.config.training_config.max_leverage,
+            price_column='BTC_Close',
+            random_start=False,
+        )
+        
+        # MORL: Fix w_cost for evaluation (Audit 2026-01-22)
+        env.set_eval_w_cost(DEFAULT_EVAL_W_COST)
+
+        # Run evaluation
+        obs, info = env.gym_reset()
+        done = False
+        rewards = []
+        navs = []
+        ensemble_metrics_history = []
+
+        while not done:
+            # Use predict_with_safety for OOD detection
+            action, ensemble_info = ensemble.predict_with_safety(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.gym_step(action)
+            done = terminated or truncated
+
+            rewards.append(reward)
+            navs.append(info.get('nav', 10000.0))
+            ensemble_metrics_history.append({
+                'std': ensemble_info.get('ensemble_std', 0.0),
+                'agreement': ensemble_info.get('ensemble_agreement', 1.0),
+                'mode': ensemble_info.get('mode', 'NORMAL'),
+                'ood_score': ensemble_info.get('ood_score', 0.0),
+            })
+
+        ensemble.close()
+        env.close()
+
+        # Calculate metrics - SKIP context_rows
+        all_rewards = np.array(rewards)
+        all_navs = np.array(navs) if navs else np.array([10000])
+
+        if len(all_rewards) > context_rows:
+            rewards_arr = all_rewards[context_rows:]
+            navs_arr = all_navs[context_rows:]
+        else:
+            rewards_arr = all_rewards
+            navs_arr = all_navs
+
+        # Sharpe
+        if len(rewards_arr) > 1 and rewards_arr.std() > 0:
+            sharpe = (rewards_arr.mean() / rewards_arr.std()) * np.sqrt(8760)
+        else:
+            sharpe = 0.0
+
+        # PnL
+        pnl = navs_arr[-1] - navs_arr[0] if len(navs_arr) > 1 else 0
+        pnl_pct = (pnl / navs_arr[0]) * 100 if navs_arr[0] > 0 else 0
+
+        # Max Drawdown
+        if len(navs_arr) > 1:
+            peak = np.maximum.accumulate(navs_arr)
+            drawdown = (peak - navs_arr) / peak
+            max_drawdown = drawdown.max() * 100
+        else:
+            max_drawdown = 0.0
+
+        # Ensemble-specific metrics
+        avg_agreement = np.mean([m['agreement'] for m in ensemble_metrics_history])
+        avg_std = np.mean([m['std'] for m in ensemble_metrics_history])
+        n_ood_warnings = sum(1 for m in ensemble_metrics_history if m['mode'] == 'OOD_WARNING')
+        n_ood_fallbacks = sum(1 for m in ensemble_metrics_history if m['mode'] == 'OOD_FALLBACK')
+
+        # B&H benchmark
+        prices = test_df['BTC_Close'].values
+        price_start_idx = self.config.window_size + context_rows
+        price_end_idx = price_start_idx + len(navs_arr)
+        if price_end_idx > len(prices):
+            price_end_idx = len(prices)
+
+        bnh_prices = prices[price_start_idx:price_end_idx]
+        if len(bnh_prices) > 1:
+            bnh_return = (bnh_prices[-1] - bnh_prices[0]) / bnh_prices[0]
+            bnh_pct = bnh_return * 100
+            bnh_navs = (bnh_prices / bnh_prices[0]) * 10000
+            alpha = pnl_pct - bnh_pct
+        else:
+            bnh_pct = 0.0
+            bnh_navs = np.array([10000])
+            alpha = pnl_pct
+
+        metrics = {
+            'segment_id': segment_id,
+            'model_type': 'ensemble',
+            'aggregation': self.config.ensemble_aggregation,
+            'n_members': self.config.ensemble_n_members,
+            'sharpe': sharpe,
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'max_drawdown': max_drawdown,
+            'final_nav': navs_arr[-1] if len(navs_arr) > 0 else 10000,
+            'test_rows': len(rewards_arr),
+            'ensemble_avg_agreement': avg_agreement,
+            'ensemble_avg_std': avg_std,
+            'n_ood_warnings': n_ood_warnings,
+            'n_ood_fallbacks': n_ood_fallbacks,
+            'bnh_pct': bnh_pct,
+            'alpha': alpha,
+            'bnh_navs': bnh_navs,
+        }
+
+        if train_metrics:
+            metrics['train_action_sat'] = train_metrics.get('avg_action_saturation', 0.0)
+            metrics['train_entropy'] = train_metrics.get('avg_entropy', 0.0)
+
+        print(f"  Results (Ensemble - {self.config.ensemble_aggregation}):")
+        print(f"    Sharpe: {sharpe:.2f}")
+        print(f"    PnL: {pnl_pct:+.2f}%")
+        print(f"    Max DD: {max_drawdown:.2f}%")
+        print(f"    Alpha vs B&H: {alpha:+.2f}%")
+        print(f"    Avg Agreement: {avg_agreement:.2%}")
+        print(f"    Avg Action Std: {avg_std:.4f}")
+        print(f"    OOD Warnings: {n_ood_warnings}, Fallbacks: {n_ood_fallbacks}")
+
+        # TensorBoard logging
+        from torch.utils.tensorboard import SummaryWriter
+        eval_log_dir = f"logs/wfo/eval/segment_{segment_id}_ensemble"
+        os.makedirs(eval_log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=eval_log_dir)
+
+        writer.add_scalar("eval_ensemble/sharpe", sharpe, segment_id)
+        writer.add_scalar("eval_ensemble/pnl_pct", pnl_pct, segment_id)
+        writer.add_scalar("eval_ensemble/max_drawdown", max_drawdown, segment_id)
+        writer.add_scalar("eval_ensemble/avg_agreement", avg_agreement, segment_id)
+        writer.add_scalar("eval_ensemble/avg_std", avg_std, segment_id)
+        writer.add_scalar("eval_ensemble/alpha", alpha, segment_id)
+
+        writer.close()
+
+        torch.cuda.empty_cache()
+
+        return metrics, navs_arr
 
     def evaluate_segment(
         self,
@@ -725,14 +1041,18 @@ class WFOPipeline:
             device='cuda' if torch.cuda.is_available() else 'cpu',
             window_size=self.config.window_size,
             episode_length=test_episode_length,  # Full episode
-            commission=0.0004,  # churn_analysis.yaml
+            commission=self.config.training_config.eval_commission,
             slippage=0.0001,
-            target_volatility=self.config.target_volatility,
-            vol_window=self.config.vol_window,
-            max_leverage=self.config.max_leverage,  # MORL: Cohérence train/eval (fix Distributional Shift)
+            target_volatility=self.config.training_config.target_volatility,
+            vol_window=self.config.training_config.vol_window,
+            max_leverage=self.config.training_config.max_leverage,  # MORL: Cohérence train/eval (fix Distributional Shift)
             price_column='BTC_Close',
             random_start=False,  # Sequential start for evaluation
         )
+        
+        # MORL: Fix w_cost for evaluation (Audit 2026-01-22)
+        # Default: 0.5 (balanced mode). For Pareto front, iterate over EVAL_W_COST_VALUES
+        env.set_eval_w_cost(DEFAULT_EVAL_W_COST)
 
         # Circuit Breaker state (DISABLED - too aggressive)
         cb_vol_window = 24
@@ -1037,14 +1357,24 @@ class WFOPipeline:
             print(f"[EXEC] Training MAE Foundation Model for Segment {segment_id}...")
             encoder_path = self.train_mae(train_path, segment_id)
 
-        # 5. TQC Training (with Chain of Inheritance support + Eval In-Train)
-        tqc_path, train_metrics = self.train_tqc(
-            train_path, encoder_path, segment_id,
-            use_batch_env=use_batch_env,
-            resume=resume,
-            init_model_path=init_model_path,
-            eval_path=eval_path  # Enable EvalCallback for in-train evaluation
-        )
+        # === 5. TQC Training: Single vs Ensemble Mode ===
+        if self.config.use_ensemble:
+            # === ENSEMBLE MODE ===
+            ensemble_dir = os.path.join(weights_dir, "ensemble")
+            model_paths, train_metrics = self.train_tqc_ensemble(
+                train_path, encoder_path, segment_id,
+                eval_path=eval_path
+            )
+            tqc_path = model_paths[0] if model_paths else None
+        else:
+            # === SINGLE MODEL MODE (existing code) ===
+            tqc_path, train_metrics = self.train_tqc(
+                train_path, encoder_path, segment_id,
+                use_batch_env=use_batch_env,
+                resume=resume,
+                init_model_path=init_model_path,
+                eval_path=eval_path  # Enable EvalCallback for in-train evaluation
+            )
 
         # === 5.5 Guard Fail-over Logic ===
         guard_triggered = train_metrics.get('guard_early_stop', False)
@@ -1099,53 +1429,106 @@ class WFOPipeline:
 
         # 6. Organize Artifacts (Swap & Archive) - BEFORE evaluation
         # This ensures tqc.zip=Best and tqc_last.zip=Last exist on disk
-        self._organize_artifacts(segment_id)
+        if not self.config.use_ensemble:
+            self._organize_artifacts(segment_id)
 
-        # 7. Double Evaluation: Best Model + Last Model
-        # INTENTIONAL: Evaluate both models to compare performance:
-        # - 'best': Highest eval reward during training (may overfit to train data)
-        # - 'last': Final model state (may be more robust, less overfitted)
-        # This comparison helps identify overfitting and guides hyperparameter tuning.
-        weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
-        models_to_eval = [
-            ('best', os.path.join(weights_dir, "tqc.zip")),
-            ('last', os.path.join(weights_dir, "tqc_last.zip"))
-        ]
+        # === 7. EVALUATION: Single vs Ensemble Mode ===
+        if self.config.use_ensemble:
+            # === ENSEMBLE EVALUATION ===
+            ensemble_dir = os.path.join(weights_dir, "ensemble")
 
-        best_metrics = None
-        for model_type, model_path in models_to_eval:
-            if not os.path.exists(model_path):
-                print(f"  [SKIP] {model_type} model not found: {model_path}")
-                continue
-
-            print(f"\n  [EVAL] Evaluating {model_type.upper()} model: {model_path}")
-
-            # Evaluate
-            metrics, navs = self.evaluate_segment(
-                test_path, encoder_path, model_path, segment_id,
+            # Evaluate ensemble
+            metrics, navs = self.evaluate_ensemble_segment(
+                test_path, encoder_path, ensemble_dir, segment_id,
                 context_rows=context_rows,
                 train_metrics=train_metrics,
                 train_path=train_path
             )
 
-            # Tag results with model type and segment status
-            metrics['model_type'] = model_type
+            # Tag results
             metrics['segment_status'] = train_metrics.get('segment_status', 'SUCCESS')
             metrics['stop_reason'] = train_metrics.get('guard_stop_reason', None)
             metrics['completion_ratio'] = train_metrics.get('completion_ratio', 1.0)
 
-            # Generate diagnostic plots with prefix
+            # Generate diagnostic plots
             plot_path = self.generate_segment_plots(
-                segment_id, navs, metrics, train_metrics, prefix=f"{model_type}_"
+                segment_id, navs, metrics, train_metrics, prefix="ensemble_"
             )
             metrics['plot_path'] = plot_path
 
             # Save results
             self.save_results(metrics)
 
-            # Keep best_metrics for return value and teacher report
-            if model_type == 'best':
-                best_metrics = metrics
+            # Also evaluate single best for comparison
+            single_model_path = os.path.join(weights_dir, "tqc.zip")
+            if os.path.exists(single_model_path):
+                print(f"\n  [COMPARISON] Evaluating single model for comparison...")
+                single_metrics, _ = self.evaluate_segment(
+                    test_path, encoder_path, single_model_path, segment_id,
+                    context_rows=context_rows,
+                    train_metrics={},
+                    train_path=train_path,
+                )
+
+                # Log comparison
+                print(f"\n  [Comparison] Single vs Ensemble:")
+                print(f"    Single Sharpe: {single_metrics['sharpe']:.2f}")
+                print(f"    Ensemble Sharpe: {metrics['sharpe']:.2f}")
+                print(f"    Improvement: {metrics['sharpe'] - single_metrics['sharpe']:+.2f}")
+
+                metrics['single_sharpe'] = single_metrics['sharpe']
+                metrics['single_pnl_pct'] = single_metrics['pnl_pct']
+                metrics['improvement_sharpe'] = metrics['sharpe'] - single_metrics['sharpe']
+
+            best_metrics = metrics
+
+        else:
+            # === SINGLE MODEL EVALUATION (existing code) ===
+            # 7. Double Evaluation: Best Model + Last Model
+            # INTENTIONAL: Evaluate both models to compare performance:
+            # - 'best': Highest eval reward during training (may overfit to train data)
+            # - 'last': Final model state (may be more robust, less overfitted)
+            # This comparison helps identify overfitting and guides hyperparameter tuning.
+            weights_dir = os.path.join(self.config.weights_dir, f"segment_{segment_id}")
+            models_to_eval = [
+                ('best', os.path.join(weights_dir, "tqc.zip")),
+                ('last', os.path.join(weights_dir, "tqc_last.zip"))
+            ]
+
+            best_metrics = None
+            for model_type, model_path in models_to_eval:
+                if not os.path.exists(model_path):
+                    print(f"  [SKIP] {model_type} model not found: {model_path}")
+                    continue
+
+                print(f"\n  [EVAL] Evaluating {model_type.upper()} model: {model_path}")
+
+                # Evaluate
+                metrics, navs = self.evaluate_segment(
+                    test_path, encoder_path, model_path, segment_id,
+                    context_rows=context_rows,
+                    train_metrics=train_metrics,
+                    train_path=train_path
+                )
+
+                # Tag results with model type and segment status
+                metrics['model_type'] = model_type
+                metrics['segment_status'] = train_metrics.get('segment_status', 'SUCCESS')
+                metrics['stop_reason'] = train_metrics.get('guard_stop_reason', None)
+                metrics['completion_ratio'] = train_metrics.get('completion_ratio', 1.0)
+
+                # Generate diagnostic plots with prefix
+                plot_path = self.generate_segment_plots(
+                    segment_id, navs, metrics, train_metrics, prefix=f"{model_type}_"
+                )
+                metrics['plot_path'] = plot_path
+
+                # Save results
+                self.save_results(metrics)
+
+                # Keep best_metrics for return value and teacher report
+                if model_type == 'best':
+                    best_metrics = metrics
 
         # 8. Teacher Report - Hyperparameter Hints (based on best model)
         if best_metrics:
@@ -1388,7 +1771,7 @@ class WFOPipeline:
         churn_ratio = train_metrics.get('avg_churn_ratio', 0.0)
         if churn_ratio > 0.3:
             print(f"  [HIGH CHURN] Trading eating profits ({churn_ratio:.3f})")
-            print(f"    -> Increase churn_coef to penalize position changes")
+            print(f"    -> Increase w_cost (MORL) to penalize position changes")
             issues_found = True
 
         # Check critic loss
@@ -1626,7 +2009,7 @@ class WFOPipeline:
         print(f"  Test:  {self.config.test_months} months ({self.config.test_rows} rows) [OOS Final Evaluation]")
         print(f"  Step:  {self.config.step_months} months ({self.config.step_rows} rows)")
         print(f"  Total train window: {self.config.train_months + self.config.eval_months} months")
-        print(f"  Volatility Scaling: Target={self.config.target_volatility}, Window={self.config.vol_window}")
+        print(f"  Volatility Scaling: Target={self.config.training_config.target_volatility}, Window={self.config.training_config.vol_window}")
         print(f"  GPU Acceleration: {'BatchCryptoEnv' if self.config.use_batch_env else 'SubprocVecEnv (CPU)'}")
 
         # Load raw data
@@ -1923,7 +2306,7 @@ def main():
                         help="Max number of segments to run")
     parser.add_argument("--segment", type=int, default=None,
                         help="Run specific segment only")
-    parser.add_argument("--timesteps", type=int, default=WFOConfig.tqc_timesteps,
+    parser.add_argument("--timesteps", type=int, default=WFOTrainingConfig.total_timesteps,
                         help="TQC training timesteps per segment")
     parser.add_argument("--mae-epochs", type=int, default=WFOConfig.mae_epochs,
                         help="MAE training epochs per segment")
@@ -1947,11 +2330,11 @@ def main():
     # === Overfitting Guard Arguments ===
     parser.add_argument("--no-overfitting-guard", action="store_true",
                         help="Disable OverfittingGuardCallbackV2 (not recommended)")
-    parser.add_argument("--guard-nav-threshold", type=float, default=10.0,
+    parser.add_argument("--guard-nav-threshold", type=float, default=WFOTrainingConfig.guard_nav_threshold,
                         help="NAV multiplier threshold for Guard (default: 10.0)")
-    parser.add_argument("--guard-patience", type=int, default=5,
+    parser.add_argument("--guard-patience", type=int, default=WFOTrainingConfig.guard_patience,
                         help="Consecutive violations before Guard stops (default: 5)")
-    parser.add_argument("--guard-check-freq", type=int, default=25_000,
+    parser.add_argument("--guard-check-freq", type=int, default=WFOTrainingConfig.guard_check_freq,
                         help="Guard check frequency in steps (default: 25000)")
 
     # === Fail-over Strategy Arguments ===
@@ -1966,12 +2349,26 @@ def main():
     parser.add_argument("--pretrained-model", type=str, default=None,
                         help="Path to pretrained model for Segment 0")
 
+    # === Ensemble RL Arguments ===
+    parser.add_argument("--ensemble", action="store_true",
+                        help="Enable ensemble training (default: 3 members)")
+    parser.add_argument("--ensemble-members", type=int, default=3,
+                        help="Number of ensemble members (default: 3)")
+    parser.add_argument("--ensemble-seeds", type=str, default="42,123,456",
+                        help="Comma-separated seeds for ensemble members")
+    parser.add_argument("--ensemble-aggregation", type=str,
+                        choices=['mean', 'median', 'confidence', 'conservative', 'pessimistic_bound'],
+                        default='confidence',
+                        help="Ensemble aggregation method (default: confidence)")
+    parser.add_argument("--no-ensemble-parallel", action="store_true",
+                        help="Disable parallel training (use single GPU)")
+
     args = parser.parse_args()
 
     # Create config
     config = WFOConfig()
     config.raw_data_path = args.raw_data
-    config.tqc_timesteps = args.timesteps
+    config.training_config.total_timesteps = args.timesteps  # Set TQC timesteps
     config.mae_epochs = args.mae_epochs
     config.train_months = args.train_months
     config.eval_months = args.eval_months
@@ -1991,14 +2388,16 @@ def main():
         config.resume = True
 
     # === Overfitting Guard Configuration ===
+    # Parameters are in WFOTrainingConfig (centralized)
+    tc = config.training_config
     if args.no_overfitting_guard:
         print("[WARNING] OverfittingGuardCallbackV2 DISABLED via --no-overfitting-guard")
-        config.use_overfitting_guard = False
+        tc.use_overfitting_guard = False
     else:
-        config.use_overfitting_guard = True
-        config.guard_nav_threshold = args.guard_nav_threshold
-        config.guard_patience = args.guard_patience
-        config.guard_check_freq = args.guard_check_freq
+        tc.use_overfitting_guard = True
+        tc.guard_nav_threshold = args.guard_nav_threshold
+        tc.guard_patience = args.guard_patience
+        tc.guard_check_freq = args.guard_check_freq
 
     # === Fail-over Strategy Configuration ===
     config.fallback_strategy = args.fallback_strategy
@@ -2017,6 +2416,19 @@ def main():
             print(f"[INFO] Pretrained model for Segment 0: {args.pretrained_model}")
         else:
             print(f"[WARNING] Pretrained model not found: {args.pretrained_model}")
+
+    # === Ensemble RL Configuration ===
+    if args.ensemble:
+        config.use_ensemble = True
+        config.ensemble_n_members = args.ensemble_members
+        config.ensemble_seeds = [int(x.strip()) for x in args.ensemble_seeds.split(',')]
+        config.ensemble_aggregation = args.ensemble_aggregation
+        config.ensemble_parallel = not args.no_ensemble_parallel
+
+        print(f"[ENSEMBLE] Enabled with {config.ensemble_n_members} members")
+        print(f"  Seeds: {config.ensemble_seeds[:config.ensemble_n_members]}")
+        print(f"  Aggregation: {config.ensemble_aggregation}")
+        print(f"  Parallel training: {config.ensemble_parallel}")
 
     # Create pipeline
     pipeline = WFOPipeline(config)
