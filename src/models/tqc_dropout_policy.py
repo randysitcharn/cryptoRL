@@ -338,6 +338,8 @@ class TQCDropoutPolicy(TQCPolicy):
         # ====== Spectral Normalization (Stability) ======
         use_spectral_norm_critic: bool = False,  # Default False for reproducibility
         use_spectral_norm_actor: bool = False,    # Default False (conservative)
+        # ====== Exploration Init (FIX for small positions) ======
+        log_std_init: float = -3.0,     # Default SB3 value (-3 gives std≈0.05)
         **kwargs
     ):
         """
@@ -381,6 +383,7 @@ class TQCDropoutPolicy(TQCPolicy):
         self.use_spectral_norm_actor = use_spectral_norm_actor
         self.n_quantiles = n_quantiles
         self.n_critics = n_critics
+        self.log_std_init = log_std_init  # FIX: Store for make_actor
 
         super().__init__(
             observation_space,
@@ -389,6 +392,7 @@ class TQCDropoutPolicy(TQCPolicy):
             net_arch,
             activation_fn,
             use_sde=use_sde,
+            log_std_init=log_std_init,  # FIX: Pass to parent for actor_kwargs
             n_quantiles=n_quantiles,
             n_critics=n_critics,
             **kwargs
