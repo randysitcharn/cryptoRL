@@ -39,6 +39,7 @@ sys.path.insert(0, ROOT_DIR)
 
 from src.data_engineering.features import FeatureEngineer
 from src.data_engineering.manager import RegimeDetector
+from src.data_engineering.splitter import validate_purge_window
 from src.config import WFOTrainingConfig
 
 
@@ -238,6 +239,7 @@ class WFOPipeline:
         Returns:
             List of dicts with train_start, train_end, eval_start, eval_end, test_start, test_end
         """
+        validate_purge_window(self.config.purge_window, raise_error=True)
         segments = []
         purge = self.config.purge_window
         embargo = self.config.embargo_window
@@ -325,23 +327,26 @@ class WFOPipeline:
         df_features = self._df_features_global.loc[start_time:end_time].copy()
         print(f"  Using pre-computed features: {start_time} to {end_time} ({len(df_features)} rows)")
 
-        # 2. Split train/eval/test (take from END to get most recent valid data)
+        # 2. Split train/eval/test by exact segment boundaries (exclude purge rows)
+        # Structure: [train][PURGE][eval][PURGE][test]; purge must not be in any block.
+        # See docs/audit/PURGE_EMBARGO_WFO_TRAIN_EVAL_TEST.md
         train_len = segment['train_end'] - segment['train_start']
         eval_len = segment['eval_end'] - segment['eval_start']
         test_len = segment['test_end'] - segment['test_start']
-        total_needed = train_len + eval_len + test_len
+        purge = segment['purge_window']
+        total_needed = train_len + 2 * purge + eval_len + test_len
 
         if len(df_features) < total_needed:
             print(f"  [WARNING] Not enough data: {len(df_features)} < {total_needed}")
-            # Fallback: split proportionally
-            train_df = df_features.iloc[:train_len].copy()
-            eval_df = df_features.iloc[train_len:train_len + eval_len].copy()
-            test_df = df_features.iloc[train_len + eval_len:].copy()
-        else:
-            # CRITICAL: Take from the END to match fallback behavior
-            train_df = df_features.iloc[-total_needed:-(eval_len + test_len)].copy()
-            eval_df = df_features.iloc[-(eval_len + test_len):-test_len].copy()
-            test_df = df_features.iloc[-test_len:].copy()
+            raise ValueError(
+                f"Segment {segment_id}: df_features has {len(df_features)} rows, "
+                f"need at least {total_needed} (train+2*purge+eval+test). "
+                "Check segment boundaries or feature computation."
+            )
+
+        train_df = df_features.iloc[0:train_len].copy()
+        eval_df = df_features.iloc[train_len + purge : train_len + purge + eval_len].copy()
+        test_df = df_features.iloc[train_len + 2 * purge + eval_len :].copy()
 
         print(f"  Train: {len(train_df)} rows, Eval: {len(eval_df)} rows, Test: {len(test_df)} rows")
 

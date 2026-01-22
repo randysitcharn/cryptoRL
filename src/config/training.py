@@ -29,7 +29,7 @@ class TQCTrainingConfig:
 
     # --- Environment ---
     window_size: int = 64
-    commission: float = 0.0005  # 0.05% - Reduced to encourage trading (was 0.15%)
+    commission: float = 0.0002  # 0.02% - Further reduced to encourage trading (was 0.05%)
     train_ratio: float = 0.8
     episode_length: int = 2048
     eval_episode_length: int = 600  # Safe value < (720 - window_size - 1)
