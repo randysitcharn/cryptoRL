@@ -196,12 +196,13 @@ class TestWFOConfigIntegration:
         
         config = WFOConfig()
         
-        assert config.use_overfitting_guard == True
-        assert config.guard_nav_threshold == 10.0
-        assert config.guard_patience == 5
-        assert config.guard_check_freq == 25_000
-        assert config.guard_action_saturation == 0.95
-        assert config.guard_reward_variance == 1e-5
+        # use_overfitting_guard and guard parameters are in training_config
+        assert config.training_config.use_overfitting_guard == True
+        assert config.training_config.guard_nav_threshold == 10.0
+        assert config.training_config.guard_patience == 5
+        assert config.training_config.guard_check_freq == 25_000
+        assert config.training_config.guard_action_saturation == 0.95
+        assert config.training_config.guard_reward_variance == 1e-5
 
     def test_wfo_config_failover_defaults(self):
         """Verify WFOConfig has correct Fail-over defaults."""
@@ -252,7 +253,14 @@ class TestFallbackStrategy:
             
             metrics = pipeline._run_fallback_strategy(segment, f.name)
             
-            os.unlink(f.name)
+            # Small delay to allow file handle to be released on Windows
+            import time
+            time.sleep(0.1)
+            try:
+                os.unlink(f.name)
+            except PermissionError:
+                # File might still be locked, skip deletion (will be cleaned up by tempfile)
+                pass
         
         assert metrics['sharpe'] == 0.0
         assert metrics['total_return'] == 0.0
@@ -279,7 +287,14 @@ class TestFallbackStrategy:
             
             metrics = pipeline._run_fallback_strategy(segment, f.name)
             
-            os.unlink(f.name)
+            # Small delay to allow file handle to be released on Windows
+            import time
+            time.sleep(0.1)
+            try:
+                os.unlink(f.name)
+            except PermissionError:
+                # File might still be locked, skip deletion (will be cleaned up by tempfile)
+                pass
         
         assert metrics['is_fallback'] == True
         assert metrics['strategy'] == 'BUY_AND_HOLD (fallback)'

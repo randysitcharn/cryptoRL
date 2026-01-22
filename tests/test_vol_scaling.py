@@ -170,8 +170,6 @@ def test_implicit_rebalancing_fees():
     print(f"[PASS] PASS: Trade executed: {env.total_trades} trades total")
     print(f"[PASS] PASS: Fees charged: ${env.total_commission:.2f} total")
 
-    return True
-
 
 def test_no_lookahead_bias():
     """
@@ -230,8 +228,6 @@ def test_no_lookahead_bias():
     print("[PASS] PASS: Current step's return is appended AFTER vol calculation")
     print("[PASS] PASS: No lookahead bias detected")
 
-    return True
-
 
 def test_with_real_env():
     """
@@ -242,17 +238,17 @@ def test_with_real_env():
     print("TEST 3: Integration with Real Environment")
     print("=" * 70)
 
+    import pytest
+
     try:
         from src.training.batch_env import BatchCryptoEnv
     except ImportError as e:
-        print(f"\n[WARN]  SKIP: Could not import BatchCryptoEnv: {e}")
-        return None
+        pytest.skip(f"Could not import BatchCryptoEnv: {e}")
 
     # Check if data exists
     data_path = "data/processed_data.parquet"
     if not os.path.exists(data_path):
-        print(f"\n[WARN]  SKIP: Data file not found: {data_path}")
-        return None
+        pytest.skip(f"Data file not found: {data_path}")
 
     # Detect price column
     df = pd.read_parquet(data_path)
@@ -261,8 +257,7 @@ def test_with_real_env():
     elif 'BTC_Close' in df.columns:
         price_col = 'BTC_Close'
     else:
-        print(f"\n[WARN]  SKIP: No price column found in data")
-        return None
+        pytest.skip("No price column found in data")
 
     # Create env with vol scaling
     env = BatchCryptoEnv(
@@ -319,8 +314,6 @@ def test_with_real_env():
         print(f"\n[PASS] PASS: Trades executed due to vol scaling (not just initial position)")
     else:
         print(f"\n[WARN]  NOTE: Only {info['total_trades']} trade(s) - vol may not have changed much")
-
-    return True
 
 
 def main():

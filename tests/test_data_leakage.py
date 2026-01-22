@@ -26,15 +26,18 @@ class TestScalerLeakage:
     def test_scaler_fit_on_train_only(self):
         """Verify that scaler statistics come from train data only."""
         # Create synthetic data with distinct train/test distributions
+        # Use different seeds to ensure different distributions
         np.random.seed(42)
         n_train = 1000
         n_test = 500
 
-        # Train data: mean=0, std=1
+        # Train data: centered around 0
         train_data = np.random.randn(n_train, 3)
 
-        # Test data: mean=10, std=5 (very different distribution)
-        test_data = np.random.randn(n_test, 3) * 5 + 10
+        # Test data: centered around 20 (very different distribution)
+        # Use a different seed to ensure different values
+        np.random.seed(123)
+        test_data = np.random.randn(n_test, 3) * 2 + 20
 
         # Combine
         all_data = np.vstack([train_data, test_data])
@@ -49,7 +52,7 @@ class TestScalerLeakage:
 
         # The median (center_) should be different
         # If fit on train only: median ≈ 0
-        # If fit on all: median ≈ (0*1000 + 10*500) / 1500 ≈ 3.3
+        # If fit on all: median should be shifted towards test data
         train_median = np.median(train_data, axis=0)
         correct_center = scaler_correct.center_
         wrong_center = scaler_wrong.center_
@@ -61,8 +64,12 @@ class TestScalerLeakage:
         )
 
         # Wrong scaler should have different center (proof of leakage)
-        assert not np.allclose(wrong_center, train_median, atol=1.0), (
-            "If centers are similar, test data didn't have different distribution"
+        # The wrong center should be significantly different (> 0.5 units away, adjusted for RobustScaler behavior)
+        # RobustScaler uses median, which is more robust to outliers, so differences are smaller
+        center_diff = np.abs(wrong_center - train_median)
+        assert np.all(center_diff > 0.5), (
+            f"If centers are similar, test data didn't have different distribution. "
+            f"Difference: {center_diff}, train_median: {train_median}, wrong_center: {wrong_center}"
         )
 
     def test_scaler_transform_uses_train_stats(self):

@@ -2,6 +2,7 @@
 test_splitting.py - Tests for TimeSeriesSplitter.
 
 Verifies chronological splitting with purge windows.
+Audit P0.2: purge_window must be >= MAX_LOOKBACK_WINDOW (720h).
 """
 
 import sys
@@ -11,10 +12,11 @@ import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from src.config.constants import DEFAULT_PURGE_WINDOW
 from src.data_engineering.splitter import TimeSeriesSplitter
 
 # Use parquet file that exists in the project
-DATA_FILE = "data/raw_training_data.parquet"
+DATA_FILE = "data/processed_data.parquet"
 
 
 def load_test_data():
@@ -25,19 +27,20 @@ def load_test_data():
 
 
 def test_split_sizes():
-    """Test: Split sizes are correct accounting for purge."""
+    """Test: Split sizes are correct accounting for purge (P0.2: purge >= 720h)."""
     print("Test 1: Split Sizes...")
 
     df = load_test_data()
     splitter = TimeSeriesSplitter(df)
 
+    purge = DEFAULT_PURGE_WINDOW  # 720h - audit P0.2
     train_df, val_df, test_df = splitter.split_data(
-        train_ratio=0.7, val_ratio=0.15, purge_window=50
+        train_ratio=0.7, val_ratio=0.15, purge_window=purge
     )
 
     # Total should be original minus 2*purge
     total_used = len(train_df) + len(val_df) + len(test_df)
-    expected_loss = 2 * 50  # 2 purge windows
+    expected_loss = 2 * purge
 
     assert total_used == len(df) - expected_loss, \
         f"Expected {len(df) - expected_loss} rows, got {total_used}"

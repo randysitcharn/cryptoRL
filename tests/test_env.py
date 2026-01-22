@@ -197,7 +197,17 @@ def test_batch_mode():
         
         print("SUCCESS: Batch mode works correctly!")
     finally:
-        os.unlink(tmp_file.name)
+        # Close environment to release file handle on Windows
+        if 'env' in locals():
+            env.close()
+        # Small delay to allow file handle to be released on Windows
+        import time
+        time.sleep(0.1)
+        try:
+            os.unlink(tmp_file.name)
+        except PermissionError:
+            # File might still be locked, skip deletion (will be cleaned up by tempfile)
+            pass
 
 
 if __name__ == "__main__":

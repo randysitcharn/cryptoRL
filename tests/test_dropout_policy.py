@@ -272,12 +272,15 @@ class TestSpectralNormalization:
         import torch.nn as nn
         from src.models.tqc_dropout_policy import TQCDropoutPolicy
         from gymnasium.spaces import Box
-        from stable_baselines3.common.schedules import constant_schedule
+        from src.config import linear_schedule
 
         # Create minimal observation and action spaces
         obs_space = Box(low=-1, high=1, shape=(512,), dtype=float)
         action_space = Box(low=-1, high=1, shape=(1,), dtype=float)
-        lr_schedule = constant_schedule(3e-4)
+        # Create a constant schedule function (takes progress as parameter but ignores it)
+        def constant_schedule(_progress: float) -> float:
+            return 3e-4
+        lr_schedule = constant_schedule
 
         # Create policy with spectral norm enabled for critic only
         policy = TQCDropoutPolicy(
@@ -286,28 +289,33 @@ class TestSpectralNormalization:
             lr_schedule=lr_schedule,
             use_spectral_norm_critic=True,
             use_spectral_norm_actor=False,
-            features_dim=512,
         )
         critic = policy.make_critic()
 
-        # Check that Linear layers in critics are wrapped
+        # Check that Linear layers in critics are wrapped (except output layer)
         for critic_net in critic.critics:
-            for layer in critic_net.net:
-                if isinstance(layer, nn.Linear):
-                    # Check if wrapped with spectral_norm (has weight_u for power iteration)
-                    assert hasattr(layer, 'weight_u'), "Spectral norm not applied to critic"
+            # Find all Linear layers
+            linear_layers = [layer for layer in critic_net.net if isinstance(layer, nn.Linear)]
+            # Exclude the last layer (output layer) which should NOT have spectral norm
+            hidden_layers = linear_layers[:-1]
+            # All hidden layers should have spectral norm
+            for layer in hidden_layers:
+                assert hasattr(layer, 'weight_u'), "Spectral norm not applied to critic hidden layer"
 
     def test_spectral_norm_applied_actor(self):
         """Verify spectral normalization is applied to Actor Linear layers when enabled."""
         import torch.nn as nn
         from src.models.tqc_dropout_policy import TQCDropoutPolicy
         from gymnasium.spaces import Box
-        from stable_baselines3.common.schedules import constant_schedule
+        from src.config import linear_schedule
 
         # Create minimal observation and action spaces
         obs_space = Box(low=-1, high=1, shape=(512,), dtype=float)
         action_space = Box(low=-1, high=1, shape=(1,), dtype=float)
-        lr_schedule = constant_schedule(3e-4)
+        # Create a constant schedule function (takes progress as parameter but ignores it)
+        def constant_schedule(_progress: float) -> float:
+            return 3e-4
+        lr_schedule = constant_schedule
 
         # Create policy with spectral norm enabled for actor
         policy = TQCDropoutPolicy(
@@ -316,26 +324,31 @@ class TestSpectralNormalization:
             lr_schedule=lr_schedule,
             use_spectral_norm_critic=False,
             use_spectral_norm_actor=True,
-            features_dim=512,
         )
         actor = policy.make_actor()
 
-        # Check that Linear layers in actor are wrapped
-        for layer in actor.latent_pi:
-            if isinstance(layer, nn.Linear):
-                assert hasattr(layer, 'weight_u'), "Spectral norm not applied to actor"
+        # Check that Linear layers in actor are wrapped (except output layer)
+        linear_layers = [layer for layer in actor.latent_pi if isinstance(layer, nn.Linear)]
+        # Exclude the last layer (output layer) which should NOT have spectral norm
+        hidden_layers = linear_layers[:-1]
+        # All hidden layers should have spectral norm
+        for layer in hidden_layers:
+            assert hasattr(layer, 'weight_u'), "Spectral norm not applied to actor hidden layer"
 
     def test_spectral_norm_not_on_output_layer(self):
         """Verify that the output layer does NOT have spectral norm."""
         import torch.nn as nn
         from src.models.tqc_dropout_policy import TQCDropoutPolicy
         from gymnasium.spaces import Box
-        from stable_baselines3.common.schedules import constant_schedule
+        from src.config import linear_schedule
 
         # Create minimal observation and action spaces
         obs_space = Box(low=-1, high=1, shape=(512,), dtype=float)
         action_space = Box(low=-1, high=1, shape=(1,), dtype=float)
-        lr_schedule = constant_schedule(3e-4)
+        # Create a constant schedule function (takes progress as parameter but ignores it)
+        def constant_schedule(_progress: float) -> float:
+            return 3e-4
+        lr_schedule = constant_schedule
 
         policy = TQCDropoutPolicy(
             observation_space=obs_space,
@@ -343,7 +356,6 @@ class TestSpectralNormalization:
             lr_schedule=lr_schedule,
             use_spectral_norm_critic=True,
             use_spectral_norm_actor=False,
-            features_dim=512,
         )
         critic = policy.make_critic()
 

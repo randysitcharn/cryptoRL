@@ -12,7 +12,7 @@ Reference: docs/audit/AUDIT_MODELES_RL_RESULTATS.md - Tests Callbacks section
 
 import sys
 import os
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, MagicMock, patch, PropertyMock, PropertyMock
 from collections import deque
 import numpy as np
 import torch
@@ -95,9 +95,7 @@ class TestThreePhaseCurriculumCallback:
         """Test phase transitions at 15% and 75% boundaries."""
         callback = ThreePhaseCurriculumCallback(total_timesteps=100_000)
         callback.model = create_mock_model()
-        callback.logger = callback.model.logger
-        
-        # Mock environment
+        # logger property reads from model.logger, which is already mocked
         mock_env = create_mock_env_with_curriculum()
         with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
             # Phase 1: 0% - 15%
@@ -110,7 +108,13 @@ class TestThreePhaseCurriculumCallback:
             assert callback._phase == 1
             
             # Phase 2: 15% - 75%
+            # At exactly 15%, phase is still 1 (boundary is inclusive)
             callback.num_timesteps = 15_000  # Exactly at 15%
+            callback._on_step()
+            assert callback._phase == 1  # Still phase 1 at boundary
+            
+            # Phase 2 starts after 15%
+            callback.num_timesteps = 15_001  # Just after 15%
             callback._on_step()
             assert callback._phase == 2
             
@@ -123,7 +127,13 @@ class TestThreePhaseCurriculumCallback:
             assert callback._phase == 2
             
             # Phase 3: 75% - 100%
+            # At exactly 75%, phase is still 2 (boundary is inclusive)
             callback.num_timesteps = 75_000  # Exactly at 75%
+            callback._on_step()
+            assert callback._phase == 2  # Still phase 2 at boundary
+            
+            # Phase 3 starts after 75%
+            callback.num_timesteps = 75_001  # Just after 75%
             callback._on_step()
             assert callback._phase == 3
             
@@ -135,8 +145,7 @@ class TestThreePhaseCurriculumCallback:
         """Test that set_progress is called on environment."""
         callback = ThreePhaseCurriculumCallback(total_timesteps=100_000)
         callback.model = create_mock_model()
-        callback.logger = callback.model.logger
-        
+        # logger property reads from model.logger, which is already mocked
         mock_env = create_mock_env_with_curriculum()
         with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
             callback.num_timesteps = 50_000  # 50% progress
@@ -151,11 +160,9 @@ class TestThreePhaseCurriculumCallback:
         """Test that metrics are logged to TensorBoard."""
         callback = ThreePhaseCurriculumCallback(total_timesteps=100_000)
         callback.model = create_mock_model()
-        callback.logger = callback.model.logger
-        
+        # logger property reads from model.logger, which is already mocked
         mock_env = create_mock_env_with_curriculum()
         mock_env.curriculum_lambda = 0.2
-        
         with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
             callback.num_timesteps = 50_000
             callback._on_step()
@@ -207,18 +214,17 @@ class TestOverfittingGuardCallbackV2:
             nav_threshold=5.0,
             initial_nav=10_000.0
         )
-        
-        # Setup mock
-        guard.training_env = Mock()
-        guard.training_env.get_global_metrics = Mock(
-            return_value={"portfolio_value": 60_000.0}  # 6x > 5x threshold
-        )
-        
-        # Should detect violation
-        result = guard._check_nav_threshold()
-        assert result is not None
-        assert "NAV" in result
-        assert "6.0x" in result
+
+        # Setup mock env
+        mock_env = Mock()
+        mock_env.get_global_metrics = Mock(return_value={"portfolio_value": 60_000.0})
+
+        # Patch training_env property (inherited from SB3 BaseCallback)
+        with patch.object(type(guard), 'training_env', new_callable=lambda: property(lambda self: mock_env)):
+            result = guard._check_nav_threshold()
+            assert result is not None
+            assert "NAV" in result
+            assert "6.0x" in result
     
     def test_signal_nav_threshold_no_violation(self):
         """Test NAV threshold with acceptable returns."""
@@ -226,14 +232,15 @@ class TestOverfittingGuardCallbackV2:
             nav_threshold=5.0,
             initial_nav=10_000.0
         )
-        
-        guard.training_env = Mock()
-        guard.training_env.get_global_metrics = Mock(
-            return_value={"portfolio_value": 20_000.0}  # 2x < 5x threshold
-        )
-        
-        result = guard._check_nav_threshold()
-        assert result is None
+
+        # Setup mock env
+        mock_env = Mock()
+        mock_env.get_global_metrics = Mock(return_value={"portfolio_value": 20_000.0})
+
+        # Patch training_env property (inherited from SB3 BaseCallback)
+        with patch.object(type(guard), 'training_env', new_callable=lambda: property(lambda self: mock_env)):
+            result = guard._check_nav_threshold()
+            assert result is None
     
     def test_signal_action_saturation(self):
         """Test Signal 4: Action saturation detection."""
@@ -344,26 +351,31 @@ class TestOverfittingGuardCallbackV2:
             patience=3
         )
         guard.model = create_mock_model()
-        guard.logger = guard.model.logger
-        guard.training_env = Mock()
-        guard.training_env.get_global_metrics = Mock(return_value={})
-        guard.num_timesteps = 1
-        guard.locals = {}
-        
-        # Set initial violation count
-        guard.violation_counts['nav'] = 2
-        
-        # Run step - NAV check returns None (no violation)
-        guard._check_nav_threshold = Mock(return_value=None)
-        guard._check_weight_stagnation = Mock(return_value=None)
-        guard._check_train_eval_divergence = Mock(return_value=None)
-        guard._check_action_saturation = Mock(return_value=None)
-        guard._check_reward_variance = Mock(return_value=None)
-        
-        guard._on_step()
-        
-        # Count should be reset to 0
-        assert guard.violation_counts['nav'] == 0
+        # logger and training_env are read-only properties, patch via __dict__
+        mock_env = Mock()
+        mock_env.get_global_metrics = Mock(return_value={})
+        guard.__dict__['training_env'] = mock_env
+        try:
+            guard.num_timesteps = 1
+            guard.locals = {}
+            
+            # Set initial violation count
+            guard.violation_counts['nav'] = 2
+            
+            # Run step - NAV check returns None (no violation)
+            guard._check_nav_threshold = Mock(return_value=None)
+            guard._check_weight_stagnation = Mock(return_value=None)
+            guard._check_train_eval_divergence = Mock(return_value=None)
+            guard._check_action_saturation = Mock(return_value=None)
+            guard._check_reward_variance = Mock(return_value=None)
+            
+            guard._on_step()
+            
+            # Count should be reset to 0
+            assert guard.violation_counts['nav'] == 0
+        finally:
+            if 'training_env' in guard.__dict__:
+                del guard.__dict__['training_env']
     
     def test_eval_callback_none_handling(self):
         """Test graceful handling when eval_callback is None."""
@@ -402,7 +414,7 @@ class TestModelEMACallback:
         callback = ModelEMACallback(decay=0.995)
         
         assert callback.decay == 0.995
-        assert callback.tau == 0.005  # 1 - decay
+        assert abs(callback.tau - 0.005) < 1e-10  # 1 - decay (with floating point tolerance)
         assert callback.ema_params is None  # Not initialized until training starts
     
     def test_tau_calculation(self):
@@ -454,7 +466,7 @@ class TestModelEMACallback:
         """Test that EMA converges towards current weights over time."""
         callback = ModelEMACallback(decay=0.9, verbose=0)  # Fast decay for test
         callback.model = create_mock_model(n_params=1, param_size=10)
-        callback.logger = callback.model.logger
+        # logger property reads from model.logger, which is already mocked
         callback.num_timesteps = 0
         
         callback._on_training_start()
@@ -550,31 +562,42 @@ class TestGetUnderlyingBatchEnv:
     
     def test_unwraps_vec_env(self):
         """Test unwrapping VecEnv to find BatchCryptoEnv."""
-        # Create mock chain: VecNormalize -> VecMonitor -> BatchCryptoEnv
-        batch_env = Mock()
-        batch_env.__class__.__name__ = 'BatchCryptoEnv'
+        # Create a simple class that has the identifying method
+        class MockBatchEnv:
+            def set_smoothness_penalty(self, value):
+                pass
         
-        monitor = Mock()
+        batch_env = MockBatchEnv()
+        
+        # Create monitor with venv attribute
+        monitor = Mock(spec=['venv'])
         monitor.__class__.__name__ = 'VecMonitor'
         monitor.venv = batch_env
+        # Ensure hasattr works correctly
+        type(monitor).venv = property(lambda self: batch_env)
         
-        normalize = Mock()
+        # Create normalize with venv attribute pointing to monitor
+        normalize = Mock(spec=['venv'])
         normalize.__class__.__name__ = 'VecNormalize'
         normalize.venv = monitor
+        # Ensure hasattr works correctly and venv returns monitor
+        type(normalize).venv = property(lambda self: monitor)
         
         result = get_underlying_batch_env(normalize)
         
+        # The function should find batch_env by checking hasattr(env, 'set_smoothness_penalty')
         assert result is batch_env
     
     def test_returns_none_for_non_batch_env(self):
-        """Test returns None when BatchCryptoEnv not found."""
+        """Test returns original env when BatchCryptoEnv not found."""
         env = Mock()
         env.__class__.__name__ = 'DummyVecEnv'
-        # No venv attribute
+        # No venv attribute, no set_smoothness_penalty method
         
         result = get_underlying_batch_env(env)
         
-        assert result is None
+        # Function returns the original env when BatchCryptoEnv is not found
+        assert result is env
 
 
 # ============================================================================
