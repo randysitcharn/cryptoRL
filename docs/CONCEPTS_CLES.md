@@ -13,6 +13,7 @@ Créer un **agent de trading automatisé** pour les cryptomonnaies (BTC principa
 | Composant | Technologie | Rôle |
 |-----------|-------------|------|
 | Algorithme RL | **TQC** (Truncated Quantile Critics) | Algorithme off-policy SOTA pour actions continues |
+| Robustesse | **Ensemble RL** (Multi-Seed + Confidence) | Agrégation de 3 modèles pondérée par incertitude |
 | Feature Extractor | **MAE** (Masked Autoencoder) | Pré-entraînement non-supervisé du Transformer |
 | Environnement | **BatchCryptoEnv** | Simulation GPU-vectorisée (1024 envs parallèles) |
 | Framework RL | **Stable-Baselines3** | Implémentation standard TQC/PPO |
@@ -175,30 +176,27 @@ Segment 2:                         [TRAIN 18 mois][TEST 3 mois]
 
 ---
 
-## 8. PLO - Pénalités Adaptatives (Avancé)
+## 8. MORL - Multi-Objective RL (Avancé)
 
 ### Problème
-Le coefficient de pénalité downside est **statique**. Un drawdown de 15% est pénalisé comme un de 5%.
+Les pénalités statiques (churn, smoothness) ne s'adaptent pas au contexte du marché.
 
-### Solution : PLO (Predictive Lagrangian Optimization)
-```
-downside_risk = base_downside × downside_multiplier
-                                      ↑
-                               Contrôlé par PID : λ ∈ [1.0, 5.0]
+### Solution : MORL avec paramètre w_cost
+```python
+reward = r_perf + w_cost * r_cost * MAX_PENALTY_SCALE
 ```
 
-### Contrôleur PID
-| Composante | Formule | Rôle |
-|------------|---------|------|
-| **P (Proportionnel)** | K_p × violation | Réaction immédiate |
-| **I (Intégral)** | Σ K_i × violation | Mémoire des violations |
-| **D (Dérivé)** | K_d × Δviolation | Anticipation |
+- **w_cost = 0** : Mode scalping (ignorer les coûts, maximiser profit)
+- **w_cost = 1** : Mode B&H (minimiser les coûts, conservateur)
 
-### Améliorations Critiques
-- **Observation augmentée** : L'agent voit `risk_level` (λ normalisé)
-- **Prédiction robuste** : polyfit au lieu de différence naïve
-- **Quantile 90%** : VaR-style au lieu de moyenne
-- **Smoothing** : max ±0.05/step pour éviter sauts brutaux
+L'agent apprend une politique conditionnée : `π(a|s, w_cost)` et peut s'adapter dynamiquement.
+
+### Distribution de w_cost (Training)
+| Probabilité | Valeur | Stratégie |
+|-------------|--------|-----------|
+| 20% | 0.0 | Scalping pur |
+| 20% | 1.0 | B&H pur |
+| 60% | Uniforme [0,1] | Exploration |
 
 ---
 
@@ -271,7 +269,93 @@ Si `use_sde=True` et `actor_dropout > 0`, le dropout casse la continuité tempor
 
 ---
 
-## 11. Comprendre l'Overfitting en RL
+## 11. Ensemble RL - Agrégation Multi-Modèles
+
+### Problème
+Un seul modèle TQC présente :
+- **Variance inter-seeds** : Performances très variables selon l'initialisation
+- **Sensibilité aux outliers** : Un mauvais gradient peut dérailler l'entraînement
+- **Décisions "all-in"** : Pas de notion de confiance dans les actions
+
+### Solution : Multi-Seed Ensemble + Confidence-Weighted Aggregation
+
+#### Architecture
+```
+Observation → [TQC seed=42] → action_0, spread_0
+           → [TQC seed=123] → action_1, spread_1
+           → [TQC seed=456] → action_2, spread_2
+                    ↓
+         Confidence-Weighted Aggregation
+                    ↓
+              Final Action
+```
+
+#### Méthode d'Agrégation (Softmax Temperature)
+```python
+# Spread = incertitude (max - min des quantiles TQC)
+# Plus le spread est faible, plus le modèle est confiant
+
+spread_norm = spread / EMA(spread)  # Calibration volatilité
+weight_i = exp(-spread_norm / τ) / Σ(exp(-spread_norm / τ))  # Softmax
+final_action = Σ(weight_i × action_i)
+```
+
+| Paramètre | Valeur | Effet |
+|-----------|--------|-------|
+| **τ = 1.0** | Standard | Pondération proportionnelle |
+| **τ = 0.5** | Agressif | "Tue" les modèles incertains |
+| **τ = 2.0** | Doux | Différences atténuées |
+
+### Diversité Forcée (Audit Gemini)
+Pour éviter que les modèles convergent vers la même solution :
+
+| Membre | Seed | Gamma | Learning Rate |
+|--------|------|-------|---------------|
+| 0 | 42 | 0.94 | 5e-5 |
+| 1 | 123 | 0.95 | 1e-4 |
+| 2 | 456 | 0.96 | 2e-4 |
+
+### Méthodes d'Agrégation Disponibles
+
+| Méthode | Formule | Usage |
+|---------|---------|-------|
+| **confidence** (défaut) | Softmax(-spread/τ) weighted | Pondère par confiance TQC |
+| **mean** | Σ(action_i) / N | Moyenne simple |
+| **median** | Médiane des actions | Résistant aux outliers |
+| **conservative** | argmin(\|action_i\|) | Plus risk-averse |
+
+### Filtre d'Agrément
+```python
+agreement = 1.0 - std(actions)  # 1 = accord parfait, 0 = désaccord total
+
+if agreement < min_agreement:
+    final_action = 0.0  # Hold si trop de désaccord
+```
+
+### ROI Attendu (Audit Gemini)
+> *"Diviser le Max Drawdown par 2 via l'ensemble permet souvent de doubler le levier (et donc le profit) à risque constant."*
+
+| Métrique | Single Model | Ensemble 3 | Amélioration |
+|----------|--------------|------------|--------------|
+| Sharpe | X | ≥ X | ≥ +10% |
+| Max DD | Y% | ≤ Y% | ≤ -10% |
+| Variance | σ | σ/2 | -50% |
+
+### Training Parallèle (2 GPUs)
+```
+GPU 0: TQC seed=42   ─┐
+GPU 1: TQC seed=123  ─┼→ ~20 min total (vs 30 min séquentiel)
+Then GPU 0: seed=456 ─┘
+```
+
+### Références
+- **DroQ** (Hiraoka 2021) - Dropout comme mini-ensemble implicite
+- **TQC** (Kuznetsov 2020) - Quantiles pour incertitude
+- Design complet : `docs/design/ENSEMBLE_RL_DESIGN.md`
+
+---
+
+## 12. Comprendre l'Overfitting en RL
 
 L'overfitting, c'est quand le modèle **mémorise** les données d'entraînement au lieu d'**apprendre** des patterns généralisables.
 
@@ -368,15 +452,16 @@ Entropie basse:   Le modèle est figé, toujours la même action
 |-----------|-------|
 | **Observation noise** | Empêche la mémorisation des patterns exacts |
 | **Curriculum learning** | Augmente progressivement la difficulté |
-| **PLO** | Pénalise les comportements extrêmes (drawdown, churn) |
+| **MORL (w_cost)** | Apprend à s'adapter aux différents régimes de coûts |
 | **Walk-Forward Optimization** | Entraîne sur segment N, teste sur segment N+1 |
 | **TQCDropoutPolicy** | Dropout + LayerNorm pour régularisation |
 | **OverfittingGuardV2** | Détecte et stoppe automatiquement l'overfitting |
 | **Polyak Averaging (EMA)** | Moyenne mobile exponentielle des poids pour généralisation |
+| **Ensemble RL** | Agrégation multi-modèles réduit variance et risque systémique |
 
 ---
 
-## 12. Polyak Averaging (EMA) - Robustesse & Généralisation
+## 13. Polyak Averaging (EMA) - Robustesse & Généralisation
 
 ### Problème
 Les poids du policy network pendant l'entraînement sont **instables** et peuvent surajuster aux derniers batches vus. Un poids optimal à l'étape N peut être "perdu" si le modèle continue à s'entraîner.
@@ -474,7 +559,7 @@ Si `weight_diff_relative` augmente :
 
 ---
 
-## 13. OverfittingGuardCallbackV2 (5 Signaux)
+## 14. OverfittingGuardCallbackV2 (5 Signaux)
 
 ### Problème
 La détection d'overfitting via un seul signal (NAV) est fragile.
@@ -513,7 +598,7 @@ overfit/violations_*, overfit/active_signals
 
 ---
 
-## 14. Séparation Données Train/Eval
+## 15. Séparation Données Train/Eval
 
 ### Problème : Data Leakage
 Si train et eval partagent les mêmes données, la mesure de généralisation est faussée.
@@ -553,7 +638,7 @@ Si train et eval partagent les mêmes données, la mesure de généralisation es
 
 ---
 
-## 15. Intégration WFO du Guard (Fail-over)
+## 16. Intégration WFO du Guard (Fail-over)
 
 ### Problème
 Sans Guard en WFO, le training peut continuer même si le modèle a divergé.
@@ -607,7 +692,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 16. Métriques de Performance
+## 17. Métriques de Performance
 
 ### Trading
 | Métrique | Formule | Cible |
@@ -626,14 +711,15 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 17. Fichiers Principaux
+## 18. Fichiers Principaux
 
 | Fichier | Rôle | Lignes |
 |---------|------|--------|
 | `scripts/run_full_wfo.py` | Orchestration WFO complète | ~1600 |
-| `src/training/batch_env.py` | Environnement GPU-vectorisé + Dynamic Noise | ~1200 |
-| `src/training/callbacks.py` | Curriculum, PLO, OverfittingGuardV2 | ~1700 |
+| `src/training/batch_env.py` | Environnement GPU-vectorisé + MORL + Dynamic Noise | ~1100 |
+| `src/training/callbacks.py` | Curriculum, OverfittingGuardV2, EMA | ~1500 |
 | `src/training/train_agent.py` | Entraînement TQC | ~880 |
+| `src/evaluation/ensemble.py` | Ensemble RL (Multi-Seed + Confidence Aggregation) | ~900 |
 | `src/models/tqc_dropout_policy.py` | TQCDropoutPolicy (DroQ + LayerNorm) | ~420 |
 | `src/models/rl_adapter.py` | FoundationFeatureExtractor | ~330 |
 | `src/data_engineering/features.py` | Feature engineering (FFD, Vol) | ~650 |
@@ -641,7 +727,7 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 ---
 
-## 18. Termes Techniques Courants
+## 19. Termes Techniques Courants
 
 | Terme | Définition |
 |-------|------------|
@@ -661,10 +747,14 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 | **Policy Collapse** | Dégénérescence de la policy (actions bloquées à ±1) |
 | **Weight Stagnation** | Poids du réseau qui ne bougent plus (signe de convergence/collapse) |
 | **Polyak Averaging (EMA)** | Moyenne mobile exponentielle des poids pour robustesse (τ=0.005) |
+| **Ensemble RL** | Agrégation de plusieurs modèles pour réduire variance et améliorer robustesse |
+| **Quantile Spread** | Écart max-min des quantiles TQC, proxy d'incertitude |
+| **Confidence-Weighted** | Pondération inversement proportionnelle à l'incertitude |
+| **Softmax Temperature** | Paramètre τ contrôlant la "dureté" de la pondération softmax |
 
 ---
 
-## 19. Références Essentielles
+## 20. Références Essentielles
 
 1. **Lopez de Prado (2018)** - "Advances in Financial Machine Learning"
    - Fractional Differentiation, Meta-Labeling, Purged CV
@@ -672,8 +762,8 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 2. **Kuznetsov et al. (2020)** - "TQC: Truncated Quantile Critics"
    - Algorithme RL principal
 
-3. **Stooke et al. (2020)** - "PID Lagrangian Methods"
-   - Base théorique pour PLO
+3. **Abels et al. (ICML 2019)** - "Dynamic Weights in Multi-Objective Deep RL"
+   - Base théorique pour MORL (w_cost)
 
 4. **He et al. (2022)** - "Masked Autoencoders Are Scalable Vision Learners"
    - Architecture MAE adaptée aux séries temporelles
@@ -695,6 +785,9 @@ Segment 0 (SUCCESS) → Segment 1 (FAILED) → Segment 2 (SUCCESS)
 
 10. **Polyak & Juditsky (1992)** - "Acceleration of Stochastic Approximation by Averaging"
     - Base théorique de Polyak Averaging (EMA) pour robustesse des poids
+
+11. **Ensemble RL through Classifier Models (2025)** - arXiv:2502.17518
+    - Agrégation d'ensemble via classifiers, base conceptuelle pour multi-seed
 
 ---
 

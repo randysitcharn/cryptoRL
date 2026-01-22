@@ -208,33 +208,22 @@ ssh -p 20941 -L 8081:localhost:8081 root@158.51.110.52
 | Component | Typical Value | Relative Scale |
 |-----------|---------------|----------------|
 | reward/pnl_component | +0.027 | 1.0x (baseline) |
-| reward/smoothness | **-0.190** | **7x larger** |
-| reward/downside_risk | -0.006 | 0.2x |
-| reward/churn_cost | -0.00008 | negligible |
 
-### Root Cause
+### ✅ Solution Implémentée: MORL Architecture
 
-```python
-# src/training/batch_env.py:373
-smoothness_penalty = smooth_coef * (position_deltas ** 2) * SCALE
-                   = 0.02 * (0.3)^2 * 100
-                   = 0.18  # For 30% position change
-```
-
-**Result:** Agent avoids position changes because penalty >> profit signal.
-
-### Proposed Fix
-
-Reduce `smooth_coef` from `0.02` to `0.005` in `src/training/callbacks.py`:
+Le problème de pénalités excessives a été résolu en passant à l'architecture MORL:
 
 ```python
-# Lines 594-597
-PHASES = [
-    {'end_progress': 0.1, 'churn': (0.0, 0.10), 'smooth': (0.0, 0.0)},
-    {'end_progress': 0.3, 'churn': (0.10, 0.50), 'smooth': (0.0, 0.005)},  # was 0.02
-    {'end_progress': 1.0, 'churn': (0.50, 0.50), 'smooth': (0.005, 0.005)},  # was 0.02
-]
+# src/training/batch_env.py - Architecture MORL
+reward = r_perf + curriculum_lambda * w_cost * r_cost * MAX_PENALTY_SCALE
 ```
+
+où:
+- `r_perf`: Log-returns (objectif performance)  
+- `w_cost ∈ [0, 1]`: Paramètre MORL dans l'observation
+- `curriculum_lambda ∈ [0, 0.4]`: Progression contrôlée
+
+**Avantage:** L'agent apprend à adapter son comportement à différentes valeurs de w_cost.
 
 ---
 

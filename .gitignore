@@ -38,4 +38,3 @@ models/
 .claude/
 weights/
 *.zip
-optuna_study.db

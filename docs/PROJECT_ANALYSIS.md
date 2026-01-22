@@ -44,24 +44,24 @@
 | **Curriculum Learning 3-phases** | ✅ IMPLÉMENTÉ | AAAI 2024-style |
 | **Dropout + LayerNorm (DroQ)** | ✅ IMPLÉMENTÉ | Hiraoka et al., 2021 |
 
-### ✅ Système de Récompenses Sophistiqué
+### ✅ Système de Récompenses MORL
 
-| Composant | Formule | Contrôle |
-|-----------|---------|----------|
-| **Log Returns** | `log1p(returns) × 100` | Base reward |
-| **Churn Penalty** | `\|Δpos\| × cost × gate` | PLO Churn Callback |
-| **Downside Risk** | `neg_returns² × 500` | PLO Drawdown Callback |
-| **Smoothness** | `Δpos² × smooth_coef` | PLO Smoothness Callback |
+| Composant | Formule | Rôle |
+|-----------|---------|------|
+| **Log Returns** | `log1p(returns) × 100` | Objectif performance |
+| **Cost Penalty** | `w_cost × position_delta × SCALE` | Objectif coûts (MORL) |
 
-### ✅ PLO (Predictive Lagrangian Optimization)
+### ✅ MORL (Multi-Objective RL)
 
-| Callback | Contrainte | Méthode |
-|----------|------------|---------|
-| **PLOAdaptivePenaltyCallback** | Drawdown < 10% | Contrôleur PID + prédiction polyfit |
-| **PLOChurnCallback** | Churn < seuil | PID avec leak minimum |
-| **PLOSmoothnessCallback** | Jerk < seuil | PID sur accélération des positions |
+Architecture basée sur Abels et al. (ICML 2019).
 
-**Innovation clé** : Observation augmentée (`risk_level`, `churn_level`, `smooth_level`) pour maintenir la propriété de Markov.
+| Paramètre | Valeur | Comportement |
+|-----------|--------|--------------|
+| **w_cost = 0** | Scalping | Maximiser profit, ignorer coûts |
+| **w_cost = 1** | B&H | Minimiser coûts, conservateur |
+| **w_cost ∈ (0,1)** | Intermédiaire | Équilibre profit/coûts |
+
+**Innovation clé** : L'agent voit `w_cost` dans l'observation et apprend `π(a|s, w_cost)`.
 
 ---
 
@@ -77,7 +77,7 @@
 | **Anti-overfitting** | 5 signaux + dropout + noise | Early stopping basique |
 | **Coûts réalistes** | Commission + slippage + funding | Souvent ignorés |
 | **Short selling** | ✅ Complet avec funding | Rarement implémenté |
-| **Pénalités adaptatives** | PLO SOTA 2025 | Coefficients fixes |
+| **Multi-Objective RL** | MORL avec w_cost | Coefficients fixes |
 
 **Verdict** : CryptoRL est **supérieur à 80-90%** des publications académiques en termes de rigueur technique.
 
@@ -122,15 +122,13 @@
 │  │  │ • Funding rate ✓     │     │         ↓                          │    │    │
 │  │  │ • Vol scaling ✓      │     │ Actor (LayerNorm + Dropout 0.005)  │    │    │
 │  │  │ • Dynamic noise ✓    │────▶│ Critics (LayerNorm + Dropout 0.01) │    │    │
-│  │  │ • PLO observation ✓  │     │ 25 quantiles, truncation=2         │    │    │
+│  │  │ • MORL w_cost ✓      │     │ 25 quantiles, truncation=2         │    │    │
 │  │  └──────────────────────┘     └────────────────────────────────────┘    │    │
 │  │                                                                          │    │
 │  │  CALLBACKS:                                                              │    │
-│  │  • ThreePhaseCurriculumCallback (churn/smooth ramping)                   │    │
-│  │  • PLOAdaptivePenaltyCallback (drawdown PID)                             │    │
-│  │  • PLOChurnCallback (churn PID with leak)                                │    │
-│  │  • PLOSmoothnessCallback (jerk PID)                                      │    │
+│  │  • ThreePhaseCurriculumCallback (curriculum_lambda ramping)              │    │
 │  │  • OverfittingGuardCallbackV2 (5 signals)                                │    │
+│  │  • ModelEMACallback (Polyak averaging)                                   │    │
 │  │  • DetailTensorboardCallback (GPU metric polling)                        │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                      ↓                                          │
@@ -153,9 +151,10 @@
    - Combine annealing temporel + adaptation à la volatilité
    - Rare dans la littérature
 
-2. **PLO avec Observation Augmentée**
-   - L'agent "voit" les niveaux de risque (`risk_level`, `churn_level`, `smooth_level`)
-   - Maintient la propriété de Markov (critique pour convergence)
+2. **MORL avec Paramètre de Préférence**
+   - L'agent voit `w_cost` dans l'observation
+   - Apprend une politique conditionnée `π(a|s, w_cost)`
+   - Adapte son comportement au régime de coûts
 
 3. **OverfittingGuardCallbackV2**
    - 5 signaux indépendants basés sur papers 2025-2026
@@ -184,7 +183,7 @@
 | Item | Description | Effort |
 |------|-------------|--------|
 | **Smooth Coef Tuning** | Monitoring trades/épisode | Faible |
-| **Ablation Studies** | Mesurer impact HMM, PLO, curriculum | Moyen |
+| **Ablation Studies** | Mesurer impact HMM, MORL, curriculum | Moyen |
 
 ### P2 - Basse Priorité
 
@@ -233,12 +232,12 @@
 1. ✅ **Architecture complète** : MAE + TQC + GPU env + WFO
 2. ✅ **Short selling complet** avec funding rate réaliste
 3. ✅ **5 mécanismes anti-overfitting** complémentaires
-4. ✅ **PLO SOTA 2025** avec observation augmentée
+4. ✅ **MORL** avec paramètre w_cost conditionné
 5. ✅ **Documentation technique exceptionnelle**
 
 **Ce qui le différencie de 90% des projets similaires** :
 - Validation WFO stricte (vs train/test split naïf)
-- Pénalités adaptatives PLO (vs coefficients fixes)
+- MORL avec w_cost dynamique (vs coefficients fixes)
 - 5 signaux de détection overfitting (vs early stopping simple)
 - Short selling avec funding (vs long-only)
 
@@ -259,8 +258,7 @@
 | **TQC** (Kuznetsov et al.) | 2020 | Algorithme RL principal |
 | **MAE** (He et al.) | 2022 | Foundation model adapté |
 | **DroQ** (Hiraoka et al.) | 2021 | Dropout + LayerNorm policy |
-| **PLO** (Zhang et al.) | 2025 | Pénalités adaptatives |
-| **PID Lagrangian** (Stooke et al.) | 2020 | Base théorique PLO |
+| **MORL** (Abels et al.) | 2019 | Multi-Objective RL conditionné |
 | **GRADSTOP** | 2025 | Signal 2 OverfittingGuard |
 | **FineFT** | 2025 | Signal 4 OverfittingGuard |
 | **Sparse-Reg** | 2025 | Signal 5 OverfittingGuard |
@@ -271,8 +269,8 @@
 | Fichier | Lignes | Rôle |
 |---------|--------|------|
 | `scripts/run_full_wfo.py` | ~1600 | Orchestration WFO complète |
-| `src/training/batch_env.py` | ~1200 | Environnement GPU-vectorisé |
-| `src/training/callbacks.py` | ~1700 | Tous les callbacks (Curriculum, PLO, Guard) |
+| `src/training/batch_env.py` | ~1100 | Environnement GPU-vectorisé + MORL |
+| `src/training/callbacks.py` | ~1500 | Tous les callbacks (Curriculum, Guard, EMA) |
 | `src/training/train_agent.py` | ~880 | Entraînement TQC |
 | `src/models/foundation.py` | ~300 | CryptoMAE autoencoder |
 | `src/models/rl_adapter.py` | ~330 | FoundationFeatureExtractor |
