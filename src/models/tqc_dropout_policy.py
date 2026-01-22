@@ -128,7 +128,7 @@ class DropoutActor(Actor):
         features_dim: int,
         activation_fn: Type[nn.Module] = nn.ReLU,
         use_sde: bool = False,
-        log_std_init: float = -3,
+        log_std_init: float = -1.0,  # FIX: Hardcoded -1 for larger positions (was -3)
         full_std: bool = True,
         use_expln: bool = False,
         clip_mean: float = 2.0,
