@@ -19,14 +19,60 @@ SSH_PORT=<nouveau_port>
 SSH_USER=root
 ```
 
-### 2. Connexion au serveur
+### 2. Configurer le raccourci "ssh vast" (WSL)
+
+Sur la machine locale Windows, configurer WSL pour utiliser SSH multiplexing :
+
+```bash
+# Depuis PowerShell, ouvrir la config SSH de WSL
+wsl bash -c "mkdir -p ~/.ssh/controlmasters && nano ~/.ssh/config"
+```
+
+Ajouter/mettre à jour la config :
+```
+Host vast
+    HostName <IP_SERVEUR>
+    Port <PORT>
+    User root
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/controlmasters/%r@%h:%p
+    ControlPersist 10m
+```
+
+Exemple pour le serveur actuel :
+```
+Host vast
+    HostName 74.48.140.178
+    Port 25043
+    User root
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/controlmasters/%r@%h:%p
+    ControlPersist 10m
+```
+
+**Initialiser la connexion (première fois)** :
+```powershell
+# La première connexion est lente car elle ajoute les clés au known_hosts
+wsl bash -c "ssh -o StrictHostKeyChecking=no vast 'echo OK'"
+```
+
+> **Note** : La première connexion peut prendre 10-20 secondes car SSH doit négocier les clés et les ajouter à `~/.ssh/known_hosts`. Les connexions suivantes seront quasi-instantanées grâce au multiplexing.
+
+**Usage** :
+```powershell
+wsl bash -c "ssh vast 'commande'"
+```
+
+### 3. Connexion au serveur
 
 ```bash
 ssh -p PORT root@HOST
 cd /workspace
 ```
 
-### 3. Configurer SSH pour GitHub
+### 4. Configurer SSH pour GitHub
 
 Copier la cle SSH (depuis machine locale):
 ```bash
@@ -52,7 +98,7 @@ chmod 600 ~/.ssh/config
 ssh -o StrictHostKeyChecking=no git@github.com
 ```
 
-### 4. Clone du repo
+### 5. Clone du repo
 
 ```bash
 cd /workspace
@@ -60,13 +106,13 @@ git clone git@github.com:randysitcharn/cryptoRL.git
 cd cryptoRL
 ```
 
-### 5. Installer dependances
+### 6. Installer dependances
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 6. Copier les donnees (depuis machine locale)
+### 7. Copier les donnees (depuis machine locale)
 
 ```bash
 # Executer depuis la machine locale:
@@ -77,7 +123,7 @@ Fichiers requis:
 - `data/raw_historical/multi_asset_historical.csv` (principal)
 - Ou fichiers individuels: `BTC_1h.csv`, `ETH_1h.csv`, etc.
 
-### 7. Lancer le training WFO
+### 8. Lancer le training WFO
 
 ```bash
 # Training complet (13 segments)
@@ -87,7 +133,7 @@ python3 scripts/run_full_wfo.py --segments 13
 python3 scripts/run_full_wfo.py --segment 0 --timesteps 150000
 ```
 
-### 8. Monitoring TensorBoard
+### 9. Monitoring TensorBoard
 
 **IMPORTANT:** vast.ai lance TensorBoard automatiquement sur `/workspace` (port 16006).
 Il faut le reconfigurer pour pointer sur les logs WFO.
@@ -105,7 +151,7 @@ ssh -p PORT -L 6006:localhost:16006 root@HOST
 # Ouvrir http://localhost:6006
 ```
 
-### 9. Recuperer les resultats
+### 10. Recuperer les resultats
 
 ```bash
 # Depuis machine locale:
