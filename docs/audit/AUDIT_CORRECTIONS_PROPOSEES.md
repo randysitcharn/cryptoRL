@@ -44,11 +44,11 @@ Le **Distributional Shift** causé par `max_leverage=1.0` en évaluation vs `max
 
 ### 1.2 Métriques TensorBoard Clés (Extraites du Serveur)
 
-| Segment | Position Moyenne | Action Saturation | Entropy | Churn Multiplier PLO |
-|---------|------------------|-------------------|---------|----------------------|
-| 0 | +0.54 (LONG) | 0.18 → 0.24 | 0.078 → 0.020 | **1.0** (jamais actif) |
-| 2 | +0.41 (LONG) | 0.34 → **0.47** | **0.015** | **1.0** (jamais actif) |
-| 4 | -0.46 (SHORT) | 0.38 → 0.43 | 0.021 | **1.0** (jamais actif) |
+| Segment | Position Moyenne | Action Saturation | Entropy |
+|---------|------------------|-------------------|---------|
+| 0 | +0.54 (LONG) | 0.18 → 0.24 | 0.078 → 0.020 |
+| 2 | +0.41 (LONG) | 0.34 → **0.47** | **0.015** |
+| 4 | -0.46 (SHORT) | 0.38 → 0.43 | 0.021 |
 
 ### 1.3 Analyse Détaillée des Positions (Nouvelles Données)
 
@@ -90,11 +90,11 @@ max_leverage=1.0,  # Disable vol scaling (was: self.config.max_leverage)
 - En évaluation : `max_leverage=1.0` → les positions sont brutes, sans amplification
 - Mismatch de distribution P(s,a) entre train et eval
 
-#### Problème 2 : PLO Churn Jamais Activé
+#### Problème 2 : Churn Non Contrôlé (Résolu avec MORL)
 
-**Observation** : `churn_multiplier = 1.0` sur **tous** les segments
+**Observation historique** : L'ancien système PLO ne s'activait jamais (churn_multiplier = 1.0)
 
-**Cause** : Le calcul de turnover utilise `metric_turnover = avg(current_position_deltas)` qui est proche de 0 en moyenne instantanée, même avec 900+ trades par épisode.
+**Solution** : Transition vers MORL avec w_cost qui contrôle directement les coûts de trading dans la reward.
 
 #### Problème 3 : Scalarisation Linéaire Naïve (Problème Structurel)
 
@@ -288,14 +288,14 @@ R_scalar = r_perf + w_cost * r_cost * MAX_PENALTY_SCALE
 
 où `w_cost ∈ [0, 1]` est tiré aléatoirement à chaque épisode ET inclus dans l'observation.
 
-### 4.3 Avantages vs Architecture Actuelle
+### 4.3 Avantages de l'Architecture MORL (Implémentée)
 
-| Aspect | Actuel (PLO + Curriculum) | MORL Conditioned |
-|--------|---------------------------|------------------|
-| Tuning | 10+ hyperparamètres (λ, seuils, PID gains) | 1 paramètre (MAX_PENALTY_SCALE) |
-| Adaptabilité | Fixe après training | Ajustable en temps réel |
-| Robustesse | Sensible aux changements de marché | Robuste (toutes préférences apprises) |
-| Complexité | 3 contrôleurs PID + curriculum | 1 signal w_cost |
+| Aspect | MORL Conditioned |
+|--------|------------------|
+| Tuning | 1 paramètre (MAX_PENALTY_SCALE) |
+| Adaptabilité | Ajustable en temps réel via w_cost |
+| Robustesse | Robuste (toutes préférences apprises) |
+| Complexité | 1 signal w_cost dans l'observation |
 
 ---
 
@@ -428,10 +428,9 @@ L'implémentation proposée (concaténer w_cost à l'observation et l'utiliser p
 
 ### 10.1 Code Source Pertinent
 
-**Reward Function** : `src/training/batch_env.py` lignes 363-493  
-**Curriculum Phases** : `src/training/callbacks.py` lignes 619-623 (à supprimer)  
-**PLO Churn** : `src/training/callbacks.py` lignes 1045-1205 (à simplifier)  
-**Evaluation** : `scripts/run_full_wfo.py` lignes 700-954
+**Reward Function** : `src/training/batch_env.py` (MORL architecture)  
+**Curriculum** : `src/training/callbacks.py` (ThreePhaseCurriculumCallback)  
+**Evaluation** : `scripts/run_full_wfo.py`
 
 ### 10.2 Données du Serveur
 
