@@ -431,7 +431,7 @@ class BatchCryptoEnv(VecEnv):
         # If position_delta ≈ 0.1/step → SCALE*0.1 = 10.0
         # We want w_cost=1 to make costs matter, so scale up costs
         # ═══════════════════════════════════════════════════════════════════
-        MAX_PENALTY_SCALE = 2.0  # Calibrate: if r_cost flat in TensorBoard, increase
+        MAX_PENALTY_SCALE = 0.02  # Calibrated: ~2x ratio churn/pnl (was 2.0 → 210x)
 
         # Safety caps to prevent NaN/explosion
         COST_PENALTY_CAP = 20.0
