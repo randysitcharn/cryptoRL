@@ -292,6 +292,9 @@ def create_policy_kwargs(config: TrainingConfig) -> dict:
             use_spectral_norm_actor=config.use_spectral_norm_actor,
         )
 
+    # FIX: Increased init exploration (log_std_init=-1 gives std≈0.37 vs default -3 giving std≈0.05)
+    policy_kwargs["log_std_init"] = config.log_std_init
+
     return policy_kwargs
 
 

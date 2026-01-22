@@ -88,6 +88,7 @@ class TQCTrainingConfig:
     use_sde: bool = True
     sde_sample_freq: int = -1  # -1 = resample once per episode
     use_sde_at_warmup: bool = True
+    log_std_init: float = -1.0  # FIX: Increased init exploration (default -3 too small)
 
     # Actor Noise (fallback when use_sde=False, ignored otherwise)
     # OrnsteinUhlenbeck noise for temporally correlated exploration
