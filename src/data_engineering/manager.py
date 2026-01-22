@@ -38,7 +38,7 @@ class RegimeDetector:
        - HMM_Trend: Moyenne glissante 168h des Log-Returns
        - HMM_Vol: Volatilité Parkinson rolling 168h
        - HMM_Momentum: RSI 14 normalisé [0, 1]
-       - HMM_Funding: Funding Rate 24h (leading indicator)
+       - HMM_Funding: REMOVED (synthetic funding causes spurious correlations - audit P1.2)
        - HMM_RiskOnOff: SPX - DXY (risk-on/off signal)
        - HMM_VolRatio: Vol court/long terme (early warning)
 
@@ -159,15 +159,10 @@ class RegimeDetector:
         rsi = 100 - (100 / (1 + rs))
         df_result['HMM_Momentum'] = rsi / 100  # Normaliser [0, 1]
 
-        # 4. Funding Rate - DEPRECATED (see audit P1.2)
-        # Synthetic funding removed from HMM_FEATURES to avoid spurious correlations
-        # Only compute if real funding data is available (non-zero variance)
-        if 'Funding_Rate' in df.columns and df['Funding_Rate'].std() > 1e-8:
-            df_result['HMM_Funding'] = df['Funding_Rate'].rolling(
-                window=24, min_periods=24
-            ).mean()
-            print("  [INFO] HMM_Funding computed (real data detected)")
-        # else: HMM_Funding not created - not in HMM_FEATURES anymore
+        # 4. Funding Rate - REMOVED (see audit P1.2)
+        # Synthetic funding rates cause spurious correlations and are not used as features.
+        # The environment uses a fixed funding_rate=0.0001 for short position costs.
+        # HMM_Funding has been removed from HMM_FEATURES to avoid learning artificial patterns.
 
         # 5. Risk-On/Off via SPX vs DXY
         # SPX monte + DXY baisse = Risk-On (bon pour crypto)
@@ -191,9 +186,7 @@ class RegimeDetector:
         df_result['HMM_Momentum'] = df_result['HMM_Momentum'].clip(0, 1)  # RSI strict [0,1]
         df_result['HMM_RiskOnOff'] = df_result['HMM_RiskOnOff'].clip(-0.02, 0.02)  # ±2%
         df_result['HMM_VolRatio'] = df_result['HMM_VolRatio'].clip(0.2, 5.0)  # Ratio [0.2x, 5x]
-        # HMM_Funding clip only if it exists (real funding data)
-        if 'HMM_Funding' in df_result.columns:
-            df_result['HMM_Funding'] = df_result['HMM_Funding'].clip(-0.005, 0.005)  # ±0.5%
+        # HMM_Funding removed (audit P1.2 - synthetic funding causes spurious correlations)
 
         n_features = len(self.HMM_FEATURES)
         print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, {n_features} features: {', '.join(self.HMM_FEATURES)})")
@@ -920,6 +913,19 @@ class DataManager:
             df = self.downloader.download_multi_asset()
 
         print(f"  Shape: {df.shape}")
+
+        # =====================================================================
+        # ÉTAPE 1.5: Remove Synthetic Funding Rate (Audit P1.2)
+        # =====================================================================
+        # Synthetic funding rates cause spurious correlations and should not be used
+        # as features. The environment uses a fixed funding_rate=0.0001 for short costs.
+        # See audit DATA_PIPELINE_AUDIT_REPORT.md P1.2 for details.
+        if 'Funding_Rate' in df.columns:
+            print("\n[1.5/6] Removing Funding_Rate column (synthetic data - audit P1.2)...")
+            print("  [INFO] Funding rate removed to avoid spurious correlations")
+            print("  [INFO] Environment uses fixed funding_rate=0.0001 for short position costs")
+            df = df.drop(columns=['Funding_Rate'])
+            print(f"  Shape after removal: {df.shape}")
 
         # =====================================================================
         # ÉTAPE 2: Feature Engineering

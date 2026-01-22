@@ -2017,6 +2017,13 @@ class WFOPipeline:
         df_raw = self._load_raw_data(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
 
+        # Remove synthetic Funding_Rate (audit P1.2 - avoid spurious correlations)
+        if 'Funding_Rate' in df_raw.columns:
+            print("\n[INFO] Removing Funding_Rate column (synthetic data - audit P1.2)")
+            print("  [INFO] Environment uses fixed funding_rate=0.0001 for short position costs")
+            df_raw = df_raw.drop(columns=['Funding_Rate'])
+            print(f"  Shape after removal: {df_raw.shape}")
+
         # Pre-calculate features globally (P1 optimization: ~20-30% speedup)
         print("\n[OPTIMIZATION] Pre-calculating features globally (once)...")
         self._df_features_global = self.feature_engineer.engineer_features(df_raw)
@@ -2191,6 +2198,13 @@ class WFOPipeline:
         print(f"\nLoading raw data: {self.config.raw_data_path}")
         df_raw = self._load_raw_data(self.config.raw_data_path)
         print(f"  Shape: {df_raw.shape}")
+
+        # Remove synthetic Funding_Rate (audit P1.2 - avoid spurious correlations)
+        if 'Funding_Rate' in df_raw.columns:
+            print("\n[INFO] Removing Funding_Rate column (synthetic data - audit P1.2)")
+            print("  [INFO] Environment uses fixed funding_rate=0.0001 for short position costs")
+            df_raw = df_raw.drop(columns=['Funding_Rate'])
+            print(f"  Shape after removal: {df_raw.shape}")
 
         # Pre-calculate features globally (P1 optimization)
         print("\n[OPTIMIZATION] Pre-calculating features globally (once)...")

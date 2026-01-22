@@ -59,7 +59,8 @@ EXCLUDE_COLS: List[str] = [
     'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
     # HMM intermediate features (only use Prob_0/1/2/3 outputs)
     'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
-    'HMM_Funding', 'HMM_RiskOnOff', 'HMM_VolRatio',
+    'HMM_Funding',  # Removed from features (audit P1.2), kept here for backward compatibility
+    'HMM_RiskOnOff', 'HMM_VolRatio',
 ]
 
 # Ticker configurations
