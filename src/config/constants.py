@@ -65,6 +65,8 @@ EXCLUDE_COLS: List[str] = [
     'HMM_RiskOnOff', 'HMM_VolRatio',
     # Synthetic/problematic features (audit P1.2)
     'Funding_Rate',  # Synthetic funding rate - removed for data integrity
+    # Legacy HMM belief states (use HMM_Prob_* instead to avoid duplicates)
+    'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
 ]
 
 # Ticker configurations

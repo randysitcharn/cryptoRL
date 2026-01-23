@@ -3616,6 +3616,7 @@ def run_mae_audit(
             'epochs': epochs,
             'segment_id': segment_id
         }
+        results['feature_names'] = feature_names
     
     # Load or train model
     print(f"\n[2/6] Preparing model...")
@@ -3810,6 +3811,16 @@ def generate_mae_audit_report(results: Dict, output_dir: str) -> str:
         if 'encoder_path' in results and results['encoder_path']:
             f.write(f"  encoder_path: {results['encoder_path']}\n")
         f.write("\n")
+
+        # Feature list
+        if 'feature_names' in results:
+            feature_names = results['feature_names']
+            f.write("INPUT FEATURES\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"  Total: {len(feature_names)} features\n\n")
+            for i, name in enumerate(feature_names):
+                f.write(f"  {i+1:2d}. {name}\n")
+            f.write("\n")
         
         # Section 1: Training Dynamics
         f.write("=" * 80 + "\n")
