@@ -4776,17 +4776,24 @@ def run_tqc_audit(
 
 def _serialize_results(results: Dict) -> Dict:
     """Convert numpy arrays to lists for JSON serialization."""
-    serializable = {}
-    for key, value in results.items():
+    def _convert(value):
         if isinstance(value, dict):
-            serializable[key] = _serialize_results(value)
+            return {k: _convert(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [_convert(item) for item in value]
+        elif isinstance(value, tuple):
+            return tuple(_convert(item) for item in value)
         elif isinstance(value, np.ndarray):
-            serializable[key] = value.tolist()
-        elif isinstance(value, (np.integer, np.floating)):
-            serializable[key] = float(value)
+            return value.tolist()
+        elif isinstance(value, (np.integer, np.int64, np.int32)):
+            return int(value)
+        elif isinstance(value, (np.floating, np.float64, np.float32)):
+            return float(value)
+        elif isinstance(value, (np.bool_,)):
+            return bool(value)
         else:
-            serializable[key] = value
-    return serializable
+            return value
+    return _convert(results)
 
 
 def _generate_tqc_plots(results: Dict, plots_dir: str):
