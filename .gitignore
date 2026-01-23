@@ -12,6 +12,7 @@ __pycache__/
 # IDEs
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 
@@ -38,3 +39,6 @@ models/
 .claude/
 weights/
 *.zip
+
+# Audit results (regenerated)
+results/
