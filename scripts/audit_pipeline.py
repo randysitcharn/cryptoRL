@@ -4819,11 +4819,11 @@ def _generate_tqc_plots(results: Dict, plots_dir: str):
         bin_means_return = results['calibration']['bin_means_return']
         valid_bins = [i for i, q in enumerate(bin_means_q) if not np.isnan(q)]
         if valid_bins:
-            plt.plot([bin_means_q[i] for i in valid_bins],
-                    [bin_means_return[i] for i in valid_bins],
-                    'o-', label='Actual')
-            plt.plot([min(bin_means_q[valid_bins]), max(bin_means_q[valid_bins])],
-                    [min(bin_means_q[valid_bins]), max(bin_means_q[valid_bins])],
+            valid_q_values = [bin_means_q[i] for i in valid_bins]
+            valid_return_values = [bin_means_return[i] for i in valid_bins]
+            plt.plot(valid_q_values, valid_return_values, 'o-', label='Actual')
+            plt.plot([min(valid_q_values), max(valid_q_values)],
+                    [min(valid_q_values), max(valid_q_values)],
                     '--', label='Perfect Calibration')
             plt.xlabel('Predicted Q-value (Binned)')
             plt.ylabel('Actual Return')
