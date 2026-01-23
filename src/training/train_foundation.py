@@ -132,7 +132,7 @@ def train_epoch(
     device: torch.device,
     config: TrainingConfig,
     supervised: bool = True,
-    aux_loss_weight: float = 0.1,
+    aux_loss_weight: float = 2.0,
     limit: Optional[int] = None
 ) -> dict:
     """
@@ -146,7 +146,7 @@ def train_epoch(
         device: Device (cuda/cpu).
         config: Configuration d'entraînement.
         supervised: Si True, utilise les targets de direction.
-        aux_loss_weight: Poids de la loss auxiliaire (défaut: 0.1).
+        aux_loss_weight: Poids de la loss auxiliaire (défaut: 2.0 pour forcer l'apprentissage directionnel).
 
     Returns:
         Dict avec 'total', 'recon', 'aux' losses moyennes.
@@ -187,9 +187,16 @@ def train_epoch(
 
             # 2. Auxiliary Prediction Loss (direction du marché)
             if supervised and target_direction is not None:
+                # Utiliser pos_weight pour pénaliser les Faux Positifs (modèle trop optimiste)
+                # pos_weight < 1.0 pénalise la classe positive (Hausse)
+                # On utilise 0.8 pour sous-pondérer légèrement la classe majoritaire
+                pos_weight = torch.tensor([0.8], device=device)
                 aux_loss = nn.functional.binary_cross_entropy_with_logits(
-                    pred_logits, target_direction
+                    pred_logits.view(-1), target_direction.view(-1).float(),
+                    pos_weight=pos_weight
                 )
+                # Augmentation drastique du poids de la supervision pour forcer l'apprentissage directionnel
+                # La recon_loss est déjà faible (~0.03), on veut que la prédiction domine le gradient
                 loss = recon_loss + aux_loss_weight * aux_loss
             else:
                 aux_loss = torch.tensor(0.0, device=device)
@@ -229,7 +236,7 @@ def validate(
     device: torch.device,
     config: TrainingConfig,
     supervised: bool = True,
-    aux_loss_weight: float = 0.1
+    aux_loss_weight: float = 2.0
 ) -> dict:
     """
     Valide le modèle.
@@ -275,8 +282,11 @@ def validate(
 
             # 2. Auxiliary Prediction Loss
             if supervised and target_direction is not None:
+                # Utiliser pos_weight pour pénaliser les Faux Positifs (modèle trop optimiste)
+                pos_weight = torch.tensor([0.8], device=device)
                 aux_loss = nn.functional.binary_cross_entropy_with_logits(
-                    pred_logits, target_direction
+                    pred_logits.view(-1), target_direction.view(-1).float(),
+                    pos_weight=pos_weight
                 )
                 loss = recon_loss + aux_loss_weight * aux_loss
 
@@ -371,7 +381,7 @@ def train(
     from_scratch: bool = False,
     extra_epochs: int = None,
     supervised: bool = True,
-    aux_loss_weight: float = 0.5,
+    aux_loss_weight: float = 2.0,
     limit: Optional[int] = None
 ):
     """
@@ -382,7 +392,7 @@ def train(
         from_scratch: Force un entraînement depuis zéro.
         extra_epochs: Nombre d'epochs supplémentaires (mode reprise).
         supervised: Si True, entraîne avec loss auxiliaire de direction.
-        aux_loss_weight: Poids de la loss auxiliaire (défaut: 0.1).
+        aux_loss_weight: Poids de la loss auxiliaire (défaut: 2.0 pour forcer l'apprentissage directionnel).
     """
     if config is None:
         config = TrainingConfig()
@@ -583,7 +593,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train CryptoMAE Foundation Model")
-    parser.add_argument("--epochs", type=int, default=70, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--patience", type=int, default=7, help="Early stopping patience")
@@ -593,8 +603,8 @@ if __name__ == "__main__":
                         help="Additional epochs to train (resume mode)")
     parser.add_argument("--unsupervised", action="store_true",
                         help="Train without auxiliary prediction loss (reconstruction only)")
-    parser.add_argument("--aux-weight", type=float, default=0.5,
-                        help="Weight for auxiliary prediction loss (default: 0.5)")
+    parser.add_argument("--aux-weight", type=float, default=2.0,
+                        help="Weight for auxiliary prediction loss (default: 2.0)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of batches per epoch (for testing)")
 
