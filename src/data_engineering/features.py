@@ -12,6 +12,12 @@ Référence: Lopez de Prado (2018) - Advances in Financial Machine Learning
 
 import numpy as np
 import pandas as pd
+try:
+    import talib  # TA-Lib: bibliothèque C performante pour indicateurs techniques
+    HAS_TALIB = True
+except (ImportError, Exception) as e:
+    HAS_TALIB = False
+    print(f"[WARNING] TA-Lib not available ({e}). Momentum features will use fallback values.")
 from typing import Dict, Tuple, Optional
 from statsmodels.tsa.stattools import adfuller
 
@@ -445,6 +451,114 @@ class FeatureEngineer:
         return df
 
     # =========================================================================
+    # MOMENTUM FEATURES (RSI, MACD, ADX)
+    # =========================================================================
+
+    def add_momentum_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ajoute les indicateurs de momentum via TA-Lib.
+
+        Features créées:
+        - {ASSET}_RSI_14: RSI 14 périodes (surachat/survente)
+        - {ASSET}_MACD_Hist: MACD Histogram (momentum court terme)
+        - {ASSET}_ADX_14: ADX 14 périodes (force de la tendance, sans direction)
+
+        Utilise TA-Lib (talib) pour tous les calculs (robust libraries constraint).
+
+        Args:
+            df: DataFrame avec colonnes {ASSET}_Close, {ASSET}_High, {ASSET}_Low.
+
+        Returns:
+            DataFrame avec colonnes RSI_14, MACD_Hist, ADX_14 ajoutées.
+        """
+        print("\n[Momentum] Calculating RSI, MACD, ADX via TA-Lib...")
+
+        for asset in self.ASSETS:
+            close_col = f"{asset}_Close"
+            high_col = f"{asset}_High"
+            low_col = f"{asset}_Low"
+
+            if close_col not in df.columns:
+                print(f"  [WARNING] {close_col} not found, skipping {asset}.")
+                continue
+
+            # Convertir en numpy arrays pour talib (talib nécessite des arrays numpy)
+            close_values = df[close_col].values.astype(np.float64)
+
+            # RSI 14
+            try:
+                if not HAS_TALIB:
+                    raise ImportError("TA-Lib not available")
+                # talib.RSI(close, timeperiod=14) retourne un array numpy
+                rsi = talib.RSI(close_values, timeperiod=14)
+                if rsi is not None and not np.isnan(rsi).all():
+                    df[f"{asset}_RSI_14"] = rsi
+                else:
+                    print(f"  [WARNING] RSI calculation returned None or all NaN for {asset}")
+                    df[f"{asset}_RSI_14"] = np.nan
+            except Exception as e:
+                print(f"  [WARNING] RSI calculation failed for {asset}: {e}")
+                df[f"{asset}_RSI_14"] = np.nan
+
+            # MACD (12, 26, 9) - extraire le histogram
+            try:
+                if not HAS_TALIB:
+                    raise ImportError("TA-Lib not available")
+                # talib.MACD retourne (macd, signal, hist) - 3 arrays numpy
+                macd, signal, hist = talib.MACD(close_values, fastperiod=12, slowperiod=26, signalperiod=9)
+                if hist is not None and not np.isnan(hist).all():
+                    df[f"{asset}_MACD_Hist"] = hist
+                else:
+                    print(f"  [WARNING] MACD calculation returned None or all NaN for {asset}")
+                    df[f"{asset}_MACD_Hist"] = np.nan
+            except Exception as e:
+                print(f"  [WARNING] MACD calculation failed for {asset}: {e}")
+                df[f"{asset}_MACD_Hist"] = np.nan
+
+            # ADX 14 (nécessite High et Low)
+            try:
+                if not HAS_TALIB:
+                    raise ImportError("TA-Lib not available")
+                if high_col not in df.columns or low_col not in df.columns:
+                    print(f"  [WARNING] {high_col} or {low_col} not found for ADX, skipping {asset}")
+                    df[f"{asset}_ADX_14"] = np.nan
+                else:
+                    high_values = df[high_col].values.astype(np.float64)
+                    low_values = df[low_col].values.astype(np.float64)
+                    
+                    # talib.ADX(high, low, close, timeperiod=14) retourne un array numpy
+                    adx = talib.ADX(high_values, low_values, close_values, timeperiod=14)
+                    if adx is not None and not np.isnan(adx).all():
+                        df[f"{asset}_ADX_14"] = adx
+                    else:
+                        print(f"  [WARNING] ADX calculation returned None or all NaN for {asset}")
+                        df[f"{asset}_ADX_14"] = np.nan
+            except Exception as e:
+                print(f"  [WARNING] ADX calculation failed for {asset}: {e}")
+                df[f"{asset}_ADX_14"] = np.nan
+
+            # Nettoyage robuste des NaN générés par le lag
+            # Backfill puis forward fill pour les premières valeurs
+            for col_suffix in ['_RSI_14', '_MACD_Hist', '_ADX_14']:
+                col_name = f"{asset}{col_suffix}"
+                if col_name in df.columns:
+                    # Backfill d'abord (remplir avec la première valeur valide)
+                    df[col_name] = df[col_name].bfill()
+                    # Puis forward fill pour les premières valeurs restantes
+                    df[col_name] = df[col_name].ffill()
+                    # En dernier recours, remplir avec 0 (ou valeur neutre)
+                    if col_suffix == '_RSI_14':
+                        df[col_name] = df[col_name].fillna(50.0)  # RSI neutre = 50
+                    elif col_suffix == '_MACD_Hist':
+                        df[col_name] = df[col_name].fillna(0.0)  # MACD Hist neutre = 0
+                    elif col_suffix == '_ADX_14':
+                        df[col_name] = df[col_name].fillna(0.0)  # ADX neutre = 0
+
+            print(f"  {asset}: RSI_14, MACD_Hist, ADX_14 computed")
+
+        return df
+
+    # =========================================================================
     # VOLUME FEATURES
     # =========================================================================
 
@@ -555,14 +669,15 @@ class FeatureEngineer:
 
         Ordre d'exécution:
         0. Sanitize prices (0 -> NaN -> ffill)
-        1. Log-Returns (with hard clip +/- 20%)
-        2. Volume Relatif (log)
-        3. Parkinson Volatility
-        4. Garman-Klass Volatility
-        5. Rolling Z-Score
-        6. Fractional Differentiation (FFD)
-        7. Clean (drop NaN)
-        8. Validate (check for extreme values)
+        1. Momentum Features (RSI, MACD, ADX via TA-Lib)
+        2. Log-Returns (with hard clip +/- 20%)
+        3. Volume Relatif (log)
+        4. Parkinson Volatility
+        5. Garman-Klass Volatility
+        6. Rolling Z-Score
+        7. Fractional Differentiation (FFD)
+        8. Clean (drop NaN)
+        9. Validate (check for extreme values)
 
         Args:
             df: DataFrame multi-actifs brut.
@@ -577,28 +692,32 @@ class FeatureEngineer:
         # 0. Sanitize prices (prevents log(0) = -inf explosions)
         df = self._sanitize_prices(df)
 
-        # 1. Log-Returns (with hard clip +/- 20%)
+        # 1. Momentum Features (RSI, MACD, ADX via TA-Lib)
+        # Calculées tôt car elles n'ont besoin que des prix OHLC bruts (pas de Log-Returns, volatilités, etc.)
+        df = self.add_momentum_features(df)
+
+        # 2. Log-Returns (with hard clip +/- 20%)
         df = self.add_log_returns(df)
 
-        # 2. Volume Relatif (log)
+        # 3. Volume Relatif (log)
         df = self.add_volume_features(df)
 
-        # 3. Parkinson Volatility
+        # 4. Parkinson Volatility
         df = self.add_parkinson_volatility(df)
 
-        # 4. Garman-Klass Volatility
+        # 5. Garman-Klass Volatility
         df = self.add_garman_klass_volatility(df)
 
-        # 5. Rolling Z-Score
+        # 6. Rolling Z-Score
         df = self.add_rolling_zscore(df)
 
-        # 6. Fractional Differentiation (le plus coûteux)
+        # 7. Fractional Differentiation (le plus coûteux)
         df = self.add_fracdiff(df)
 
-        # 7. Clean NaN
+        # 8. Clean NaN
         df = self.clean(df)
 
-        # 8. Validate features (check for extreme values)
+        # 9. Validate features (check for extreme values)
         self._validate_features(df)
 
         print("\n" + "=" * 60)

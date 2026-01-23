@@ -34,10 +34,12 @@ class RegimeDetector:
     Détecteur de régimes de marché via GMM-HMM avec K-Means Warm Start.
 
     Approche SOTA avec Leading Indicators + Archetype Alignment:
-    1. Features dédiées au HMM (6 features):
+    1. Features dédiées au HMM (7 features):
        - HMM_Trend: Moyenne glissante 168h des Log-Returns
        - HMM_Vol: Volatilité Parkinson rolling 168h
-       - HMM_Momentum: RSI 14 normalisé [0, 1]
+       - HMM_RSI_14: RSI 14 depuis FeatureEngineer (via TA-Lib)
+       - HMM_MACD_Hist: MACD Histogram depuis FeatureEngineer (via TA-Lib)
+       - HMM_ADX_14: ADX 14 depuis FeatureEngineer (via TA-Lib)
        - HMM_Funding: REMOVED (synthetic funding causes spurious correlations - audit P1.2)
        - HMM_RiskOnOff: SPX - DXY (risk-on/off signal)
        - HMM_VolRatio: Vol court/long terme (early warning)
@@ -53,26 +55,28 @@ class RegimeDetector:
     """
 
     # Features dédiées au HMM (calculées en interne)
-    # Quick Wins: +RiskOnOff, +VolRatio pour anticipation régimes
-    # NOTE: HMM_Funding removed (synthetic funding causes spurious correlations - see audit P1.2)
+    # Features HMM stables (4 features orthogonales)
+    # Configuration validée: génère 4 états distincts avec scaling interne
     HMM_FEATURES = [
-        'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
-        'HMM_RiskOnOff',    # SPX - DXY (risk-on/off signal)
-        'HMM_VolRatio',     # Vol court/long (early warning)
+        'HMM_Vol',      # Volatilité (log Parkinson)
+        'HMM_RSI_14',   # RSI brut [0-100], scalé en interne
+        'HMM_ADX_14',   # ADX brut [0-100], scalé en interne (force du trend)
+        'HMM_Trend',    # Rolling mean log-returns
     ]
 
-    # Archétypes fixes basés sur connaissance métier BTC (hourly data)
+    # Archétypes en Z-Scores (unités standardisées après RobustScaler)
     # Utilisés pour aligner les états HMM de manière absolue via Hungarian Algorithm
     # Résout le problème de "Semantic Drift" entre segments WFO
+    # NOTE: Valeurs en sigmas (écarts-types), pas en pourcentages bruts
     STATE_ARCHETYPES = {
-        0: {'name': 'Crash',     'mean_ret': -0.0050, 'mean_vol': 0.040},  # -5%/h, 4% vol
-        1: {'name': 'Downtrend', 'mean_ret': -0.0010, 'mean_vol': 0.015},  # -0.1%/h, 1.5% vol
-        2: {'name': 'Range',     'mean_ret':  0.0000, 'mean_vol': 0.005},  # Plat, 0.5% vol
-        3: {'name': 'Uptrend',   'mean_ret':  0.0015, 'mean_vol': 0.020},  # +0.15%/h, 2% vol
+        0: {'name': 'Crash',     'mean_ret': -2.5, 'mean_vol':  2.0},  # Crash violent, vol extrême
+        1: {'name': 'Downtrend', 'mean_ret': -0.8, 'mean_vol':  0.5},  # Légèrement baissier
+        2: {'name': 'Range',     'mean_ret':  0.0, 'mean_vol': -1.0},  # Neutre, vol faible
+        3: {'name': 'Uptrend',   'mean_ret':  1.0, 'mean_vol':  0.5},  # Haussier, vol moyenne
     }
 
-    # Fenêtre de lissage (1 semaine en heures)
-    SMOOTHING_WINDOW = 168
+    # Fenêtre de lissage (24h pour plus de réactivité - fix HMM convergence)
+    SMOOTHING_WINDOW = 24
 
     def __init__(
         self,
@@ -107,7 +111,9 @@ class RegimeDetector:
         self.kmeans: Optional[KMeans] = None
 
         # Scaler pour normaliser les features avant HMM
-        self.scaler = StandardScaler()
+        # RobustScaler utilise médiane/IQR au lieu de moyenne/std, plus robuste aux outliers
+        # Crucial pour RSI/MACD/ADX qui ont des échelles différentes
+        self.scaler = RobustScaler()
 
         # Statistiques par état (pour debug)
         self.state_stats: Dict[int, Dict] = {}
@@ -123,8 +129,9 @@ class RegimeDetector:
         """
         Calcule les features dédiées au HMM.
 
-        Ces features sont lissées sur 168h pour capter les tendances
-        de fond et ignorer le bruit horaire.
+        Ces features sont lissées sur SMOOTHING_WINDOW (24h) pour capter les tendances.
+        NOTE: Les features sont retournées en valeurs BRUTES - le scaling est fait
+        dans fit_predict() avec un RobustScaler interne avant passage au HMM.
 
         Args:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Fracdiff.
@@ -141,23 +148,36 @@ class RegimeDetector:
         ).mean()
 
         # 2. Vol_Feature: Volatilité Parkinson rolling 168h
-        df_result['HMM_Vol'] = df['BTC_Parkinson'].rolling(
+        # Apply Log transform for more Gaussian distribution (HMM-friendly)
+        # Log transform reduces the impact of level shifts and makes KPSS more likely to pass
+        hmm_vol_raw = df['BTC_Parkinson'].rolling(
             window=self.SMOOTHING_WINDOW,
             min_periods=self.SMOOTHING_WINDOW
         ).mean()
+        df_result['HMM_Vol'] = np.log(hmm_vol_raw + 1e-6)
 
-        # 3. Momentum_Feature: RSI 14 sur BTC_LogRet (centré autour de 0)
-        # Note: BTC_Fracdiff après log() est toujours positif, donc RSI ne fonctionne pas
-        # On utilise BTC_LogRet qui oscille naturellement autour de 0
-        logret = df['BTC_LogRet']
-        gain = logret.where(logret > 0, 0).rolling(window=14, min_periods=14).mean()
-        loss = (-logret.where(logret < 0, 0)).rolling(window=14, min_periods=14).mean()
+        # 3. Momentum Features depuis FeatureEngineer (via TA-Lib)
+        # NOTE: Ces features sont DÉJÀ scalées par RobustScaler dans preprocess_segment
+        # Ne PAS diviser par 100 - elles sont déjà en format mean≈0, std≈1, clip[-5,5]
+        if 'BTC_RSI_14' in df.columns:
+            df_result['HMM_RSI_14'] = df['BTC_RSI_14']  # Already scaled by RobustScaler
+        else:
+            print("  [WARNING] BTC_RSI_14 not found, using 0.0 (neutral scaled value)")
+            df_result['HMM_RSI_14'] = 0.0  # Scaled neutral = 0
 
-        # RSI borne naturellement [0, 100] → idéal pour Gaussian HMM
-        # Ajouter epsilon pour éviter division par zéro
-        rs = gain / (loss + 1e-10)
-        rsi = 100 - (100 / (1 + rs))
-        df_result['HMM_Momentum'] = rsi / 100  # Normaliser [0, 1]
+        # MACD Histogram: already scaled by RobustScaler
+        if 'BTC_MACD_Hist' in df.columns:
+            df_result['HMM_MACD_Hist'] = df['BTC_MACD_Hist']  # Already scaled
+        else:
+            print("  [WARNING] BTC_MACD_Hist not found, using 0.0 (neutral)")
+            df_result['HMM_MACD_Hist'] = 0.0
+
+        # ADX 14: already scaled by RobustScaler
+        if 'BTC_ADX_14' in df.columns:
+            df_result['HMM_ADX_14'] = df['BTC_ADX_14']  # Already scaled
+        else:
+            print("  [WARNING] BTC_ADX_14 not found, using 0.0 (neutral)")
+            df_result['HMM_ADX_14'] = 0.0
 
         # 4. Funding Rate - REMOVED (see audit P1.2)
         # Synthetic funding rates cause spurious correlations and are not used as features.
@@ -180,13 +200,18 @@ class RegimeDetector:
         vol_long = df['BTC_Parkinson'].rolling(window=168, min_periods=168).mean()
         df_result['HMM_VolRatio'] = vol_short / (vol_long + 1e-10)
 
-        # Clip HMM features pour stabilité numérique
-        df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-0.05, 0.05)  # ±5%/h max
-        df_result['HMM_Vol'] = df_result['HMM_Vol'].clip(0, 0.2)  # Vol max 20%/h
-        df_result['HMM_Momentum'] = df_result['HMM_Momentum'].clip(0, 1)  # RSI strict [0,1]
-        df_result['HMM_RiskOnOff'] = df_result['HMM_RiskOnOff'].clip(-0.02, 0.02)  # ±2%
-        df_result['HMM_VolRatio'] = df_result['HMM_VolRatio'].clip(0.2, 5.0)  # Ratio [0.2x, 5x]
-        # HMM_Funding removed (audit P1.2 - synthetic funding causes spurious correlations)
+        # Clip HMM features pour stabilité numérique (outliers extrêmes uniquement)
+        # NOTE: Le scaling interne du RegimeDetector (fit_predict) normalise ces features
+        # avant de les passer au HMM, donc on ne clippe que les outliers vraiment extrêmes
+        df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-0.10, 0.10)  # ±10%/h max (outliers)
+        df_result['HMM_Vol'] = df_result['HMM_Vol'].clip(-12, 0)  # Log-vol bounds (élargi)
+        # RSI, MACD, ADX: valeurs BRUTES ici, scalées dans fit_predict() - pas de clip agressif
+        # RSI: 0-100, ADX: 0-100, MACD: variable selon prix
+        df_result['HMM_RSI_14'] = df_result['HMM_RSI_14'].clip(0, 100)  # Bornes naturelles RSI
+        df_result['HMM_MACD_Hist'] = df_result['HMM_MACD_Hist'].clip(-2000, 2000)  # Outliers extrêmes
+        df_result['HMM_ADX_14'] = df_result['HMM_ADX_14'].clip(0, 100)  # Bornes naturelles ADX
+        df_result['HMM_RiskOnOff'] = df_result['HMM_RiskOnOff'].clip(-0.05, 0.05)  # ±5% (élargi)
+        df_result['HMM_VolRatio'] = df_result['HMM_VolRatio'].clip(0.1, 10.0)  # Ratio [0.1x, 10x]
 
         n_features = len(self.HMM_FEATURES)
         print(f"  Computed HMM features (window={self.SMOOTHING_WINDOW}h, {n_features} features: {', '.join(self.HMM_FEATURES)})")
@@ -233,9 +258,6 @@ class RegimeDetector:
         # Injecter les centres K-Means dans means_
         # means_ shape: (n_components, n_mix, n_features)
         kmeans_centers = self.kmeans.cluster_centers_
-
-        # Répliquer les centres pour chaque mixture component
-        # Avec un léger bruit pour différencier les mixtures
         np.random.seed(self.random_state)
         for i in range(self.n_components):
             for j in range(self.n_mix):
@@ -347,7 +369,13 @@ class RegimeDetector:
 
         cost_matrix = cdist(weighted_archetypes, weighted_current, metric='euclidean')
 
-        # 6. Hungarian Algorithm pour appariement optimal
+        # 6. Check for NaN/Inf in cost_matrix (can happen when HMM converges to 1 state)
+        if not np.isfinite(cost_matrix).all():
+            print("  [WARNING] Cost matrix contains NaN/Inf - using default identity mapping")
+            # Replace NaN/Inf with large values to allow Hungarian to proceed
+            cost_matrix = np.nan_to_num(cost_matrix, nan=1e10, posinf=1e10, neginf=1e10)
+
+        # 7. Hungarian Algorithm pour appariement optimal
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         # Debug: afficher le mapping trouvé
@@ -470,7 +498,17 @@ class RegimeDetector:
         print(f"  Valid samples: {len(features_valid)}")
 
         # 3. Scaler les features
-        features_scaled = self.scaler.fit_transform(features_valid)
+        self.scaler.fit(features_valid)
+
+        # --- FIX: Numerical Stability for Flat Features ---
+        # Empêche l'explosion des valeurs si l'IQR est proche de 0 (ex: SPX_MACD_Hist)
+        # MIN_IQR=1.0 garantit que les valeurs scalées restent dans une plage raisonnable
+        # avant le clip(-5, 5)
+        MIN_IQR = 1.0
+        self.scaler.scale_ = np.maximum(self.scaler.scale_, MIN_IQR)
+        # --------------------------------------------------
+
+        features_scaled = self.scaler.transform(features_valid)
 
         # Clip scaled features to [-5, 5] for numerical stability
         features_scaled = np.clip(features_scaled, -5, 5)
@@ -512,7 +550,7 @@ class RegimeDetector:
             )
             self.hmm._init(features_scaled, None)
 
-            # Injecter les centres K-Means
+            # Injecter les centres K-Means dans means_
             kmeans_centers = self.kmeans.cluster_centers_
             np.random.seed(current_random_state)
             for i in range(self.n_components):
@@ -969,6 +1007,13 @@ class DataManager:
             # Fit on train only, transform all (prevents data leakage)
             print(f"  [LEAK-FREE] Fitting scaler on train only (first {train_end_idx} rows)")
             self.scaler.fit(df.iloc[:train_end_idx][cols_to_scale])
+
+            # --- FIX: Numerical Stability for Flat Features ---
+            MIN_IQR = 1e-4
+            self.scaler.scale_ = np.maximum(self.scaler.scale_, MIN_IQR)
+            print(f"  [Safety] Applied min_scale={MIN_IQR} to prevent div/0 explosion.")
+            # --------------------------------------------------
+
             df[cols_to_scale] = self.scaler.transform(df[cols_to_scale])
         else:
             # Legacy mode - fit_transform on full dataset (DATA LEAKAGE WARNING)
@@ -979,7 +1024,15 @@ class DataManager:
                 UserWarning
             )
             print("  [WARNING] Legacy mode: fit_transform on full dataset (data leakage risk)")
-            df[cols_to_scale] = self.scaler.fit_transform(df[cols_to_scale])
+            self.scaler.fit(df[cols_to_scale])
+
+            # --- FIX: Numerical Stability for Flat Features ---
+            MIN_IQR = 1e-4
+            self.scaler.scale_ = np.maximum(self.scaler.scale_, MIN_IQR)
+            print(f"  [Safety] Applied min_scale={MIN_IQR} to prevent div/0 explosion.")
+            # --------------------------------------------------
+
+            df[cols_to_scale] = self.scaler.transform(df[cols_to_scale])
 
         # Sauvegarder le scaler
         with open(scaler_path, 'wb') as f:

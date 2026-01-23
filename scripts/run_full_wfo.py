@@ -366,6 +366,14 @@ class WFOPipeline:
         # Fit on train ONLY
         scaler.fit(train_df[cols_to_scale])
 
+        # --- FIX: Numerical Stability for Flat Features ---
+        # Empêche l'explosion des valeurs si l'IQR est proche de 0 (ex: SPX_MACD_Hist)
+        # MIN_IQR=1.0 garantit que les valeurs scalées restent dans une plage raisonnable
+        MIN_IQR = 1.0
+        scaler.scale_ = np.maximum(scaler.scale_, MIN_IQR)
+        print(f"  [Safety] Applied min_scale={MIN_IQR} to RobustScaler to prevent div/0 explosion.")
+        # --------------------------------------------------
+
         # Transform all three splits
         train_df[cols_to_scale] = scaler.transform(train_df[cols_to_scale])
         eval_df[cols_to_scale] = scaler.transform(eval_df[cols_to_scale])
@@ -544,8 +552,14 @@ class WFOPipeline:
         # DEBUG: Verify d_model alignment
         print(f"  DEBUG: Starting MAE Training with d_model={config.d_model}")
 
-        # Train
-        model, best_loss = train(config, from_scratch=True)
+        # Train with supervised auxiliary loss (direction prediction)
+        # aux_loss_weight=1.0 ensures signal preservation (see analyze_pipeline_hmm_mae.py)
+        model, best_loss = train(
+            config,
+            from_scratch=True,
+            supervised=True,
+            aux_loss_weight=1.0
+        )
 
         print(f"  MAE trained. Best loss: {best_loss:.4f}")
         print(f"  Encoder saved: {config.encoder_path}")
@@ -1346,6 +1360,19 @@ class WFOPipeline:
             print(f"[EXEC] Processing data and training HMM for Segment {segment_id}...")
             # Normal flow: Preprocess -> Train HMM -> Save
             train_df, eval_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+
+            # DEBUG: Vérification du Scaling avant HMM
+            features_check = ['BTC_RSI_14', 'BTC_MACD_Hist', 'BTC_ADX_14']
+            print("\n[AUDIT SCALING] Vérification des features momentum avant HMM:")
+            for f in features_check:
+                if f in train_df.columns:
+                    stat = train_df[f]
+                    print(f"  > {f}: Mean={stat.mean():.4f}, Std={stat.std():.4f}, Min={stat.min():.4f}, Max={stat.max():.4f}")
+                    if abs(stat.mean()) > 1.0 or stat.std() > 5.0:
+                        print(f"    ⚠️ ALERTE: {f} semble mal scalé !")
+                else:
+                    print(f"  ⚠️ ALERTE: {f} manquant !")
+
             train_df, eval_df, test_df, hmm, context_rows = self.train_hmm(train_df, eval_df, test_df, segment_id)
 
             # Save artifacts for future skips
@@ -2235,6 +2262,18 @@ class WFOPipeline:
             try:
                 # 1. Preprocessing
                 train_df, eval_df, test_df, scaler = self.preprocess_segment(df_raw, segment)
+
+                # DEBUG: Vérification du Scaling avant HMM
+                features_check = ['BTC_RSI_14', 'BTC_MACD_Hist', 'BTC_ADX_14']
+                print("\n[AUDIT SCALING] Vérification des features momentum avant HMM:")
+                for f in features_check:
+                    if f in train_df.columns:
+                        stat = train_df[f]
+                        print(f"  > {f}: Mean={stat.mean():.4f}, Std={stat.std():.4f}, Min={stat.min():.4f}, Max={stat.max():.4f}")
+                        if abs(stat.mean()) > 1.0 or stat.std() > 5.0:
+                            print(f"    ⚠️ ALERTE: {f} semble mal scalé !")
+                    else:
+                        print(f"  ⚠️ ALERTE: {f} manquant !")
 
                 # 2. HMM (with context buffer)
                 train_df, eval_df, test_df, hmm, context_rows = self.train_hmm(train_df, eval_df, test_df, seg_id)

@@ -58,7 +58,9 @@ EXCLUDE_COLS: List[str] = [
     # Volumes bruts (utiliser VolRel à la place)
     'BTC_Volume', 'ETH_Volume', 'SPX_Volume', 'DXY_Volume', 'NASDAQ_Volume',
     # HMM intermediate features (only use Prob_0/1/2/3 outputs)
-    'HMM_Trend', 'HMM_Vol', 'HMM_Momentum',
+    'HMM_Trend', 'HMM_Vol',
+    'HMM_RSI_14', 'HMM_MACD_Hist', 'HMM_ADX_14',  # Momentum features depuis FeatureEngineer
+    'HMM_Momentum',  # Legacy: remplacé par HMM_RSI_14, HMM_MACD_Hist, HMM_ADX_14
     'HMM_Funding',  # Removed from features (audit P1.2), kept here for backward compatibility
     'HMM_RiskOnOff', 'HMM_VolRatio',
     # Synthetic/problematic features (audit P1.2)

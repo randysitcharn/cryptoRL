@@ -133,6 +133,10 @@ class CryptoMAE(nn.Module):
         # 4. Decoder Head: Linear projection inverse
         self.decoder = nn.Linear(d_model, input_dim)
 
+        # 5. Prediction Head: Classification de direction (auxiliaire)
+        # Prend la représentation poolée et prédit la direction du marché
+        self.prediction_head = nn.Linear(d_model, 1)
+
         # Learnable mask token (optionnel, utilisé à la place de 0)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, input_dim))
         nn.init.normal_(self.mask_token, std=0.02)
@@ -187,18 +191,19 @@ class CryptoMAE(nn.Module):
         self,
         x: torch.Tensor,
         mask_ratio: float = 0.15
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Forward pass avec masquage.
+        Forward pass avec masquage et prédiction de direction.
 
         Args:
             x: Input tensor de shape (batch, seq_len, input_dim)
             mask_ratio: Fraction de tokens à masquer (0.0 à 1.0)
 
         Returns:
-            pred: Prédictions complètes (batch, seq_len, input_dim)
+            pred: Prédictions de reconstruction (batch, seq_len, input_dim)
             target: Valeurs originales aux positions masquées (n_masked, input_dim)
             mask: Boolean mask (batch, seq_len), True = masqué
+            pred_logits: Logits de prédiction de direction (batch, 1)
         """
         batch_size, seq_len, _ = x.shape
 
@@ -225,15 +230,20 @@ class CryptoMAE(nn.Module):
         x_emb = self.pos_encoder(x_emb)
 
         # 5. Transformer Encoder
-        encoded = self.encoder(x_emb)
+        encoded = self.encoder(x_emb)  # Shape: (batch, seq_len, d_model)
 
-        # 6. Decoder
+        # 6. Decoder (reconstruction)
         pred = self.decoder(encoded)
 
         # 7. Extraire les targets (valeurs originales aux positions masquées)
         target = x[mask]  # Shape: (n_masked_total, input_dim)
 
-        return pred, target, mask
+        # 8. Prediction Head (direction auxiliaire)
+        # Global Average Pooling sur la dimension séquence
+        latent_pooled = encoded.mean(dim=1)  # Shape: (batch, d_model)
+        pred_logits = self.prediction_head(latent_pooled)  # Shape: (batch, 1)
+
+        return pred, target, mask, pred_logits
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -285,14 +295,16 @@ if __name__ == "__main__":
     model = CryptoMAE(input_dim=input_dim)
     x = torch.randn(batch_size, seq_len, input_dim)
 
-    pred, target, mask = model(x, mask_ratio=0.15)
+    pred, target, mask, pred_logits = model(x, mask_ratio=0.15)
 
-    print(f"Input shape:  {x.shape}")
-    print(f"Output shape: {pred.shape}")
-    print(f"Target shape: {target.shape}")
-    print(f"Mask shape:   {mask.shape}")
-    print(f"Masked tokens: {mask.sum().item()}")
+    print(f"Input shape:       {x.shape}")
+    print(f"Recon pred shape:  {pred.shape}")
+    print(f"Target shape:      {target.shape}")
+    print(f"Mask shape:        {mask.shape}")
+    print(f"Pred logits shape: {pred_logits.shape}")
+    print(f"Masked tokens:     {mask.sum().item()}")
 
     # Vérifier les shapes
-    assert pred.shape == x.shape, "Shape mismatch!"
+    assert pred.shape == x.shape, "Reconstruction shape mismatch!"
+    assert pred_logits.shape == (batch_size, 1), "Prediction logits shape mismatch!"
     print("\n[OK] Shape verification passed!")

@@ -129,8 +129,8 @@ def run_oracle_test(
         n_quantiles=config.n_quantiles,
     )
 
-    # Select policy
-    policy_class = "MlpPolicy"
+    # Select policy - Dict observation space requires MultiInputPolicy
+    policy_class = "MultiInputPolicy"
 
     model = TQC(
         policy=policy_class,

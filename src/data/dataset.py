@@ -28,6 +28,8 @@ class CryptoDataset(Dataset):
         seq_len: Longueur des fenêtres
         n_features: Nombre de features
         feature_cols: Liste des noms de colonnes utilisées
+        close_prices: Array numpy des prix close pour calcul des targets
+        return_targets: Si True, retourne (window, target) au lieu de window seul
     """
 
     def __init__(
@@ -36,7 +38,9 @@ class CryptoDataset(Dataset):
         seq_len: int = 64,
         feature_cols: Optional[List[str]] = None,
         start_idx: Optional[int] = None,
-        end_idx: Optional[int] = None
+        end_idx: Optional[int] = None,
+        return_targets: bool = False,
+        close_col: str = "BTC_Close"
     ):
         """
         Initialise le dataset.
@@ -47,9 +51,13 @@ class CryptoDataset(Dataset):
             feature_cols: Liste des colonnes à utiliser (si None, auto-détection).
             start_idx: Index de début (pour train/val/test split).
             end_idx: Index de fin (pour train/val/test split).
+            return_targets: Si True, retourne (window, target) pour supervised learning.
+            close_col: Colonne de prix close pour calculer les targets de direction.
         """
         self.seq_len = seq_len
         self.parquet_path = parquet_path
+        self.return_targets = return_targets
+        self.close_col = close_col
 
         # Charger les données
         df = pd.read_parquet(parquet_path)
@@ -73,6 +81,21 @@ class CryptoDataset(Dataset):
         # Extraire les données comme array numpy
         self.data = df[feature_cols].values.astype(np.float32)
 
+        # Extraire les prix close pour les targets de direction
+        # On garde une copie même si close_col est dans EXCLUDE_COLS
+        if close_col in df.columns:
+            self.close_prices = df[close_col].values.astype(np.float32)
+        else:
+            # Fallback: chercher une colonne close
+            close_candidates = [c for c in df.columns if 'close' in c.lower()]
+            if close_candidates:
+                self.close_prices = df[close_candidates[0]].values.astype(np.float32)
+                print(f"[CryptoDataset] Using {close_candidates[0]} for targets")
+            else:
+                self.close_prices = None
+                if return_targets:
+                    raise ValueError(f"No close column found for targets. Available: {df.columns.tolist()}")
+
         # Vérifier qu'il n'y a pas de NaN
         if np.isnan(self.data).any():
             nan_count = np.isnan(self.data).sum()
@@ -86,23 +109,47 @@ class CryptoDataset(Dataset):
         print(f"  Shape: ({len(self.data)}, {self.n_features})")
         print(f"  Window size: {seq_len}")
         print(f"  Features: {self.n_features}")
+        if return_targets:
+            print(f"  Mode: Supervised (returning targets)")
 
     def __len__(self) -> int:
         """Nombre de fenêtres disponibles."""
+        # Si return_targets=True, on a besoin de close[t+seq_len] pour la target
+        # Donc on s'arrête 1 step avant la fin
+        if self.return_targets:
+            return len(self.data) - self.seq_len  # -1 implicite pour le lookahead
         return len(self.data) - self.seq_len + 1
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         """
-        Retourne une fenêtre glissante.
+        Retourne une fenêtre glissante et optionnellement la target.
 
         Args:
             idx: Index de la fenêtre.
 
         Returns:
-            Tensor de shape (seq_len, n_features).
+            Si return_targets=False: Tensor de shape (seq_len, n_features)
+            Si return_targets=True: Tuple (window, target) où:
+                - window: Tensor (seq_len, n_features)
+                - target: Tensor (1,) avec 1.0 si hausse, 0.0 sinon
         """
         window = self.data[idx:idx + self.seq_len]
-        return torch.from_numpy(window)
+        window_tensor = torch.from_numpy(window)
+
+        if not self.return_targets:
+            return window_tensor
+
+        # Calcul de la target: Sign(Close[t+seq_len] - Close[t+seq_len-1])
+        # t+seq_len est le premier step APRÈS la fenêtre
+        # t+seq_len-1 est le dernier step DE la fenêtre
+        close_future = self.close_prices[idx + self.seq_len]
+        close_current = self.close_prices[idx + self.seq_len - 1]
+
+        # Target: 1.0 si hausse, 0.0 sinon (pour BCEWithLogitsLoss)
+        direction = 1.0 if close_future > close_current else 0.0
+        target = torch.tensor([direction], dtype=torch.float32)
+
+        return window_tensor, target
 
     def get_feature_names(self) -> List[str]:
         """Retourne la liste des noms de features."""
@@ -114,7 +161,9 @@ class CryptoDataset(Dataset):
         seq_len: int = 64,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
-        feature_cols: Optional[List[str]] = None
+        feature_cols: Optional[List[str]] = None,
+        return_targets: bool = False,
+        close_col: str = "BTC_Close"
     ) -> Tuple['CryptoDataset', 'CryptoDataset', 'CryptoDataset']:
         """
         Crée les splits train/val/test.
@@ -125,6 +174,8 @@ class CryptoDataset(Dataset):
             train_ratio: Ratio pour l'entraînement.
             val_ratio: Ratio pour la validation.
             feature_cols: Colonnes à utiliser.
+            return_targets: Si True, retourne (window, target) pour supervised learning.
+            close_col: Colonne de prix close pour calculer les targets.
 
         Returns:
             Tuple (train_dataset, val_dataset, test_dataset).
@@ -149,7 +200,9 @@ class CryptoDataset(Dataset):
             seq_len=seq_len,
             feature_cols=feature_cols,
             start_idx=0,
-            end_idx=train_end
+            end_idx=train_end,
+            return_targets=return_targets,
+            close_col=close_col
         )
 
         val_ds = CryptoDataset(
@@ -157,7 +210,9 @@ class CryptoDataset(Dataset):
             seq_len=seq_len,
             feature_cols=train_ds.feature_cols,  # Même colonnes que train
             start_idx=train_end,
-            end_idx=val_end
+            end_idx=val_end,
+            return_targets=return_targets,
+            close_col=close_col
         )
 
         test_ds = CryptoDataset(
@@ -165,7 +220,9 @@ class CryptoDataset(Dataset):
             seq_len=seq_len,
             feature_cols=train_ds.feature_cols,  # Même colonnes que train
             start_idx=val_end,
-            end_idx=None
+            end_idx=None,
+            return_targets=return_targets,
+            close_col=close_col
         )
 
         return train_ds, val_ds, test_ds

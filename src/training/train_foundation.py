@@ -59,12 +59,13 @@ def get_device_verbose() -> torch.device:
 # Data Preparation
 # =============================================================================
 
-def prepare_data(config: TrainingConfig):
+def prepare_data(config: TrainingConfig, supervised: bool = True):
     """
     Prépare les données avec split chronologique.
 
     Args:
         config: Configuration d'entraînement.
+        supervised: Si True, retourne (features, target) pour supervised learning.
 
     Returns:
         train_loader, val_loader, n_features
@@ -74,7 +75,8 @@ def prepare_data(config: TrainingConfig):
     # Charger le dataset complet
     dataset = CryptoDataset(
         parquet_path=os.path.join(ROOT_DIR, config.data_path),
-        seq_len=config.seq_len
+        seq_len=config.seq_len,
+        return_targets=supervised
     )
 
     n_samples = len(dataset)
@@ -127,33 +129,63 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     device: torch.device,
-    config: TrainingConfig
-) -> float:
+    config: TrainingConfig,
+    supervised: bool = True,
+    aux_loss_weight: float = 0.1
+) -> dict:
     """
     Entraîne le modèle pour une époque.
 
+    Args:
+        model: Le modèle CryptoMAE.
+        loader: DataLoader d'entraînement.
+        optimizer: Optimiseur.
+        scaler: GradScaler pour mixed precision.
+        device: Device (cuda/cpu).
+        config: Configuration d'entraînement.
+        supervised: Si True, utilise les targets de direction.
+        aux_loss_weight: Poids de la loss auxiliaire (défaut: 0.1).
+
     Returns:
-        Loss moyenne sur l'époque.
+        Dict avec 'total', 'recon', 'aux' losses moyennes.
     """
     model.train()
     total_loss = 0.0
+    total_recon_loss = 0.0
+    total_aux_loss = 0.0
     n_batches = 0
 
     pbar = tqdm(loader, desc="Training", leave=False)
 
     for batch in pbar:
-        batch = batch.to(device)
+        # Dépack le batch selon le mode
+        if supervised:
+            x, target_direction = batch
+            x = x.to(device)
+            target_direction = target_direction.to(device)  # Shape: (batch, 1)
+        else:
+            x = batch.to(device)
+            target_direction = None
 
         optimizer.zero_grad()
 
         # Mixed precision forward
         with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-            pred, target, mask = model(batch, mask_ratio=config.mask_ratio)
+            pred, target_recon, mask, pred_logits = model(x, mask_ratio=config.mask_ratio)
 
-            # MSE Loss sur les tokens masqués uniquement
-            # pred[mask] et target ont la même shape: (n_masked, n_features)
+            # 1. Reconstruction Loss (tokens masqués uniquement)
             pred_masked = pred[mask]
-            loss = nn.functional.mse_loss(pred_masked, target)
+            recon_loss = nn.functional.mse_loss(pred_masked, target_recon)
+
+            # 2. Auxiliary Prediction Loss (direction du marché)
+            if supervised and target_direction is not None:
+                aux_loss = nn.functional.binary_cross_entropy_with_logits(
+                    pred_logits, target_direction
+                )
+                loss = recon_loss + aux_loss_weight * aux_loss
+            else:
+                aux_loss = torch.tensor(0.0, device=device)
+                loss = recon_loss
 
         # Backward avec scaling
         if device.type == 'cuda':
@@ -165,11 +197,21 @@ def train_epoch(
             optimizer.step()
 
         total_loss += loss.item()
+        total_recon_loss += recon_loss.item()
+        total_aux_loss += aux_loss.item()
         n_batches += 1
 
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'recon': f'{recon_loss.item():.4f}',
+            'aux': f'{aux_loss.item():.4f}'
+        })
 
-    return total_loss / n_batches
+    return {
+        'total': total_loss / n_batches,
+        'recon': total_recon_loss / n_batches,
+        'aux': total_aux_loss / n_batches
+    }
 
 
 @torch.no_grad()
@@ -177,30 +219,77 @@ def validate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    config: TrainingConfig
-) -> float:
+    config: TrainingConfig,
+    supervised: bool = True,
+    aux_loss_weight: float = 0.1
+) -> dict:
     """
     Valide le modèle.
 
+    Args:
+        model: Le modèle CryptoMAE.
+        loader: DataLoader de validation.
+        device: Device (cuda/cpu).
+        config: Configuration d'entraînement.
+        supervised: Si True, utilise les targets de direction.
+        aux_loss_weight: Poids de la loss auxiliaire.
+
     Returns:
-        Loss moyenne sur la validation.
+        Dict avec 'total', 'recon', 'aux', 'accuracy' métriques.
     """
     model.eval()
     total_loss = 0.0
+    total_recon_loss = 0.0
+    total_aux_loss = 0.0
+    correct_predictions = 0
+    total_predictions = 0
     n_batches = 0
 
     for batch in loader:
-        batch = batch.to(device)
+        # Dépack le batch selon le mode
+        if supervised:
+            x, target_direction = batch
+            x = x.to(device)
+            target_direction = target_direction.to(device)
+        else:
+            x = batch.to(device)
+            target_direction = None
 
         with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-            pred, target, mask = model(batch, mask_ratio=config.mask_ratio)
+            pred, target_recon, mask, pred_logits = model(x, mask_ratio=config.mask_ratio)
+
+            # 1. Reconstruction Loss
             pred_masked = pred[mask]
-            loss = nn.functional.mse_loss(pred_masked, target)
+            recon_loss = nn.functional.mse_loss(pred_masked, target_recon)
+
+            # 2. Auxiliary Prediction Loss
+            if supervised and target_direction is not None:
+                aux_loss = nn.functional.binary_cross_entropy_with_logits(
+                    pred_logits, target_direction
+                )
+                loss = recon_loss + aux_loss_weight * aux_loss
+
+                # Accuracy de prédiction de direction
+                pred_direction = (torch.sigmoid(pred_logits) > 0.5).float()
+                correct_predictions += (pred_direction == target_direction).sum().item()
+                total_predictions += target_direction.numel()
+            else:
+                aux_loss = torch.tensor(0.0, device=device)
+                loss = recon_loss
 
         total_loss += loss.item()
+        total_recon_loss += recon_loss.item()
+        total_aux_loss += aux_loss.item()
         n_batches += 1
 
-    return total_loss / n_batches
+    accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+
+    return {
+        'total': total_loss / n_batches,
+        'recon': total_recon_loss / n_batches,
+        'aux': total_aux_loss / n_batches,
+        'accuracy': accuracy
+    }
 
 
 def save_checkpoint(
@@ -269,7 +358,9 @@ def load_checkpoint(
 def train(
     config: TrainingConfig = None,
     from_scratch: bool = False,
-    extra_epochs: int = None
+    extra_epochs: int = None,
+    supervised: bool = True,
+    aux_loss_weight: float = 0.1
 ):
     """
     Boucle d'entraînement principale.
@@ -278,6 +369,8 @@ def train(
         config: Configuration (utilise défauts si None).
         from_scratch: Force un entraînement depuis zéro.
         extra_epochs: Nombre d'epochs supplémentaires (mode reprise).
+        supervised: Si True, entraîne avec loss auxiliaire de direction.
+        aux_loss_weight: Poids de la loss auxiliaire (défaut: 0.1).
     """
     if config is None:
         config = TrainingConfig()
@@ -291,7 +384,7 @@ def train(
     device = get_device()
 
     # Data
-    train_loader, val_loader, n_features = prepare_data(config)
+    train_loader, val_loader, n_features = prepare_data(config, supervised=supervised)
 
     # Model
     print("\n[Model] Creating CryptoMAE...")
@@ -364,6 +457,9 @@ def train(
     print(f"  Learning rate: {config.lr}")
     print(f"  Mask ratio: {config.mask_ratio}")
     print(f"  Early stopping patience: {config.patience}")
+    print(f"  Mode: {'Supervised (Task-Aware)' if supervised else 'Unsupervised (Reconstruction only)'}")
+    if supervised:
+        print(f"  Aux loss weight: {aux_loss_weight}")
     print()
 
     # ==========================================================================
@@ -386,27 +482,46 @@ def train(
         epoch_start = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, scaler, device, config)
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, scaler, device, config,
+            supervised=supervised, aux_loss_weight=aux_loss_weight
+        )
 
         # Validate
-        val_loss = validate(model, val_loader, device, config)
+        val_metrics = validate(
+            model, val_loader, device, config,
+            supervised=supervised, aux_loss_weight=aux_loss_weight
+        )
 
         epoch_time = time.time() - epoch_start
 
         # Print progress
-        print(f"Epoch {epoch:02d}/{end_epoch} | "
-              f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"Time: {epoch_time:.1f}s")
+        if supervised:
+            print(f"Epoch {epoch:02d}/{end_epoch} | "
+                  f"Train: {train_metrics['total']:.4f} (R:{train_metrics['recon']:.4f} A:{train_metrics['aux']:.4f}) | "
+                  f"Val: {val_metrics['total']:.4f} (Acc:{val_metrics['accuracy']:.1%}) | "
+                  f"Time: {epoch_time:.1f}s")
+        else:
+            print(f"Epoch {epoch:02d}/{end_epoch} | "
+                  f"Train Loss: {train_metrics['total']:.4f} | "
+                  f"Val Loss: {val_metrics['total']:.4f} | "
+                  f"Time: {epoch_time:.1f}s")
 
         # TensorBoard Logging
         if writer:
-            writer.add_scalar("loss/train", train_loss, epoch)
-            writer.add_scalar("loss/val", val_loss, epoch)
+            writer.add_scalar("loss/train_total", train_metrics['total'], epoch)
+            writer.add_scalar("loss/train_recon", train_metrics['recon'], epoch)
+            writer.add_scalar("loss/val_total", val_metrics['total'], epoch)
+            writer.add_scalar("loss/val_recon", val_metrics['recon'], epoch)
             writer.add_scalar("loss/best_val", best_val_loss, epoch)
             writer.add_scalar("time/epoch_seconds", epoch_time, epoch)
+            if supervised:
+                writer.add_scalar("loss/train_aux", train_metrics['aux'], epoch)
+                writer.add_scalar("loss/val_aux", val_metrics['aux'], epoch)
+                writer.add_scalar("accuracy/val_direction", val_metrics['accuracy'], epoch)
 
-        # Early Stopping Check
+        # Early Stopping Check (based on total loss)
+        val_loss = val_metrics['total']
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -464,6 +579,10 @@ if __name__ == "__main__":
                         help="Force training from scratch, ignoring checkpoints")
     parser.add_argument("--extra-epochs", type=int, default=None,
                         help="Additional epochs to train (resume mode)")
+    parser.add_argument("--unsupervised", action="store_true",
+                        help="Train without auxiliary prediction loss (reconstruction only)")
+    parser.add_argument("--aux-weight", type=float, default=0.1,
+                        help="Weight for auxiliary prediction loss (default: 0.1)")
 
     args = parser.parse_args()
 
@@ -475,4 +594,10 @@ if __name__ == "__main__":
     config.patience = args.patience
 
     # Train
-    train(config, from_scratch=args.from_scratch, extra_epochs=args.extra_epochs)
+    train(
+        config,
+        from_scratch=args.from_scratch,
+        extra_epochs=args.extra_epochs,
+        supervised=not args.unsupervised,
+        aux_loss_weight=args.aux_weight
+    )
