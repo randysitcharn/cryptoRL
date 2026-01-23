@@ -4412,46 +4412,76 @@ def analyze_tqc_attribution(
     for idx in indices:
         obs_sample = observations[idx]
         action_sample = actions[idx]
-        
+
+        # Create tensors with requires_grad
+        market_tensor = torch.tensor(obs_sample['market'], dtype=torch.float32).unsqueeze(0).to(device)
+        market_tensor.requires_grad_(True)
+        position_tensor = torch.tensor(obs_sample['position'], dtype=torch.float32).unsqueeze(0).to(device)
+        position_tensor.requires_grad_(True)
+        w_cost_tensor = torch.tensor(obs_sample['w_cost'], dtype=torch.float32).unsqueeze(0).to(device)
+        w_cost_tensor.requires_grad_(True)
+
         obs_tensor = {
-            'market': torch.tensor(obs_sample['market'], dtype=torch.float32).unsqueeze(0).to(device).requires_grad_(True),
-            'position': torch.tensor(obs_sample['position'], dtype=torch.float32).unsqueeze(0).to(device).requires_grad_(True),
-            'w_cost': torch.tensor(obs_sample['w_cost'], dtype=torch.float32).unsqueeze(0).to(device).requires_grad_(True)
+            'market': market_tensor,
+            'position': position_tensor,
+            'w_cost': w_cost_tensor
         }
         action_tensor = torch.tensor([action_sample], dtype=torch.float32).unsqueeze(0).to(device)
-        
-        # Get Q-value
-        quantiles = model.policy.critic(obs_tensor, action_tensor)
-        q_value = quantiles.mean()  # Average across critics and quantiles
-        
-        # Compute gradients
-        q_value.backward()
-        
-        # Extract gradients
-        market_grad = obs_tensor['market'].grad.abs().mean().item()
-        position_grad = obs_tensor['position'].grad.abs().mean().item()
-        w_cost_grad = obs_tensor['w_cost'].grad.abs().mean().item()
-        
-        feature_gradients.append({
-            'market': market_grad,
-            'position': position_grad,
-            'w_cost': w_cost_grad
-        })
+
+        try:
+            # Get Q-value - try different critic interfaces
+            if hasattr(model.policy.critic, 'forward'):
+                quantiles = model.policy.critic(obs_tensor, action_tensor)
+            else:
+                # Fallback: use actor to get action value
+                quantiles = model.policy.critic.q1_forward(obs_tensor, action_tensor)
+
+            q_value = quantiles.mean()  # Average across critics and quantiles
+
+            # Zero gradients before backward
+            if market_tensor.grad is not None:
+                market_tensor.grad.zero_()
+            if position_tensor.grad is not None:
+                position_tensor.grad.zero_()
+            if w_cost_tensor.grad is not None:
+                w_cost_tensor.grad.zero_()
+
+            # Compute gradients
+            q_value.backward(retain_graph=True)
+
+            # Extract gradients with None check
+            market_grad = market_tensor.grad.abs().mean().item() if market_tensor.grad is not None else 0.0
+            position_grad = position_tensor.grad.abs().mean().item() if position_tensor.grad is not None else 0.0
+            w_cost_grad = w_cost_tensor.grad.abs().mean().item() if w_cost_tensor.grad is not None else 0.0
+
+            feature_gradients.append({
+                'market': market_grad,
+                'position': position_grad,
+                'w_cost': w_cost_grad
+            })
+        except Exception as e:
+            # Skip this sample if gradient computation fails
+            if len(feature_gradients) == 0:
+                print(f"  [WARNING] Gradient computation failed: {e}")
+            continue
     
-    # Aggregate gradients
-    avg_gradients = {
-        'market': np.mean([g['market'] for g in feature_gradients]),
-        'position': np.mean([g['position'] for g in feature_gradients]),
-        'w_cost': np.mean([g['w_cost'] for g in feature_gradients])
-    }
-    
-    # Rank features by importance
-    feature_ranking = sorted(avg_gradients.items(), key=lambda x: x[1], reverse=True)
-    
+    # Aggregate gradients (with fallback for empty list)
+    if len(feature_gradients) == 0:
+        print(f"  [WARNING] No gradients computed - critic may not support gradient flow")
+        avg_gradients = {'market': 0.0, 'position': 0.0, 'w_cost': 0.0}
+        feature_ranking = [('market', 0.0), ('position', 0.0), ('w_cost', 0.0)]
+    else:
+        avg_gradients = {
+            'market': np.mean([g['market'] for g in feature_gradients]),
+            'position': np.mean([g['position'] for g in feature_gradients]),
+            'w_cost': np.mean([g['w_cost'] for g in feature_gradients])
+        }
+        feature_ranking = sorted(avg_gradients.items(), key=lambda x: x[1], reverse=True)
+
     results = {
         'feature_gradients': avg_gradients,
         'feature_ranking': feature_ranking,
-        'n_samples': sample_size
+        'n_samples': len(feature_gradients)
     }
     
     print(f"  Analyzed {sample_size} samples")
