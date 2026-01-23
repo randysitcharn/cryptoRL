@@ -424,15 +424,13 @@ class BatchCryptoEnv(VecEnv):
             Rewards for all envs. Shape: (n_envs,)
         """
         SCALE = 100.0
-        
+
         # ═══════════════════════════════════════════════════════════════════
-        # MORL CALIBRATION: MAX_PENALTY_SCALE
-        # CRITICAL: r_cost * MAX_PENALTY_SCALE must be same order of magnitude as r_perf
-        # If log-returns ≈ 0.01/step → SCALE*0.01 = 1.0
-        # If position_delta ≈ 0.1/step → SCALE*0.1 = 10.0
-        # We want w_cost=1 to make costs matter, so scale up costs
+        # MORL CALIBRATION: MAX_PENALTY_SCALE (Reward Rescue - FiLM audit)
+        # Audit: Policy Paralysis — agent stuck in Cash (92%) when penalty too high.
+        # Original 2.0 was too punitive; divide by 5 so agent learns Alpha before Cost.
         # ═══════════════════════════════════════════════════════════════════
-        MAX_PENALTY_SCALE = 0.0  # Disabled: no churn penalty (testing PnL-only reward)
+        MAX_PENALTY_SCALE = 0.4  # 2.0 / 5 — softer cost penalty, avoid policy paralysis
 
         # Safety caps to prevent NaN/explosion
         COST_PENALTY_CAP = 20.0
@@ -462,7 +460,7 @@ class BatchCryptoEnv(VecEnv):
         # Shape: w_cost (n_envs, 1), r_cost (n_envs,) → squeeze for broadcast
         # ═══════════════════════════════════════════════════════════════════
         w_cost_squeezed = self.w_cost.squeeze(-1)  # (n_envs,)
-        
+
         # Total reward: performance + weighted costs
         # When w_cost=0: reward = r_perf (pure profit seeking)
         # When w_cost=1: reward = r_perf + r_cost * MAX_PENALTY_SCALE (cost-conscious)

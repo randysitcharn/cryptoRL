@@ -8,10 +8,11 @@ for TQC (Truncated Quantile Critics) agents in Stable Baselines3.
 The encoder weights are frozen by default to preserve the learned
 market representations during initial RL training.
 
-Architecture (updated for Dict observation space):
+Architecture (FiLM + Dict observation space):
 - Input: Dict {"market": (B, 64, 43), "position": (B, 1)}
-- Market → Transformer Encoder → Flatten (8192)
-- Concat(market_features, position) → Linear → LayerNorm → LeakyReLU
+- Market → MAE Encoder (frozen) → (B, 64, 128)
+- HMM context = last 5 cols of market (4 probs + entropy) → FiLM modulation
+- Modulated embed → Flatten (8192) → Concat(position) → Linear → LeakyReLU
 - Output: (B, features_dim)
 """
 
@@ -22,23 +23,28 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from typing import Optional, Dict
 
 from src.models.foundation import CryptoMAE
+from src.models.layers import FiLMLayer
+
+# HMM context: 4 regime probabilities + 1 entropy (last 5 columns of market)
+HMM_CONTEXT_SIZE = 5
 
 
 class FoundationFeatureExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor using a pre-trained CryptoMAE encoder with position injection.
+    Feature extractor using a pre-trained CryptoMAE encoder with FiLM + position.
 
     Accepts Dict observation space with:
-    - "market": (seq_len, n_features) market data
+    - "market": (seq_len, n_features) market data (last 5 cols = HMM context)
     - "position": (1,) current position
 
     Architecture:
-    - Market data → Encoder → Flatten (8192)
-    - Concat with position (8193)
-    - Linear projection with LeakyReLU (no Tanh to avoid vanishing gradients)
+    - Market → MAE Encoder (frozen) → embeddings (B, 64, 128)
+    - HMM context = market[:, -1, -5:] (4 probs + entropy)
+    - FiLM(embeddings, HMM context) → modulated embeddings
+    - Flatten → LayerNorm → Concat(position) → Linear → LeakyReLU
 
-    The encoder is frozen by default to prevent "breaking" the
-    pre-trained representations during early RL training.
+    FiLM forces the model to use regime information to modulate MAE features.
+    The encoder is frozen; only FiLM and fusion layers are trainable.
     """
 
     def __init__(
@@ -87,6 +93,9 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.market_flatten_dim = self.window_size * d_model  # 64 * 128 = 8192
         self.total_input_dim = self.market_flatten_dim + self.position_dim  # 8193
 
+        # FiLM: use HMM context only if we have enough feature columns
+        self.use_film = self.n_features >= HMM_CONTEXT_SIZE
+
         # Initialize parent class with features_dim
         super().__init__(observation_space, features_dim)
 
@@ -118,6 +127,17 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             self.mae.embedding = self.mae.embedding.half()
             self.mae.encoder = self.mae.encoder.half()
             print("[FoundationFeatureExtractor] Encoder converted to float16 for faster inference")
+
+        # FiLM: context (HMM) modulates MAE embeddings before flatten
+        # Only instantiate when we have enough market columns (HMM_Prob_* + HMM_Entropy)
+        self.film_layer: Optional[nn.Module] = None
+        if self.use_film:
+            self.film_layer = FiLMLayer(
+                feature_dim=d_model,
+                context_dim=HMM_CONTEXT_SIZE,
+                hidden_dim=64,
+            )
+            print(f"[FoundationFeatureExtractor] FiLM: context_dim={HMM_CONTEXT_SIZE}, feature_dim={d_model} (HMM modulates MAE)")
 
         # Fusion Projector: market features + position → features_dim
         # Architecture: Concat(market_flat, position) → Linear → LayerNorm → LeakyReLU
@@ -240,38 +260,37 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             Feature tensor of shape (batch, features_dim).
         """
         # Extract market data and position from dict
-        market_obs = observations["market"]    # (B, 64, 43)
+        market_obs = observations["market"]    # (B, 64, n_features)
         position = observations["position"]    # (B, 1)
 
-        # 1. Encode market data using pretrained MAE encoder
+        # 1. Encode market data using pretrained MAE encoder (frozen)
         # Output: (batch, seq_len, d_model) = (B, 64, 128)
-        # Note: Handle dtype matching - encoder may be in half precision from training
         encoder_dtype = next(self.mae.embedding.parameters()).dtype
         if encoder_dtype == torch.float16:
-            # Encoder is in half precision (from GPU training)
             if market_obs.is_cuda:
-                # On GPU: use autocast for efficiency
                 with torch.amp.autocast('cuda'):
                     encoded = self.mae.encode(market_obs.half())
-                encoded = encoded.float()  # Convert back to float32 for fusion
+                encoded = encoded.float()
             else:
-                # On CPU: convert encoder back to float32 (half not well supported on CPU)
                 self.mae.embedding = self.mae.embedding.float()
                 self.mae.encoder = self.mae.encoder.float()
                 encoded = self.mae.encode(market_obs.float())
         else:
-            # Encoder is in float32
             encoded = self.mae.encode(market_obs.float())
 
-        # 2. Flatten and normalize market features
-        market_flat = self.market_flatten(encoded)  # (B, 8192)
+        # 2. FiLM modulation: HMM context (last 5 cols at last timestep) scales/shifts MAE embeddings
+        if self.film_layer is not None:
+            hmm_context = market_obs[:, -1, -HMM_CONTEXT_SIZE:].float()  # (B, 5)
+            modulated = self.film_layer(encoded, hmm_context)  # (B, 64, 128)
+        else:
+            modulated = encoded
+
+        # 3. Flatten and normalize
+        market_flat = self.market_flatten(modulated)  # (B, 8192)
         market_flat = self.market_layernorm(market_flat)
 
-        # 3. Concatenate market features with position
-        # Position tells the agent where it currently is (critical for learning to hold!)
+        # 4. Concat with position and project
         combined = torch.cat([market_flat, position], dim=1)  # (B, 8193)
-
-        # 4. Fusion projection with LeakyReLU (no Tanh!)
         features = self.fusion_projection(combined)  # (B, 512)
 
         return features
