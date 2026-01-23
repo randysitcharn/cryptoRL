@@ -1,8 +1,8 @@
 # Serveur actuel
 
 ```
-SSH_HOST=74.48.140.178
-SSH_PORT=25043
+SSH_HOST=212.93.107.107
+SSH_PORT=40075
 SSH_USER=root
 ```
 
@@ -40,14 +40,14 @@ L'environnement local peut être :
 2. **Utiliser directement** la commande ssh (la clé est déjà configurée dans l'agent Windows) :
    ```powershell
    # ✅ FONCTIONNE sur Windows/PowerShell
-   ssh -p 25043 root@74.48.140.178 "commande"
+   ssh -p 40075 root@212.93.107.107 "commande"
    ```
 
 3. **Chemin des clés SSH Windows** : `~/.ssh/` se traduit en `C:\Users\<user>\.ssh\`
 
 4. **Guillemets** : Utiliser des guillemets doubles pour les commandes distantes
    ```powershell
-   ssh -p 25043 root@74.48.140.178 "cd /workspace/cryptoRL && python3 script.py"
+   ssh -p 40075 root@212.93.107.107 "cd /workspace/cryptoRL && python3 script.py"
    ```
 
 5. **Pas de `&&` entre commandes locales PowerShell** - utiliser `;` ou des commandes séparées
@@ -56,12 +56,12 @@ L'environnement local peut être :
 
 Si l'agent SSH n'est pas démarré, utiliser :
 ```bash
-eval $(ssh-agent -s) && ssh-add ~/.ssh/id_ed25519 && ssh -p 25043 root@74.48.140.178 "commande"
+eval $(ssh-agent -s) && ssh-add ~/.ssh/id_ed25519 && ssh -p 40075 root@212.93.107.107 "commande"
 ```
 
 Sinon, directement :
 ```bash
-ssh -p 25043 root@74.48.140.178 "commande"
+ssh -p 40075 root@212.93.107.107 "commande"
 ```
 
 ## IMPORTANT: Rate Limiting & SSH Multiplexing (WSL)
@@ -75,8 +75,8 @@ Le multiplexing permet de réutiliser une connexion SSH existante → **pas de r
 **Configuration (déjà faite dans WSL ~/.ssh/config) :**
 ```
 Host vast
-    HostName 74.48.140.178
-    Port 25043
+    HostName 212.93.107.107
+    Port 40075
     User root
     IdentityFile ~/.ssh/id_ed25519
     ControlMaster auto
@@ -110,7 +110,7 @@ wsl bash -c "ssh vast 'cd /workspace/cryptoRL && python3 script.py'"
 
 Pour du travail interactif prolongé :
 ```powershell
-ssh -p 25043 root@74.48.140.178 -t "tmux attach -t ssh_tmux"
+ssh -p 40075 root@212.93.107.107 -t "tmux attach -t ssh_tmux"
 ```
 
 **Raccourcis tmux :**
@@ -134,26 +134,26 @@ ssh host "nohup cmd </dev/null >logs/fichier.log 2>&1 &"
 
 ```powershell
 # Session tmux (recommandé)
-ssh -p 25043 root@74.48.140.178 -t "tmux attach -t ssh_tmux"
+ssh -p 40075 root@212.93.107.107 -t "tmux attach -t ssh_tmux"
 
 # Shell simple
-ssh -p 25043 root@74.48.140.178
+ssh -p 40075 root@212.93.107.107
 ```
 
 ## SCP (copier données)
 
 ```powershell
 # Copier vers le serveur
-scp -P 25043 -r data/raw_historical/ root@74.48.140.178:/workspace/cryptoRL/data/
+scp -P 40075 -r data/raw_historical/ root@212.93.107.107:/workspace/cryptoRL/data/
 
 # Copier depuis le serveur
-scp -P 25043 root@74.48.140.178:/workspace/cryptoRL/results/wfo_results.csv ./
+scp -P 40075 root@212.93.107.107:/workspace/cryptoRL/results/wfo_results.csv ./
 ```
 
 ## Tunnel TensorBoard
 
 ```powershell
-ssh -p 25043 -L 8081:localhost:8081 root@74.48.140.178
+ssh -p 40075 -L 8081:localhost:8081 root@212.93.107.107
 # Ouvrir http://localhost:8081 dans le navigateur
 ```
 

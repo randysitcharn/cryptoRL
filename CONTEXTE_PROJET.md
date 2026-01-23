@@ -9,28 +9,28 @@
 
 ### Environnement virtuel
 
-Le projet utilise un environnement virtuel Python. Par défaut, il se trouve dans `.venv/` à la racine du projet.
+Le projet utilise un environnement virtuel Python. Par défaut, il se trouve dans `venv/` à la racine du projet.
 
 **Créer l'environnement virtuel (si nécessaire):**
 ```bash
-python -m venv .venv
+python -m venv venv
 ```
 
 **Activer l'environnement virtuel:**
 
 - **Windows (PowerShell):**
   ```powershell
-  .\.venv\Scripts\Activate.ps1
+  venv\Scripts\activate
   ```
 
 - **Windows (CMD):**
   ```cmd
-  .venv\Scripts\activate.bat
+  venv\Scripts\activate.bat
   ```
 
 - **Linux/Mac:**
   ```bash
-  source .venv/bin/activate
+  source venv/bin/activate
   ```
 
 **Installer les dépendances:**

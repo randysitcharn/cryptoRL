@@ -435,7 +435,7 @@ L'implémentation proposée (concaténer w_cost à l'observation et l'utiliser p
 ### 10.2 Données du Serveur
 
 ```
-SSH: ssh -p 20941 root@158.51.110.52
+SSH: ssh -p 40075 root@212.93.107.107
 Résultats: /workspace/cryptoRL/results/wfo_results.csv
 Logs: /workspace/cryptoRL/logs/wfo/
 ```
