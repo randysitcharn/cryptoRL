@@ -223,7 +223,7 @@ class WFOPipeline:
 
         return df
 
-    def calculate_segments(self, total_rows: int) -> List[Dict[str, int]]:
+    def calculate_segments(self, total_rows: int, warmup_offset: int = 0) -> List[Dict[str, int]]:
         """
         Calculate segment boundaries for rolling WFO with purge and embargo windows.
 
@@ -234,7 +234,17 @@ class WFOPipeline:
         - PURGE (720h): Gap between train→eval and eval→test to prevent indicator leakage
         - EMBARGO (24h): Gap after test before next segment's train (label correlation decay)
 
+        Dynamic WFO Offset:
+            If warmup_offset > 0, the first segment is shifted to accommodate feature
+            engineering warmup (rolling windows create NaN at the start).
+            This allows --train-months 36 without crashing on Segment 0.
+
         See audit DATA_PIPELINE_AUDIT_REPORT.md P0.2 for details.
+
+        Args:
+            total_rows: Total rows in raw dataset.
+            warmup_offset: Rows lost at the start due to feature engineering (NaN dropped).
+                          If provided, first segment starts at this offset.
 
         Returns:
             List of dicts with train_start, train_end, eval_start, eval_end, test_start, test_end
@@ -254,8 +264,13 @@ class WFOPipeline:
             embargo  # Embargo after test
         )
 
-        start = 0
+        # Dynamic WFO Offset: Start at warmup_offset to ensure first segment has enough data
+        start = warmup_offset
         segment_id = 0
+
+        if warmup_offset > 0:
+            print(f"[INFO] Dynamic WFO Offset: First segment shifted by {warmup_offset} rows "
+                  f"to accommodate feature engineering warmup.")
 
         while start + segment_size <= total_rows:
             train_start = start
@@ -2061,8 +2076,14 @@ class WFOPipeline:
         self._df_features_global = self.feature_engineer.engineer_features(df_raw)
         print(f"  Features shape: {self._df_features_global.shape}")
 
-        # Calculate segments
-        segments = self.calculate_segments(len(df_raw))
+        # Calculate warmup offset (rows lost at start due to feature engineering NaN)
+        # This enables Dynamic WFO Offset - first segment shifts to accommodate training window
+        warmup_offset = len(df_raw) - len(self._df_features_global)
+        if warmup_offset > 0:
+            print(f"  Warmup offset: {warmup_offset} rows (lost to rolling window NaN)")
+
+        # Calculate segments with dynamic offset
+        segments = self.calculate_segments(len(df_raw), warmup_offset=warmup_offset)
         print(f"\nTotal segments: {len(segments)}")
 
         # Filter segments if specified
@@ -2243,8 +2264,13 @@ class WFOPipeline:
         self._df_features_global = self.feature_engineer.engineer_features(df_raw)
         print(f"  Features shape: {self._df_features_global.shape}")
 
-        # Calculate all segments to get their boundaries
-        all_segments = self.calculate_segments(len(df_raw))
+        # Calculate warmup offset (rows lost at start due to feature engineering NaN)
+        warmup_offset = len(df_raw) - len(self._df_features_global)
+        if warmup_offset > 0:
+            print(f"  Warmup offset: {warmup_offset} rows (lost to rolling window NaN)")
+
+        # Calculate all segments to get their boundaries (with dynamic offset)
+        all_segments = self.calculate_segments(len(df_raw), warmup_offset=warmup_offset)
         segments_by_id = {s['id']: s for s in all_segments}
 
         all_metrics = []
