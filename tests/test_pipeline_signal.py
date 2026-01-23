@@ -233,11 +233,13 @@ class TestPipelineSignal:
         target = self._create_target(df)
         df_aligned = df.iloc[:-1]
 
-        # HMM probability columns
-        hmm_cols = [col for col in df_aligned.columns if col.startswith('Prob_')]
+        # HMM probability columns (priorité: HMM_Prob_* puis Prob_*)
+        hmm_cols = [col for col in df_aligned.columns if col.startswith('HMM_Prob_')]
+        if len(hmm_cols) == 0:
+            hmm_cols = [col for col in df_aligned.columns if col.startswith('Prob_')]
 
         if len(hmm_cols) == 0:
-            pytest.skip("No HMM probability columns found")
+            pytest.skip("No HMM probability columns found (neither HMM_Prob_* nor Prob_*)")
 
         X = df_aligned[hmm_cols].fillna(0.25).values
 
@@ -274,8 +276,10 @@ class TestPipelineSignal:
             and df_aligned[col].dtype in [np.float64, np.float32]
         ]
 
-        # HMM probs
-        hmm_cols = [col for col in df_aligned.columns if col.startswith('Prob_')]
+        # HMM probs (priorité: HMM_Prob_* puis Prob_*)
+        hmm_cols = [col for col in df_aligned.columns if col.startswith('HMM_Prob_')]
+        if len(hmm_cols) == 0:
+            hmm_cols = [col for col in df_aligned.columns if col.startswith('Prob_')]
 
         if len(raw_cols) == 0 or len(hmm_cols) == 0:
             pytest.skip("Missing features for comparison")
@@ -352,7 +356,7 @@ class TestMAESignalPreservation:
 
         x = torch.randn(8, 32, input_dim, device=device)
 
-        pred, target, mask = model(x, mask_ratio=0.15)
+        pred, target, mask, pred_logits = model(x, mask_ratio=0.15)
 
         # Pred should have same shape as input
         assert pred.shape == x.shape
@@ -360,6 +364,9 @@ class TestMAESignalPreservation:
         # Target should be extracted masked values
         n_masked = mask.sum().item()
         assert target.shape == (n_masked, input_dim)
+        
+        # pred_logits should have shape (batch, 1)
+        assert pred_logits.shape == (8, 1)
 
     def test_mae_preserves_variance(self, device):
         """

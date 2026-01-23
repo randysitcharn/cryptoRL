@@ -3,6 +3,7 @@
 test_callbacks.py - Tests for RL Callbacks.
 
 Verifies that the critical callbacks work correctly:
+- UnifiedMetricsCallback: TensorBoard logging with standardized namespaces
 - ThreePhaseCurriculumCallback: phase transitions and curriculum_lambda
 - OverfittingGuardCallbackV2: 5 signal detection and multi-signal decision logic
 - ModelEMACallback: Polyak averaging and weight management
@@ -22,6 +23,7 @@ import pytest
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.training.callbacks import (
+    UnifiedMetricsCallback,
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallbackV2,
     ModelEMACallback,
@@ -74,6 +76,363 @@ def create_mock_env_with_curriculum():
     env.curriculum_lambda = 0.0
     env.set_progress = Mock()
     return env
+
+
+# ============================================================================
+# TestUnifiedMetricsCallback
+# ============================================================================
+
+class TestUnifiedMetricsCallback:
+    """Tests for UnifiedMetricsCallback TensorBoard logging."""
+    
+    def test_initialization(self):
+        """Test callback initialization with default and custom values."""
+        # Default values
+        callback = UnifiedMetricsCallback()
+        assert callback.log_freq == 100
+        assert callback.verbose == 0
+        assert len(callback.metrics_buffer) == 0
+        
+        # Custom values
+        callback = UnifiedMetricsCallback(log_freq=50, verbose=1)
+        assert callback.log_freq == 50
+        assert callback.verbose == 1
+    
+    def test_collect_light_metrics_from_infos(self):
+        """Test collection of light metrics from infos dict."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        callback.locals = {
+            "infos": [{
+                "portfolio_value": 10_500.0,
+                "position_pct": 0.75,
+                "max_drawdown": 0.05
+            }]
+        }
+        
+        callback._collect_light_metrics()
+        
+        assert len(callback.metrics_buffer["portfolio/nav"]) == 1
+        assert callback.metrics_buffer["portfolio/nav"][0] == 10_500.0
+        assert len(callback.metrics_buffer["portfolio/position_pct"]) == 1
+        assert callback.metrics_buffer["portfolio/position_pct"][0] == 0.75
+        assert len(callback.metrics_buffer["risk/max_drawdown"]) == 1
+        assert callback.metrics_buffer["risk/max_drawdown"][0] == 5.0  # Converted to %
+    
+    def test_log_buffered_metrics(self):
+        """Test logging of buffered metrics using record_mean."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # Fill buffer
+        callback.metrics_buffer["portfolio/nav"] = [10_000.0, 10_100.0, 10_200.0]
+        callback.metrics_buffer["portfolio/position_pct"] = [0.5, 0.6, 0.7]
+        
+        callback._log_buffered_metrics()
+        
+        # Verify record_mean was called
+        record_mean_calls = [call for call in callback.logger.record_mean.call_args_list]
+        assert len(record_mean_calls) == 2
+        
+        # Verify buffer was cleared
+        assert len(callback.metrics_buffer) == 0
+    
+    def test_log_global_metrics(self):
+        """Test logging of global metrics from get_global_metrics()."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # Create mock environment with get_global_metrics
+        mock_env = Mock()
+        mock_env.get_global_metrics = Mock(return_value={
+            "portfolio_value": 10_500.0,
+            "position_pct": 0.75,
+            "max_drawdown": 0.05,
+            "reward/pnl_component": 0.1,
+            "reward/churn_cost": 0.01,
+            "reward/smoothness": 0.02,
+            "reward/downside_risk": 0.005
+        })
+        callback.model.env = mock_env
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            callback._log_global_metrics()
+        
+        # Verify logger.record was called for all metrics
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        
+        assert "portfolio/nav" in keys_logged
+        assert "portfolio/position_pct" in keys_logged
+        assert "risk/max_drawdown" in keys_logged
+        assert "rewards/pnl_component" in keys_logged
+        assert "rewards/total_penalties" in keys_logged
+        
+        # Verify total_penalties aggregation
+        total_penalties_call = [call for call in record_calls if call[0][0] == "rewards/total_penalties"][0]
+        assert abs(total_penalties_call[0][1] - 0.035) < 1e-6  # 0.01 + 0.02 + 0.005
+    
+    def test_log_gradients(self):
+        """Test logging of gradient norms."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # Create mock actor and critic with gradients
+        actor = Mock()
+        actor_param1 = torch.nn.Parameter(torch.randn(10, requires_grad=True))
+        actor_param2 = torch.nn.Parameter(torch.randn(10, requires_grad=True))
+        actor_param1.grad = torch.randn(10) * 0.1
+        actor_param2.grad = torch.randn(10) * 0.1
+        actor.parameters = Mock(return_value=iter([actor_param1, actor_param2]))
+        
+        critic = Mock()
+        critic_param = torch.nn.Parameter(torch.randn(10, requires_grad=True))
+        critic_param.grad = torch.randn(10) * 0.05
+        critic.parameters = Mock(return_value=iter([critic_param]))
+        
+        callback.model.policy.actor = actor
+        callback.model.policy.critic = critic
+        
+        callback._log_gradients()
+        
+        # Verify gradient norms were logged
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        
+        assert "debug/grad_actor_norm" in keys_logged
+        assert "debug/grad_critic_norm" in keys_logged
+    
+    def test_log_gradients_no_grads(self):
+        """Test gradient logging when no gradients are available."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # Create mock actor without gradients
+        actor = Mock()
+        actor_param = torch.nn.Parameter(torch.randn(10, requires_grad=True))
+        actor_param.grad = None
+        actor.parameters = Mock(return_value=iter([actor_param]))
+        
+        callback.model.policy.actor = actor
+        
+        # Should not crash
+        callback._log_gradients()
+        
+        # Should not log anything if no gradients
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        assert "debug/grad_actor_norm" not in keys_logged
+    
+    def test_handle_episode_end_churn_ratio(self):
+        """Test episode end handling and churn ratio calculation."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # Set up episode data
+        callback.episode_churn_penalties = [0.01, 0.02, 0.01]
+        callback.episode_log_returns = [0.1, 0.2, 0.1]
+        
+        callback.locals = {
+            "infos": [{
+                "episode": {"r": 0.4}
+            }]
+        }
+        
+        callback._handle_episode_end()
+        
+        # Verify churn ratio was logged
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        
+        assert "strategy/churn_ratio" in keys_logged
+        
+        # Verify accumulators were reset
+        assert len(callback.episode_churn_penalties) == 0
+        assert len(callback.episode_log_returns) == 0
+    
+    def test_handle_episode_end_no_data(self):
+        """Test episode end handling when no data available."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        callback.locals = {
+            "infos": [{
+                "episode": {"r": 0.4}
+            }]
+        }
+        
+        # Should not crash
+        callback._handle_episode_end()
+        
+        # Should not log churn ratio if no data
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        assert "strategy/churn_ratio" not in keys_logged
+    
+    def test_logging_frequency(self):
+        """Test that heavy metrics are only logged at log_freq."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        callback.logger.dump = Mock()
+        
+        # Mock environment
+        mock_env = Mock()
+        mock_env.get_global_metrics = Mock(return_value={})
+        callback.model.env = mock_env
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            # Step 1: Should not log (not at log_freq)
+            callback.n_calls = 1
+            callback.num_timesteps = 1
+            callback.locals = {"infos": [{}]}
+            callback._on_step()
+            
+            # dump should not be called
+            assert callback.logger.dump.call_count == 0
+            
+            # Step 10: Should log (at log_freq)
+            callback.n_calls = 10
+            callback.num_timesteps = 10
+            callback._on_step()
+            
+            # dump should be called once
+            assert callback.logger.dump.call_count == 1
+    
+    def test_console_logging_verbose(self):
+        """Test console logging when verbose > 0."""
+        callback = UnifiedMetricsCallback(log_freq=10, verbose=1)
+        callback.model = create_mock_model()
+        callback.logger.dump = Mock()
+        
+        # Mock environment with metrics
+        mock_env = Mock()
+        mock_env.get_global_metrics = Mock(return_value={
+            "portfolio_value": 10_500.0,
+            "position_pct": 0.75,
+            "max_drawdown": 0.05
+        })
+        callback.model.env = mock_env
+        
+        callback.locals = {
+            "infos": [{
+                "episode": {"r": 0.4}
+            }]
+        }
+        
+        callback.last_time = None
+        callback.last_step = 0
+        callback.num_timesteps = 10
+        callback.n_calls = 10
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            with patch('builtins.print') as mock_print:
+                callback._on_step()
+                
+                # Verify print was called (console logging)
+                assert mock_print.called
+    
+    def test_console_logging_not_verbose(self):
+        """Test that console logging is skipped when verbose == 0."""
+        callback = UnifiedMetricsCallback(log_freq=10, verbose=0)
+        callback.model = create_mock_model()
+        callback.logger.dump = Mock()
+        
+        callback.locals = {"infos": [{}]}
+        callback.num_timesteps = 10
+        callback.n_calls = 10
+        
+        with patch('builtins.print') as mock_print:
+            callback._on_step()
+            
+            # Verify print was not called
+            assert not mock_print.called
+    
+    def test_get_training_metrics(self):
+        """Test get_training_metrics returns correct diagnostic metrics."""
+        callback = UnifiedMetricsCallback()
+        
+        # Fill diagnostic deques
+        callback.all_actions.extend([0.5, 0.6, 0.7])
+        callback.entropy_values.extend([1.0, 1.1, 1.2])
+        callback.critic_losses.extend([0.1, 0.2, 0.3])
+        callback.actor_losses.extend([0.05, 0.1, 0.15])
+        callback.churn_ratios.extend([0.1, 0.2, 0.3])
+        callback.actor_grad_norms.extend([0.5, 0.6, 0.7])
+        callback.critic_grad_norms.extend([0.3, 0.4, 0.5])
+        
+        metrics = callback.get_training_metrics()
+        
+        assert "action_saturation" in metrics
+        assert "avg_entropy" in metrics
+        assert "avg_critic_loss" in metrics
+        assert "avg_actor_loss" in metrics
+        assert "avg_churn_ratio" in metrics
+        assert "avg_actor_grad_norm" in metrics
+        assert "avg_critic_grad_norm" in metrics
+        
+        # Verify values are means
+        assert abs(metrics["action_saturation"] - 0.6) < 1e-6
+        assert abs(metrics["avg_entropy"] - 1.1) < 1e-6
+    
+    def test_get_training_metrics_empty(self):
+        """Test get_training_metrics with empty deques."""
+        callback = UnifiedMetricsCallback()
+        
+        metrics = callback.get_training_metrics()
+        
+        # All metrics should be 0.0 when deques are empty
+        assert metrics["action_saturation"] == 0.0
+        assert metrics["avg_entropy"] == 0.0
+        assert metrics["avg_critic_loss"] == 0.0
+        assert metrics["avg_actor_loss"] == 0.0
+        assert metrics["avg_churn_ratio"] == 0.0
+        assert metrics["avg_actor_grad_norm"] == 0.0
+        assert metrics["avg_critic_grad_norm"] == 0.0
+    
+    def test_init_callback_fps_tracking(self):
+        """Test that FPS tracking is initialized."""
+        callback = UnifiedMetricsCallback()
+        callback._init_callback()
+        
+        assert callback.last_time is not None
+        assert callback.last_step == 0
+    
+    def test_log_tqc_stats_no_critic(self):
+        """Test TQC stats logging when critic is not available."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # No critic in policy
+        callback.model.policy.critic = None
+        
+        # Should not crash
+        callback.locals = {"new_obs": np.array([[1.0, 2.0]]), "actions": np.array([[0.5]])}
+        callback._log_tqc_stats()
+        
+        # Should not log anything
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        assert "debug/q_values_mean" not in keys_logged
+    
+    def test_log_tqc_stats_no_obs_actions(self):
+        """Test TQC stats logging when obs/actions are not available."""
+        callback = UnifiedMetricsCallback(log_freq=10)
+        callback.model = create_mock_model()
+        
+        # Mock critic
+        critic = Mock()
+        callback.model.policy.critic = critic
+        
+        # No obs/actions in locals
+        callback.locals = {}
+        
+        # Should not crash
+        callback._log_tqc_stats()
+        
+        # Should not log anything
+        record_calls = callback.logger.record.call_args_list
+        keys_logged = [call[0][0] for call in record_calls]
+        assert "debug/q_values_mean" not in keys_logged
 
 
 # ============================================================================
