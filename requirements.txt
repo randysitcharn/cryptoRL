@@ -6,7 +6,7 @@ pandas
 numpy
 matplotlib
 yfinance
-# ta-lib  # Note: Requires C binary installed manually. Use pandas-ta as a simpler alternative if needed.
+ta-lib  # Requires: apt-get install -y libta-lib0-dev (or brew install ta-lib on macOS)
 pandas-ta
 ccxt
 statsmodels
