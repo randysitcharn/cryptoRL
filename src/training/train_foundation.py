@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from typing import Optional
 
 from src.data.dataset import CryptoDataset
 from src.models.foundation import CryptoMAE
@@ -131,7 +132,8 @@ def train_epoch(
     device: torch.device,
     config: TrainingConfig,
     supervised: bool = True,
-    aux_loss_weight: float = 0.1
+    aux_loss_weight: float = 0.1,
+    limit: Optional[int] = None
 ) -> dict:
     """
     Entraîne le modèle pour une époque.
@@ -157,12 +159,18 @@ def train_epoch(
 
     pbar = tqdm(loader, desc="Training", leave=False)
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
+        # Limiter le nombre de batches si spécifié (pour tests)
+        if limit is not None and batch_idx >= limit:
+            break
         # Dépack le batch selon le mode
         if supervised:
             x, target_direction = batch
             x = x.to(device)
-            target_direction = target_direction.to(device)  # Shape: (batch, 1)
+            target_direction = target_direction.to(device)
+            # S'assurer que target_direction a shape (batch, 1)
+            if target_direction.dim() == 1:
+                target_direction = target_direction.unsqueeze(1)
         else:
             x = batch.to(device)
             target_direction = None
@@ -251,6 +259,9 @@ def validate(
             x, target_direction = batch
             x = x.to(device)
             target_direction = target_direction.to(device)
+            # S'assurer que target_direction a shape (batch, 1)
+            if target_direction.dim() == 1:
+                target_direction = target_direction.unsqueeze(1)
         else:
             x = batch.to(device)
             target_direction = None
@@ -360,7 +371,8 @@ def train(
     from_scratch: bool = False,
     extra_epochs: int = None,
     supervised: bool = True,
-    aux_loss_weight: float = 0.1
+    aux_loss_weight: float = 0.5,
+    limit: Optional[int] = None
 ):
     """
     Boucle d'entraînement principale.
@@ -484,7 +496,7 @@ def train(
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, scaler, device, config,
-            supervised=supervised, aux_loss_weight=aux_loss_weight
+            supervised=supervised, aux_loss_weight=aux_loss_weight, limit=limit
         )
 
         # Validate
@@ -581,8 +593,10 @@ if __name__ == "__main__":
                         help="Additional epochs to train (resume mode)")
     parser.add_argument("--unsupervised", action="store_true",
                         help="Train without auxiliary prediction loss (reconstruction only)")
-    parser.add_argument("--aux-weight", type=float, default=0.1,
-                        help="Weight for auxiliary prediction loss (default: 0.1)")
+    parser.add_argument("--aux-weight", type=float, default=0.5,
+                        help="Weight for auxiliary prediction loss (default: 0.5)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit number of batches per epoch (for testing)")
 
     args = parser.parse_args()
 
@@ -599,5 +613,6 @@ if __name__ == "__main__":
         from_scratch=args.from_scratch,
         extra_epochs=args.extra_epochs,
         supervised=not args.unsupervised,
-        aux_loss_weight=args.aux_weight
+        aux_loss_weight=args.aux_weight,
+        limit=args.limit
     )

@@ -30,8 +30,7 @@ from src.models.rl_adapter import FoundationFeatureExtractor
 from src.training.batch_env import BatchCryptoEnv
 from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
-    StepLoggingCallback,
-    DetailTensorboardCallback,
+    UnifiedMetricsCallback,
     ThreePhaseCurriculumCallback,
     OverfittingGuardCallback,
     OverfittingGuardCallbackV2,
@@ -379,7 +378,7 @@ def create_callbacks(
     config: TrainingConfig,
     eval_env,
     shared_fee=None,
-) -> tuple[list, DetailTensorboardCallback]:
+) -> tuple[list, UnifiedMetricsCallback]:
     """
     Create training callbacks.
 
@@ -389,13 +388,13 @@ def create_callbacks(
         shared_fee: Shared memory Value for curriculum fee (SubprocVecEnv).
 
     Returns:
-        Tuple of (callbacks_list, detail_callback).
+        Tuple of (callbacks_list, unified_callback).
     """
     callbacks = []
 
-    # Step logging callback
-    step_callback = StepLoggingCallback(log_freq=config.log_freq)
-    callbacks.append(step_callback)
+    # Unified metrics callback (replaces StepLoggingCallback and DetailTensorboardCallback)
+    unified_callback = UnifiedMetricsCallback(log_freq=config.log_freq, verbose=config.verbose)
+    callbacks.append(unified_callback)
 
     # Note: Gradient clipping is now handled by ClippedAdamW optimizer
 
@@ -440,7 +439,7 @@ def create_callbacks(
     else:
         # WFO mode: no EvalCallback, use safety checkpoint with rotation
         print("      [WFO Mode] EvalCallback disabled.")
-        print("      [WFO Mode] Portfolio metrics logged via StepLoggingCallback (custom/nav, custom/position, custom/max_drawdown)")
+        print("      [WFO Mode] Portfolio metrics logged via UnifiedMetricsCallback (portfolio/nav, portfolio/position_pct, risk/max_drawdown)")
 
         # Safety checkpoint with disk rotation (keeps only last checkpoint)
         n_envs = getattr(config, 'n_envs', 1) or 1
@@ -454,10 +453,7 @@ def create_callbacks(
         callbacks.append(safety_checkpoint)
         print(f"      [WFO Mode] RotatingCheckpointCallback enabled (freq={safety_freq}, keeps last only)")
 
-    # Detail Tensorboard callback for reward components
-    # Uses config.log_freq for consistent logging frequency across all callbacks
-    detail_callback = DetailTensorboardCallback(log_freq=config.log_freq, verbose=0)
-    callbacks.append(detail_callback)
+    # Note: UnifiedMetricsCallback already added above (replaces DetailTensorboardCallback)
 
     # Curriculum Learning callback (3-Phase: Discovery → Discipline → Refinement)
     # Phases calibrées dans callbacks.py pour ratio |PnL|/|Penalties| ≈ 1.0
@@ -515,7 +511,7 @@ def create_callbacks(
         signal3_status = 'ON' if eval_cb else 'OFF (WFO mode)'
         print(f"  [Guard] OverfittingGuardCallbackV2 enabled (Signal 3: {signal3_status})")
 
-    return callbacks, detail_callback
+    return callbacks, unified_callback
 
 
 def train(
@@ -767,7 +763,7 @@ def train(
     print(f"      Checkpoint frequency: {config.checkpoint_freq:,}")
     print("\n" + "=" * 70)
 
-    callbacks, detail_callback = create_callbacks(
+    callbacks, unified_callback = create_callbacks(
         config, eval_env, shared_fee=shared_fee
     )
 
@@ -816,7 +812,7 @@ def train(
                 pass
 
     # ==================== Capture Training Metrics ====================
-    training_metrics = detail_callback.get_training_metrics()
+    training_metrics = unified_callback.get_training_metrics()
 
     # === Guard Metrics (WFO Fail-over support) ===
     training_metrics['guard_early_stop'] = False

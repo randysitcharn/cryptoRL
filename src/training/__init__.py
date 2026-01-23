@@ -18,10 +18,7 @@ __all__ = [
     "train_agent",
     "train_foundation",
     # Callbacks (lazy loaded)
-    "TensorBoardStepCallback",
-    "StepLoggingCallback",
-    "DetailTensorboardCallback",
-    "CurriculumFeesCallback",
+    "UnifiedMetricsCallback",
     "get_next_run_dir",
     # Configs
     "TQCTrainingConfig",
@@ -37,8 +34,7 @@ def __getattr__(name):
     elif name == "train_foundation":
         from src.training.train_foundation import train
         return train
-    elif name in ("TensorBoardStepCallback", "StepLoggingCallback",
-                  "DetailTensorboardCallback", "CurriculumFeesCallback", "get_next_run_dir"):
+    elif name in ("UnifiedMetricsCallback", "get_next_run_dir"):
         from src.training import callbacks
         return getattr(callbacks, name)
     elif name in ("TQCTrainingConfig", "FoundationTrainingConfig"):
