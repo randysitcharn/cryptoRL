@@ -155,6 +155,7 @@ def train_epoch(
     total_loss = 0.0
     total_recon_loss = 0.0
     total_aux_loss = 0.0
+    total_pred_ratio = 0.0  # Métrique de biais : ratio de prédictions positives
     n_batches = 0
 
     pbar = tqdm(loader, desc="Training", leave=False)
@@ -187,17 +188,25 @@ def train_epoch(
 
             # 2. Auxiliary Prediction Loss (direction du marché)
             if supervised and target_direction is not None:
-                # Utiliser pos_weight pour pénaliser les Faux Positifs (modèle trop optimiste)
-                # pos_weight < 1.0 pénalise la classe positive (Hausse)
-                # On utilise 0.8 pour sous-pondérer légèrement la classe majoritaire
-                pos_weight = torch.tensor([0.8], device=device)
+                # Class Balancing Dynamique : Calculer pos_weight par batch pour forcer l'apprentissage équilibré
+                # Le modèle "lazy" prédit toujours "UP" (1) pour minimiser la loss sans apprendre
+                # On calcule le ratio de la classe positive dans le batch actuel
+                num_pos = target_direction.sum().item()
+                batch_size = target_direction.size(0)
+                # Poids inverse pour pénaliser la classe majoritaire
+                # Si num_pos est élevé (ex: 70% du batch), pos_weight sera faible (< 1.0)
+                # Cela force le modèle à prêter autant d'attention aux baisses qu'aux hausses
+                pos_weight_value = (batch_size - num_pos) / (num_pos + 1e-6)
+                pos_weight = torch.tensor([pos_weight_value], device=device)
+                
                 aux_loss = nn.functional.binary_cross_entropy_with_logits(
                     pred_logits.view(-1), target_direction.view(-1).float(),
                     pos_weight=pos_weight
                 )
-                # Augmentation drastique du poids de la supervision pour forcer l'apprentissage directionnel
+                # SUPERVISION_WEIGHT = 5.0 : Priorité absolue à la direction
                 # La recon_loss est déjà faible (~0.03), on veut que la prédiction domine le gradient
-                loss = recon_loss + aux_loss_weight * aux_loss
+                SUPERVISION_WEIGHT = 5.0
+                loss = recon_loss + SUPERVISION_WEIGHT * aux_loss
             else:
                 aux_loss = torch.tensor(0.0, device=device)
                 loss = recon_loss
@@ -216,16 +225,31 @@ def train_epoch(
         total_aux_loss += aux_loss.item()
         n_batches += 1
 
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'recon': f'{recon_loss.item():.4f}',
-            'aux': f'{aux_loss.item():.4f}'
-        })
+        # Métriques de biais : Calculer le ratio de prédictions positives
+        # Si pred_ratio reste collé à 0.7-0.8, le modèle triche encore (prédit toujours "UP")
+        # Objectif : voir ce ratio osciller autour de 0.5 (équilibre)
+        if supervised and target_direction is not None:
+            pred_ratio = torch.sigmoid(pred_logits).mean().item()
+            total_pred_ratio += pred_ratio
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'recon': f'{recon_loss.item():.4f}',
+                'aux': f'{aux_loss.item():.4f}',
+                'pred_ratio': f'{pred_ratio:.3f}'  # Ratio de prédictions positives (0.5 = équilibré)
+            })
+        else:
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'recon': f'{recon_loss.item():.4f}',
+                'aux': f'{aux_loss.item():.4f}'
+            })
 
+    avg_pred_ratio = total_pred_ratio / n_batches if n_batches > 0 else 0.0
     return {
         'total': total_loss / n_batches,
         'recon': total_recon_loss / n_batches,
-        'aux': total_aux_loss / n_batches
+        'aux': total_aux_loss / n_batches,
+        'pred_ratio': avg_pred_ratio  # Ratio moyen de prédictions positives (0.5 = équilibré)
     }
 
 
@@ -258,6 +282,7 @@ def validate(
     total_aux_loss = 0.0
     correct_predictions = 0
     total_predictions = 0
+    total_pred_ratio = 0.0  # Métrique de biais : ratio de prédictions positives
     n_batches = 0
 
     for batch in loader:
@@ -282,18 +307,28 @@ def validate(
 
             # 2. Auxiliary Prediction Loss
             if supervised and target_direction is not None:
-                # Utiliser pos_weight pour pénaliser les Faux Positifs (modèle trop optimiste)
-                pos_weight = torch.tensor([0.8], device=device)
+                # Class Balancing Dynamique : Même logique que dans train_epoch
+                num_pos = target_direction.sum().item()
+                batch_size = target_direction.size(0)
+                pos_weight_value = (batch_size - num_pos) / (num_pos + 1e-6)
+                pos_weight = torch.tensor([pos_weight_value], device=device)
+                
                 aux_loss = nn.functional.binary_cross_entropy_with_logits(
                     pred_logits.view(-1), target_direction.view(-1).float(),
                     pos_weight=pos_weight
                 )
-                loss = recon_loss + aux_loss_weight * aux_loss
+                # SUPERVISION_WEIGHT = 5.0 : Priorité absolue à la direction
+                SUPERVISION_WEIGHT = 5.0
+                loss = recon_loss + SUPERVISION_WEIGHT * aux_loss
 
                 # Accuracy de prédiction de direction
                 pred_direction = (torch.sigmoid(pred_logits) > 0.5).float()
                 correct_predictions += (pred_direction == target_direction).sum().item()
                 total_predictions += target_direction.numel()
+                
+                # Métrique de biais : ratio de prédictions positives
+                pred_ratio = torch.sigmoid(pred_logits).mean().item()
+                total_pred_ratio += pred_ratio
             else:
                 aux_loss = torch.tensor(0.0, device=device)
                 loss = recon_loss
@@ -304,12 +339,14 @@ def validate(
         n_batches += 1
 
     accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
+    avg_pred_ratio = total_pred_ratio / n_batches if n_batches > 0 else 0.0
 
     return {
         'total': total_loss / n_batches,
         'recon': total_recon_loss / n_batches,
         'aux': total_aux_loss / n_batches,
-        'accuracy': accuracy
+        'accuracy': accuracy,
+        'pred_ratio': avg_pred_ratio  # Ratio moyen de prédictions positives (0.5 = équilibré)
     }
 
 
@@ -381,7 +418,7 @@ def train(
     from_scratch: bool = False,
     extra_epochs: int = None,
     supervised: bool = True,
-    aux_loss_weight: float = 2.0,
+    aux_loss_weight: float = 5.0,  # Augmenté de 2.0 à 5.0 pour forcer l'apprentissage directionnel
     limit: Optional[int] = None
 ):
     """
@@ -519,9 +556,11 @@ def train(
 
         # Print progress
         if supervised:
+            pred_ratio_train = train_metrics.get('pred_ratio', 0.0)
+            pred_ratio_val = val_metrics.get('pred_ratio', 0.0)
             print(f"Epoch {epoch:02d}/{end_epoch} | "
-                  f"Train: {train_metrics['total']:.4f} (R:{train_metrics['recon']:.4f} A:{train_metrics['aux']:.4f}) | "
-                  f"Val: {val_metrics['total']:.4f} (Acc:{val_metrics['accuracy']:.1%}) | "
+                  f"Train: {train_metrics['total']:.4f} (R:{train_metrics['recon']:.4f} A:{train_metrics['aux']:.4f} PR:{pred_ratio_train:.3f}) | "
+                  f"Val: {val_metrics['total']:.4f} (Acc:{val_metrics['accuracy']:.1%} PR:{pred_ratio_val:.3f}) | "
                   f"Time: {epoch_time:.1f}s")
         else:
             print(f"Epoch {epoch:02d}/{end_epoch} | "
@@ -541,6 +580,11 @@ def train(
                 writer.add_scalar("loss/train_aux", train_metrics['aux'], epoch)
                 writer.add_scalar("loss/val_aux", val_metrics['aux'], epoch)
                 writer.add_scalar("accuracy/val_direction", val_metrics['accuracy'], epoch)
+                # Métriques de biais : pred_ratio (0.5 = équilibré, >0.7 = biais haussier)
+                if 'pred_ratio' in train_metrics:
+                    writer.add_scalar("bias/train_pred_ratio", train_metrics['pred_ratio'], epoch)
+                if 'pred_ratio' in val_metrics:
+                    writer.add_scalar("bias/val_pred_ratio", val_metrics['pred_ratio'], epoch)
 
         # Early Stopping Check (based on total loss)
         val_loss = val_metrics['total']
@@ -603,8 +647,8 @@ if __name__ == "__main__":
                         help="Additional epochs to train (resume mode)")
     parser.add_argument("--unsupervised", action="store_true",
                         help="Train without auxiliary prediction loss (reconstruction only)")
-    parser.add_argument("--aux-weight", type=float, default=2.0,
-                        help="Weight for auxiliary prediction loss (default: 2.0)")
+    parser.add_argument("--aux-weight", type=float, default=5.0,
+                        help="Weight for auxiliary prediction loss (default: 5.0 for aggressive supervision)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of batches per epoch (for testing)")
 

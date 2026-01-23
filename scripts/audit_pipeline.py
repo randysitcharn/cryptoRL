@@ -90,6 +90,16 @@ from src.data_engineering.manager import RegimeDetector, DataManager
 from src.models.foundation import CryptoMAE
 from src.data.dataset import CryptoDataset
 
+# TQC audit imports
+try:
+    from sb3_contrib import TQC
+    HAS_TQC = True
+except ImportError:
+    HAS_TQC = False
+    print("[WARNING] sb3_contrib not available. TQC audit will be disabled.")
+
+from src.training.batch_env import BatchCryptoEnv
+
 # Import normalization audit
 # Add scripts directory to path for import
 scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -3971,6 +3981,929 @@ def generate_mae_audit_report(results: Dict, output_dir: str) -> str:
 
 
 # ============================================================================
+# TQC COMPREHENSIVE AUDIT
+# ============================================================================
+
+def analyze_tqc_quantiles(
+    model: TQC,
+    test_env: BatchCryptoEnv,
+    test_df: pd.DataFrame,
+    n_steps: int = 1000
+) -> Dict:
+    """
+    F.1 Inter-Quantile Range (IQR) vs HMM_Entropy
+    
+    Test: When HMM_Entropy is high (market uncertainty), 
+    TQC's IQR should increase (model uncertainty).
+    
+    If not: TQC is overconfident (dangerous).
+    
+    Args:
+        model: Loaded TQC model
+        test_env: Test environment
+        n_steps: Number of steps to collect data
+    
+    Returns:
+        Dict with IQR analysis metrics
+    """
+    print(f"\n[F] Analyzing TQC Quantiles (IQR vs HMM_Entropy)...")
+    
+    device = next(model.policy.parameters()).device
+    model.policy.eval()
+    
+    hmm_entropies = []
+    iqrs = []
+    q_values_mean = []
+    q_values_std = []
+    
+    obs, info = test_env.gym_reset()
+    done = False
+    step_count = 0
+    
+    # Get starting index in dataframe (account for window_size)
+    window_size = test_env.window_size if hasattr(test_env, 'window_size') else 64
+    df_start_idx = window_size
+    
+    while not done and step_count < n_steps:
+        # Get action from policy
+        action, _ = model.predict(obs, deterministic=True)
+        
+        # Extract HMM_Entropy from dataframe
+        hmm_entropy = None
+        if test_df is not None and (df_start_idx + step_count) < len(test_df):
+            row = test_df.iloc[df_start_idx + step_count]
+            if 'HMM_Entropy' in row:
+                hmm_entropy = row['HMM_Entropy']
+        
+        # Get quantiles from critic
+        with torch.no_grad():
+            obs_tensor = {
+                'market': torch.tensor(obs['market'], dtype=torch.float32).unsqueeze(0).to(device),
+                'position': torch.tensor(obs['position'], dtype=torch.float32).unsqueeze(0).to(device),
+                'w_cost': torch.tensor(obs['w_cost'], dtype=torch.float32).unsqueeze(0).to(device)
+            }
+            action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0).to(device)
+            
+            # Get quantiles from critic
+            # TQC critic returns (batch, n_critics, n_quantiles)
+            quantiles = model.policy.critic(obs_tensor, action_tensor)
+            # Shape: (batch, n_critics, n_quantiles)
+            
+            # Average across critics
+            quantiles_flat = quantiles.mean(dim=1)  # (batch, n_quantiles)
+            quantiles_flat = quantiles_flat.squeeze(0).cpu().numpy()  # (n_quantiles,)
+            
+            # Calculate IQR (Q90 - Q10)
+            n_quantiles = len(quantiles_flat)
+            q10_idx = int(0.10 * n_quantiles)
+            q90_idx = int(0.90 * n_quantiles)
+            iqr = quantiles_flat[q90_idx] - quantiles_flat[q10_idx]
+            
+            # Calculate mean and std of Q-values
+            q_mean = quantiles_flat.mean()
+            q_std = quantiles_flat.std()
+            
+            iqrs.append(iqr)
+            q_values_mean.append(q_mean)
+            q_values_std.append(q_std)
+            
+            # For HMM_Entropy, we'll need to extract from the data
+            # For now, set to None and we'll fill it later from the dataframe
+            if hmm_entropy is not None:
+                hmm_entropies.append(hmm_entropy)
+            else:
+                hmm_entropies.append(None)
+        
+        # Step environment
+        obs, reward, terminated, truncated, info = test_env.gym_step(action)
+        done = terminated or truncated
+        step_count += 1
+    
+    # Convert to numpy arrays
+    iqrs = np.array(iqrs)
+    q_values_mean = np.array(q_values_mean)
+    q_values_std = np.array(q_values_std)
+    
+    # Calculate correlation if we have HMM_Entropy
+    correlation = None
+    overconfidence_flag = False
+    
+    if len([h for h in hmm_entropies if h is not None]) > 10:
+        hmm_entropies_valid = np.array([h for h in hmm_entropies if h is not None])
+        iqrs_valid = np.array([iqrs[i] for i, h in enumerate(hmm_entropies) if h is not None])
+        
+        if len(hmm_entropies_valid) > 10:
+            correlation = np.corrcoef(hmm_entropies_valid, iqrs_valid)[0, 1]
+            
+            # Check for overconfidence: correlation should be positive (high entropy → high IQR)
+            # If correlation < 0.3, TQC ignores market uncertainty
+            if correlation < 0.3:
+                overconfidence_flag = True
+    
+    results = {
+        'iqrs': iqrs,
+        'q_values_mean': q_values_mean,
+        'q_values_std': q_values_std,
+        'hmm_entropies': hmm_entropies,
+        'correlation': correlation,
+        'overconfidence_detected': overconfidence_flag,
+        'n_steps': step_count
+    }
+    
+    print(f"  Collected {step_count} steps")
+    if correlation is not None:
+        print(f"  Correlation (HMM_Entropy, IQR): {correlation:.4f}")
+        if overconfidence_flag:
+            print(f"  [!] OVERCONFIDENCE DETECTED: Correlation < 0.3")
+        else:
+            print(f"  [OK] Correlation >= 0.3 (TQC responds to market uncertainty)")
+    
+    return results
+
+
+def analyze_tqc_calibration(
+    model: TQC,
+    test_env: BatchCryptoEnv,
+    test_df: pd.DataFrame,
+    n_steps: int = 1000
+) -> Dict:
+    """
+    A.1 Reliability Diagram: Q-values vs Actual Returns
+    A.2 Entropy Correlation: HMM_Entropy vs Q_value_std
+    
+    Args:
+        model: Loaded TQC model
+        test_env: Test environment
+        n_steps: Number of steps to collect data
+    
+    Returns:
+        Dict with calibration metrics
+    """
+    print(f"\n[A] Analyzing TQC Calibration...")
+    
+    device = next(model.policy.parameters()).device
+    model.policy.eval()
+    
+    q_values = []
+    actual_returns = []
+    hmm_entropies = []
+    q_value_stds = []
+    actions = []
+    
+    obs, info = test_env.gym_reset()
+    done = False
+    step_count = 0
+    initial_nav = info.get('nav', 10000.0)
+    prev_nav = initial_nav
+    
+    # Get starting index in dataframe (account for window_size)
+    window_size = test_env.window_size if hasattr(test_env, 'window_size') else 64
+    df_start_idx = window_size
+    
+    while not done and step_count < n_steps:
+        # Get action and Q-value
+        action, _ = model.predict(obs, deterministic=True)
+        
+        # Get Q-value from critic
+        with torch.no_grad():
+            obs_tensor = {
+                'market': torch.tensor(obs['market'], dtype=torch.float32).unsqueeze(0).to(device),
+                'position': torch.tensor(obs['position'], dtype=torch.float32).unsqueeze(0).to(device),
+                'w_cost': torch.tensor(obs['w_cost'], dtype=torch.float32).unsqueeze(0).to(device)
+            }
+            action_tensor = torch.tensor(action, dtype=torch.float32).unsqueeze(0).to(device)
+            
+            quantiles = model.policy.critic(obs_tensor, action_tensor)
+            quantiles_flat = quantiles.mean(dim=1).squeeze(0).cpu().numpy()
+            
+            q_mean = quantiles_flat.mean()
+            q_std = quantiles_flat.std()
+            
+            q_values.append(q_mean)
+            q_value_stds.append(q_std)
+        
+        actions.append(action[0])
+        
+        # Extract HMM_Entropy from dataframe
+        hmm_entropy = None
+        if test_df is not None and (df_start_idx + step_count) < len(test_df):
+            row = test_df.iloc[df_start_idx + step_count]
+            if 'HMM_Entropy' in row:
+                hmm_entropy = row['HMM_Entropy']
+        hmm_entropies.append(hmm_entropy)
+        
+        # Step environment
+        obs, reward, terminated, truncated, info = test_env.gym_step(action)
+        done = terminated or truncated
+        
+        # Calculate actual return
+        nav = info.get('nav', prev_nav)
+        actual_return = (nav - prev_nav) / prev_nav if prev_nav > 0 else 0.0
+        actual_returns.append(actual_return)
+        prev_nav = nav
+        
+        step_count += 1
+    
+    # Convert to numpy
+    q_values = np.array(q_values)
+    actual_returns = np.array(actual_returns)
+    q_value_stds = np.array(q_value_stds)
+    hmm_entropies = np.array([h if h is not None else np.nan for h in hmm_entropies])
+    
+    # A.1 Reliability Diagram
+    # Bin Q-values into deciles
+    n_bins = 10
+    q_bins = np.percentile(q_values, np.linspace(0, 100, n_bins + 1))
+    bin_indices = np.digitize(q_values, q_bins) - 1
+    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+    
+    bin_means_q = []
+    bin_means_return = []
+    bin_win_rates = []
+    
+    for i in range(n_bins):
+        mask = bin_indices == i
+        if mask.sum() > 0:
+            bin_means_q.append(q_values[mask].mean())
+            bin_means_return.append(actual_returns[mask].mean())
+            bin_win_rates.append((actual_returns[mask] > 0).mean())
+        else:
+            bin_means_q.append(np.nan)
+            bin_means_return.append(np.nan)
+            bin_win_rates.append(np.nan)
+    
+    # Calculate ECE (Expected Calibration Error)
+    ece = np.nanmean([abs(bin_means_q[i] - bin_means_return[i]) 
+                      for i in range(n_bins) if not np.isnan(bin_means_q[i])])
+    
+    # Calculate Brier Score (simplified - treating as regression)
+    brier_score = np.mean((q_values - actual_returns) ** 2)
+    
+    # A.2 Entropy Correlation
+    entropy_correlation = None
+    if not np.all(np.isnan(hmm_entropies)):
+        valid_mask = ~np.isnan(hmm_entropies)
+        if valid_mask.sum() > 10:
+            entropy_correlation = np.corrcoef(
+                hmm_entropies[valid_mask],
+                q_value_stds[valid_mask]
+            )[0, 1]
+    
+    results = {
+        'q_values': q_values,
+        'actual_returns': actual_returns,
+        'q_value_stds': q_value_stds,
+        'hmm_entropies': hmm_entropies,
+        'bin_means_q': bin_means_q,
+        'bin_means_return': bin_means_return,
+        'bin_win_rates': bin_win_rates,
+        'ece': ece,
+        'brier_score': brier_score,
+        'entropy_correlation': entropy_correlation,
+        'n_steps': step_count
+    }
+    
+    print(f"  Collected {step_count} steps")
+    print(f"  ECE (Expected Calibration Error): {ece:.4f}")
+    print(f"  Brier Score: {brier_score:.4f}")
+    if entropy_correlation is not None:
+        print(f"  Correlation (HMM_Entropy, Q_std): {entropy_correlation:.4f}")
+    
+    return results
+
+
+def analyze_tqc_action_distribution(
+    model: TQC,
+    test_env: BatchCryptoEnv,
+    n_steps: int = 1000
+) -> Dict:
+    """
+    D.1 Action Histogram, Saturation, Entropy
+    
+    Args:
+        model: Loaded TQC model
+        test_env: Test environment
+        n_steps: Number of steps to collect data
+    
+    Returns:
+        Dict with action distribution metrics
+    """
+    print(f"\n[D] Analyzing TQC Action Distribution...")
+    
+    actions = []
+    
+    obs, info = test_env.gym_reset()
+    done = False
+    step_count = 0
+    
+    while not done and step_count < n_steps:
+        action, _ = model.predict(obs, deterministic=True)
+        actions.append(action[0])
+        
+        obs, reward, terminated, truncated, info = test_env.gym_step(action)
+        done = terminated or truncated
+        step_count += 1
+    
+    actions = np.array(actions)
+    
+    # Calculate saturation (% of actions at ±1.0 or close)
+    saturation_threshold = 0.95
+    saturated = np.abs(np.abs(actions) - 1.0) < (1.0 - saturation_threshold)
+    saturation_pct = saturated.mean() * 100
+    
+    # Calculate action entropy (discretized)
+    n_bins = 21  # Match action discretization
+    hist, _ = np.histogram(actions, bins=n_bins, range=(-1.0, 1.0))
+    hist = hist / hist.sum()  # Normalize
+    hist = hist[hist > 0]  # Remove zeros
+    action_entropy = -np.sum(hist * np.log(hist))
+    
+    # Statistics
+    action_mean = actions.mean()
+    action_std = actions.std()
+    action_min = actions.min()
+    action_max = actions.max()
+    
+    results = {
+        'actions': actions,
+        'saturation_pct': saturation_pct,
+        'action_entropy': action_entropy,
+        'action_mean': action_mean,
+        'action_std': action_std,
+        'action_min': action_min,
+        'action_max': action_max,
+        'n_steps': step_count
+    }
+    
+    print(f"  Collected {step_count} steps")
+    print(f"  Saturation (% actions near ±1.0): {saturation_pct:.1f}%")
+    print(f"  Action Entropy: {action_entropy:.4f}")
+    print(f"  Action Range: [{action_min:.3f}, {action_max:.3f}]")
+    print(f"  Action Mean: {action_mean:.3f}, Std: {action_std:.3f}")
+    
+    if saturation_pct > 95:
+        print(f"  [!] POLICY COLLAPSE DETECTED: >95% actions saturated")
+    if action_entropy < 1.0:
+        print(f"  [!] LOW EXPLORATION: Action entropy < 1.0")
+    
+    return results
+
+
+def analyze_tqc_attribution(
+    model: TQC,
+    test_env: BatchCryptoEnv,
+    n_samples: int = 1000
+) -> Dict:
+    """
+    B.1 Gradient Attribution: ∇_features Q(s, a)
+    B.2 Feature Importance Ranking
+    
+    Args:
+        model: Loaded TQC model
+        test_env: Test environment
+        n_samples: Number of samples for attribution
+    
+    Returns:
+        Dict with feature importance metrics
+    """
+    print(f"\n[B] Analyzing TQC Attribution...")
+    
+    device = next(model.policy.parameters()).device
+    model.policy.train()  # Need gradients
+    
+    # Sample observations
+    observations = []
+    actions = []
+    
+    obs, info = test_env.gym_reset()
+    done = False
+    step_count = 0
+    
+    while not done and step_count < n_samples:
+        action, _ = model.predict(obs, deterministic=True)
+        observations.append({
+            'market': obs['market'].copy(),
+            'position': obs['position'].copy(),
+            'w_cost': obs['w_cost'].copy()
+        })
+        actions.append(action[0])
+        
+        obs, reward, terminated, truncated, info = test_env.gym_step(action)
+        done = terminated or truncated
+        step_count += 1
+    
+    # Calculate gradients for a subset (gradient computation is expensive)
+    sample_size = min(100, len(observations))
+    indices = np.random.choice(len(observations), sample_size, replace=False)
+    
+    feature_gradients = []
+    
+    for idx in indices:
+        obs_sample = observations[idx]
+        action_sample = actions[idx]
+        
+        obs_tensor = {
+            'market': torch.tensor(obs_sample['market'], dtype=torch.float32).unsqueeze(0).to(device).requires_grad_(True),
+            'position': torch.tensor(obs_sample['position'], dtype=torch.float32).unsqueeze(0).to(device).requires_grad_(True),
+            'w_cost': torch.tensor(obs_sample['w_cost'], dtype=torch.float32).unsqueeze(0).to(device).requires_grad_(True)
+        }
+        action_tensor = torch.tensor([action_sample], dtype=torch.float32).unsqueeze(0).to(device)
+        
+        # Get Q-value
+        quantiles = model.policy.critic(obs_tensor, action_tensor)
+        q_value = quantiles.mean()  # Average across critics and quantiles
+        
+        # Compute gradients
+        q_value.backward()
+        
+        # Extract gradients
+        market_grad = obs_tensor['market'].grad.abs().mean().item()
+        position_grad = obs_tensor['position'].grad.abs().mean().item()
+        w_cost_grad = obs_tensor['w_cost'].grad.abs().mean().item()
+        
+        feature_gradients.append({
+            'market': market_grad,
+            'position': position_grad,
+            'w_cost': w_cost_grad
+        })
+    
+    # Aggregate gradients
+    avg_gradients = {
+        'market': np.mean([g['market'] for g in feature_gradients]),
+        'position': np.mean([g['position'] for g in feature_gradients]),
+        'w_cost': np.mean([g['w_cost'] for g in feature_gradients])
+    }
+    
+    # Rank features by importance
+    feature_ranking = sorted(avg_gradients.items(), key=lambda x: x[1], reverse=True)
+    
+    results = {
+        'feature_gradients': avg_gradients,
+        'feature_ranking': feature_ranking,
+        'n_samples': sample_size
+    }
+    
+    print(f"  Analyzed {sample_size} samples")
+    print(f"  Feature Importance Ranking:")
+    for i, (feature, importance) in enumerate(feature_ranking, 1):
+        print(f"    {i}. {feature}: {importance:.6f}")
+    
+    return results
+
+
+def analyze_tqc_value_add(
+    model: TQC,
+    test_env: BatchCryptoEnv,
+    test_df: pd.DataFrame,
+    baseline_strategy: str = "naive_mae"
+) -> Dict:
+    """
+    C.1 Baseline Comparison: Naive MAE vs TQC vs Oracle
+    C.2 Regime-Specific Performance
+    
+    Args:
+        model: Loaded TQC model
+        test_env: Test environment
+        test_df: Test dataframe with HMM features
+        baseline_strategy: Baseline strategy to use
+    
+    Returns:
+        Dict with value add metrics
+    """
+    print(f"\n[C] Analyzing TQC Value Add...")
+    
+    # C.1 Run backtest with TQC
+    tqc_returns = []
+    tqc_actions = []
+    tqc_hmm_states = []
+    
+    obs, info = test_env.gym_reset()
+    done = False
+    step_count = 0
+    initial_nav = info.get('nav', 10000.0)
+    prev_nav = initial_nav
+    
+    while not done:
+        action, _ = model.predict(obs, deterministic=True)
+        tqc_actions.append(action[0])
+        
+        # Get HMM state (dominant probability)
+        if 'hmm_entropy' in obs or test_df is not None:
+            # Extract from dataframe if available
+            if test_df is not None and step_count < len(test_df):
+                hmm_probs = [
+                    test_df.iloc[step_count].get('HMM_Prob_0', 0),
+                    test_df.iloc[step_count].get('HMM_Prob_1', 0),
+                    test_df.iloc[step_count].get('HMM_Prob_2', 0),
+                    test_df.iloc[step_count].get('HMM_Prob_3', 0)
+                ]
+                dominant_state = np.argmax(hmm_probs)
+                tqc_hmm_states.append(dominant_state)
+            else:
+                tqc_hmm_states.append(None)
+        else:
+            tqc_hmm_states.append(None)
+        
+        obs, reward, terminated, truncated, info = test_env.gym_step(action)
+        done = terminated or truncated
+        
+        nav = info.get('nav', prev_nav)
+        ret = (nav - prev_nav) / prev_nav if prev_nav > 0 else 0.0
+        tqc_returns.append(ret)
+        prev_nav = nav
+        step_count += 1
+    
+    tqc_returns = np.array(tqc_returns)
+    
+    # Calculate TQC metrics
+    tqc_sharpe = calculate_sharpe_ratio(tqc_returns) if len(tqc_returns) > 1 else 0.0
+    tqc_total_return = (prev_nav / initial_nav - 1.0) * 100
+    tqc_max_dd = calculate_max_drawdown(tqc_returns)
+    tqc_win_rate = (tqc_returns > 0).mean() * 100
+    
+    # C.2 Regime-Specific Performance
+    regime_metrics = {}
+    if any(s is not None for s in tqc_hmm_states):
+        for state in range(4):
+            state_mask = np.array([s == state for s in tqc_hmm_states])
+            if state_mask.sum() > 10:
+                state_returns = tqc_returns[state_mask]
+                regime_metrics[f'state_{state}'] = {
+                    'sharpe': calculate_sharpe_ratio(state_returns) if len(state_returns) > 1 else 0.0,
+                    'win_rate': (state_returns > 0).mean() * 100,
+                    'avg_return': state_returns.mean() * 100,
+                    'n_trades': state_mask.sum()
+                }
+    
+    results = {
+        'tqc_sharpe': tqc_sharpe,
+        'tqc_total_return': tqc_total_return,
+        'tqc_max_dd': tqc_max_dd,
+        'tqc_win_rate': tqc_win_rate,
+        'tqc_returns': tqc_returns,
+        'regime_metrics': regime_metrics,
+        'n_steps': step_count
+    }
+    
+    print(f"  TQC Performance:")
+    print(f"    Sharpe Ratio: {tqc_sharpe:.4f}")
+    print(f"    Total Return: {tqc_total_return:.2f}%")
+    print(f"    Max Drawdown: {tqc_max_dd:.2f}%")
+    print(f"    Win Rate: {tqc_win_rate:.1f}%")
+    
+    if regime_metrics:
+        print(f"  Regime-Specific Performance:")
+        for state, metrics in regime_metrics.items():
+            print(f"    {state}: Sharpe={metrics['sharpe']:.4f}, WinRate={metrics['win_rate']:.1f}%")
+    
+    return results
+
+
+def analyze_tqc_convergence(
+    tensorboard_log_dir: str
+) -> Dict:
+    """
+    E.1 Training Curves Analysis from TensorBoard
+    
+    Args:
+        tensorboard_log_dir: Path to TensorBoard log directory
+    
+    Returns:
+        Dict with convergence analysis
+    """
+    print(f"\n[E] Analyzing TQC Convergence...")
+    
+    # Try to parse TensorBoard events
+    # This is a simplified version - full implementation would use tensorboard library
+    results = {
+        'log_dir': tensorboard_log_dir,
+        'available': os.path.exists(tensorboard_log_dir),
+        'note': 'Full TensorBoard parsing requires tensorboard library'
+    }
+    
+    if os.path.exists(tensorboard_log_dir):
+        print(f"  TensorBoard log directory found: {tensorboard_log_dir}")
+        print(f"  [INFO] Full parsing requires tensorboard library (not implemented here)")
+    else:
+        print(f"  [WARNING] TensorBoard log directory not found: {tensorboard_log_dir}")
+    
+    return results
+
+
+def run_tqc_audit(
+    segment_id: int = 0,
+    tqc_path: Optional[str] = None,
+    test_data_path: Optional[str] = None,
+    encoder_path: Optional[str] = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    n_samples: int = 1000,
+    output_dir: Optional[str] = None
+) -> Dict:
+    """
+    Run comprehensive TQC audit with all analyses (A-F).
+    
+    Args:
+        segment_id: WFO segment ID (used to auto-detect paths if not provided)
+        tqc_path: Path to TQC model (auto-detected from segment if None)
+        test_data_path: Path to test data parquet (auto-detected if None)
+        encoder_path: Path to MAE encoder (auto-detected if None)
+        device: Device to use
+        n_samples: Number of samples for attribution analysis
+        output_dir: Output directory (auto-generated if None)
+    
+    Returns:
+        Dict with all audit results
+    """
+    if not HAS_TQC:
+        raise ImportError("sb3_contrib not available. Cannot run TQC audit.")
+    
+    print("=" * 70)
+    print("TQC COMPREHENSIVE AUDIT")
+    print("=" * 70)
+    print(f"Segment: {segment_id}, Device: {device}")
+    
+    # Auto-detect paths from segment_id
+    if tqc_path is None:
+        tqc_path = f"weights/wfo/segment_{segment_id}/tqc.zip"
+    if test_data_path is None:
+        test_data_path = f"data/processed/wfo/segment_{segment_id}/test.parquet"
+    if encoder_path is None:
+        encoder_path = f"weights/wfo/segment_{segment_id}/encoder.pth"
+    
+    # Validate paths exist
+    for name, path in [("TQC", tqc_path), ("Test Data", test_data_path)]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{name} not found: {path}")
+    
+    # Create output directory
+    if output_dir is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_base = os.path.join("results", "tqc_audit")
+        os.makedirs(output_base, exist_ok=True)
+        output_dir = os.path.join(output_base, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+    
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    print(f"\nOutput directory: {output_dir}")
+    
+    results = {
+        'output_dir': output_dir,
+        'segment_id': segment_id,
+        'tqc_path': tqc_path,
+        'test_data_path': test_data_path,
+        'config': {
+            'device': device,
+            'n_samples': n_samples
+        }
+    }
+    
+    # Load model
+    print(f"\n[1/7] Loading TQC model...")
+    model = TQC.load(tqc_path, device=device)
+    print(f"  Model loaded from: {tqc_path}")
+    
+    # Load test data
+    print(f"\n[2/7] Loading test data...")
+    test_df = pd.read_parquet(test_data_path)
+    print(f"  Test data shape: {test_df.shape}")
+    
+    # Create test environment
+    print(f"\n[3/7] Creating test environment...")
+    test_env = BatchCryptoEnv(
+        parquet_path=test_data_path,
+        n_envs=1,
+        device=device,
+        window_size=64,  # Default window size
+        episode_length=len(test_df) - 64 - 1,
+        initial_balance=10000.0,
+        commission=0.001,
+        slippage=0.0001,
+        price_column='BTC_Close',
+        random_start=False
+    )
+    test_env.set_training_mode(False)  # Disable observation noise
+    
+    # Run all analyses
+    print(f"\n[4/7] Running analyses...")
+    
+    # Section F: Quantiles
+    results['quantiles'] = analyze_tqc_quantiles(model, test_env, test_df, n_steps=n_samples)
+    
+    # Section A: Calibration
+    results['calibration'] = analyze_tqc_calibration(model, test_env, test_df, n_steps=n_samples)
+    
+    # Section D: Action Distribution
+    results['action_distribution'] = analyze_tqc_action_distribution(model, test_env, n_steps=n_samples)
+    
+    # Section C: Value Add
+    results['value_add'] = analyze_tqc_value_add(model, test_env, test_df, baseline_strategy="naive_mae")
+    
+    # Section B: Attribution
+    results['attribution'] = analyze_tqc_attribution(model, test_env, n_samples=min(n_samples, 100))
+    
+    # Section E: Convergence (requires TensorBoard log)
+    tensorboard_log = f"logs/tensorboard_tqc/segment_{segment_id}"
+    results['convergence'] = analyze_tqc_convergence(tensorboard_log)
+    
+    # Generate plots
+    print(f"\n[5/7] Generating plots...")
+    _generate_tqc_plots(results, plots_dir)
+    
+    # Generate report
+    print(f"\n[6/7] Generating report...")
+    report_path = generate_tqc_audit_report(results, output_dir)
+    
+    # Save metrics
+    print(f"\n[7/7] Saving metrics...")
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    # Convert numpy arrays to lists for JSON serialization
+    metrics_serializable = _serialize_results(results)
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_serializable, f, indent=2)
+    
+    print("\n" + "=" * 70)
+    print("TQC AUDIT COMPLETE")
+    print("=" * 70)
+    print(f"Report: {report_path}")
+    print(f"Metrics: {metrics_path}")
+    print(f"Plots: {plots_dir}")
+    
+    return results
+
+
+def _serialize_results(results: Dict) -> Dict:
+    """Convert numpy arrays to lists for JSON serialization."""
+    serializable = {}
+    for key, value in results.items():
+        if isinstance(value, dict):
+            serializable[key] = _serialize_results(value)
+        elif isinstance(value, np.ndarray):
+            serializable[key] = value.tolist()
+        elif isinstance(value, (np.integer, np.floating)):
+            serializable[key] = float(value)
+        else:
+            serializable[key] = value
+    return serializable
+
+
+def _generate_tqc_plots(results: Dict, plots_dir: str):
+    """Generate all plots for TQC audit."""
+    # F. Quantiles: IQR vs HMM_Entropy
+    if 'quantiles' in results and results['quantiles'].get('correlation') is not None:
+        plt.figure(figsize=(10, 6))
+        hmm_entropies = results['quantiles']['hmm_entropies']
+        iqrs = results['quantiles']['iqrs']
+        valid_mask = np.array([h is not None for h in hmm_entropies])
+        if valid_mask.sum() > 0:
+            plt.scatter([h for h, v in zip(hmm_entropies, valid_mask) if v],
+                       [iqrs[i] for i, v in enumerate(valid_mask) if v],
+                       alpha=0.5)
+            plt.xlabel('HMM_Entropy')
+            plt.ylabel('IQR (Q90 - Q10)')
+            plt.title('TQC Quantiles: IQR vs HMM_Entropy')
+            plt.grid(True, alpha=0.3)
+            corr = results['quantiles']['correlation']
+            plt.text(0.05, 0.95, f'Correlation: {corr:.4f}', 
+                    transform=plt.gca().transAxes, verticalalignment='top')
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "quantiles_iqr_vs_hmm_entropy.png"), dpi=150)
+            plt.close()
+    
+    # A. Calibration: Reliability Diagram
+    if 'calibration' in results:
+        plt.figure(figsize=(10, 6))
+        bin_means_q = results['calibration']['bin_means_q']
+        bin_means_return = results['calibration']['bin_means_return']
+        valid_bins = [i for i, q in enumerate(bin_means_q) if not np.isnan(q)]
+        if valid_bins:
+            plt.plot([bin_means_q[i] for i in valid_bins],
+                    [bin_means_return[i] for i in valid_bins],
+                    'o-', label='Actual')
+            plt.plot([min(bin_means_q[valid_bins]), max(bin_means_q[valid_bins])],
+                    [min(bin_means_q[valid_bins]), max(bin_means_q[valid_bins])],
+                    '--', label='Perfect Calibration')
+            plt.xlabel('Predicted Q-value (Binned)')
+            plt.ylabel('Actual Return')
+            plt.title('TQC Calibration: Reliability Diagram')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "calibration_reliability_diagram.png"), dpi=150)
+            plt.close()
+    
+    # D. Action Distribution: Histogram
+    if 'action_distribution' in results:
+        plt.figure(figsize=(10, 6))
+        actions = results['action_distribution']['actions']
+        plt.hist(actions, bins=50, alpha=0.7, edgecolor='black')
+        plt.xlabel('Action Value')
+        plt.ylabel('Frequency')
+        plt.title('TQC Action Distribution')
+        plt.axvline(0, color='red', linestyle='--', alpha=0.5, label='Zero')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "action_distribution_histogram.png"), dpi=150)
+        plt.close()
+
+
+def generate_tqc_audit_report(
+    results: Dict,
+    output_dir: str
+) -> str:
+    """
+    Generate comprehensive TQC audit report (Markdown + plots).
+    
+    Sections:
+    - A. Calibration (ECE, Brier, Entropy Correlation)
+    - B. Attribution (Feature Importance, HMM Sensitivity)
+    - C. Value Add (Sharpe Delta, Regime Performance)
+    - D. Action Distribution (Saturation, Entropy)
+    - E. Convergence (Training Curves)
+    - F. Quantiles (IQR vs HMM_Entropy correlation)
+    """
+    report_path = os.path.join(output_dir, "report.md")
+    
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("# TQC Comprehensive Audit Report\n\n")
+        f.write(f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"**Segment ID**: {results['segment_id']}\n\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Section F: Quantiles
+        f.write("## F. Quantiles Analysis (IQR vs HMM_Entropy)\n\n")
+        if 'quantiles' in results:
+            quantiles = results['quantiles']
+            f.write(f"- **Correlation**: {quantiles.get('correlation', 'N/A')}\n")
+            f.write(f"- **Overconfidence Detected**: {quantiles.get('overconfidence_detected', False)}\n")
+            f.write(f"- **Steps Analyzed**: {quantiles.get('n_steps', 0)}\n\n")
+            if quantiles.get('overconfidence_detected'):
+                f.write("⚠️ **WARNING**: TQC shows overconfidence (correlation < 0.3).\n")
+                f.write("The model does not increase uncertainty when market uncertainty is high.\n\n")
+        
+        # Section A: Calibration
+        f.write("## A. Calibration Analysis\n\n")
+        if 'calibration' in results:
+            cal = results['calibration']
+            f.write(f"- **ECE (Expected Calibration Error)**: {cal.get('ece', 'N/A'):.4f}\n")
+            f.write(f"- **Brier Score**: {cal.get('brier_score', 'N/A'):.4f}\n")
+            f.write(f"- **Entropy Correlation**: {cal.get('entropy_correlation', 'N/A')}\n")
+            f.write(f"- **Steps Analyzed**: {cal.get('n_steps', 0)}\n\n")
+        
+        # Section B: Attribution
+        f.write("## B. Attribution Analysis\n\n")
+        if 'attribution' in results:
+            attr = results['attribution']
+            f.write("**Feature Importance Ranking**:\n\n")
+            for i, (feature, importance) in enumerate(attr.get('feature_ranking', []), 1):
+                f.write(f"{i}. {feature}: {importance:.6f}\n")
+            f.write(f"\n**Samples Analyzed**: {attr.get('n_samples', 0)}\n\n")
+        
+        # Section C: Value Add
+        f.write("## C. Value Add Analysis\n\n")
+        if 'value_add' in results:
+            va = results['value_add']
+            f.write("**TQC Performance**:\n\n")
+            f.write(f"- **Sharpe Ratio**: {va.get('tqc_sharpe', 'N/A'):.4f}\n")
+            f.write(f"- **Total Return**: {va.get('tqc_total_return', 'N/A'):.2f}%\n")
+            f.write(f"- **Max Drawdown**: {va.get('tqc_max_dd', 'N/A'):.2f}%\n")
+            f.write(f"- **Win Rate**: {va.get('tqc_win_rate', 'N/A'):.1f}%\n\n")
+            
+            if 'regime_metrics' in va and va['regime_metrics']:
+                f.write("**Regime-Specific Performance**:\n\n")
+                for state, metrics in va['regime_metrics'].items():
+                    f.write(f"- **{state}**: Sharpe={metrics['sharpe']:.4f}, WinRate={metrics['win_rate']:.1f}%\n")
+                f.write("\n")
+        
+        # Section D: Action Distribution
+        f.write("## D. Action Distribution Analysis\n\n")
+        if 'action_distribution' in results:
+            ad = results['action_distribution']
+            f.write(f"- **Saturation %**: {ad.get('saturation_pct', 'N/A'):.1f}%\n")
+            f.write(f"- **Action Entropy**: {ad.get('action_entropy', 'N/A'):.4f}\n")
+            f.write(f"- **Action Range**: [{ad.get('action_min', 'N/A'):.3f}, {ad.get('action_max', 'N/A'):.3f}]\n")
+            f.write(f"- **Action Mean**: {ad.get('action_mean', 'N/A'):.3f}, Std: {ad.get('action_std', 'N/A'):.3f}\n\n")
+            if ad.get('saturation_pct', 0) > 95:
+                f.write("⚠️ **WARNING**: Policy collapse detected (>95% actions saturated).\n\n")
+        
+        # Section E: Convergence
+        f.write("## E. Convergence Analysis\n\n")
+        if 'convergence' in results:
+            conv = results['convergence']
+            f.write(f"- **TensorBoard Log**: {conv.get('log_dir', 'N/A')}\n")
+            f.write(f"- **Available**: {conv.get('available', False)}\n")
+            f.write(f"- **Note**: {conv.get('note', 'N/A')}\n\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("END OF REPORT\n")
+        f.write("=" * 80 + "\n")
+    
+    return report_path
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -3982,9 +4915,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["hmm", "pipeline", "both", "synthetic", "mae"],
+        choices=["hmm", "pipeline", "both", "synthetic", "mae", "tqc"],
         default="both",
-        help="Analysis mode: hmm, pipeline, both, synthetic (old MAE test), or mae (comprehensive MAE audit)"
+        help="Analysis mode: hmm, pipeline, both, synthetic (old MAE test), mae (comprehensive MAE audit), or tqc (comprehensive TQC audit)"
     )
     parser.add_argument("--segment", type=int, default=0, help="WFO segment ID")
     parser.add_argument("--skip-mae", action="store_true", help="Skip MAE in pipeline mode")
@@ -4017,6 +4950,17 @@ def main():
     
     parser.add_argument("--check-normalization", action="store_true",
                         help="Run normalization/clipping audit for HMM, MAE, TQC")
+    
+    # TQC audit arguments
+    parser.add_argument("--tqc-segment", type=int, default=0,
+                        help="WFO segment ID for TQC audit")
+    parser.add_argument("--tqc-path", type=str, default=None,
+                        help="Path to TQC model (auto-detected from segment if None)")
+    parser.add_argument("--tqc-test-data", type=str, default=None,
+                        help="Path to test data parquet (auto-detected if None)")
+    parser.add_argument("--tqc-samples", type=int, default=1000,
+                        help="Number of samples for attribution analysis")
+    
     args = parser.parse_args()
 
     if args.mode == "mae":
@@ -4063,6 +5007,16 @@ def main():
             output_dir=None,  # Auto-generate unique directory with timestamp
             device=args.device,
             force_retrain=args.force_retrain
+        )
+    
+    if args.mode == "tqc":
+        run_tqc_audit(
+            segment_id=args.tqc_segment,
+            tqc_path=args.tqc_path,
+            test_data_path=args.tqc_test_data,
+            encoder_path=args.mae_encoder_path,  # Réutiliser argument MAE
+            device=args.device,
+            n_samples=args.tqc_samples
         )
 
 

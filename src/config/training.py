@@ -175,7 +175,7 @@ class FoundationTrainingConfig:
     mask_ratio: float = 0.15
 
     # --- Training ---
-    epochs: int = 50  # Increased focus on supervised learning
+    epochs: int = 100  # Increased for convergence with aggressive supervision (was 50)
     lr: float = 1e-4
     weight_decay: float = 1e-5
     patience: int = 7  # Early stopping
