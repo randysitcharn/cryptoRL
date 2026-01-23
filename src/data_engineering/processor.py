@@ -1,24 +1,26 @@
 """
 processor.py - Traitement et enrichissement des données.
 
-Classe DataProcessor pour nettoyer les données OHLCV et ajouter :
-- Indicateurs techniques (RSI, MACD, ATR, Bollinger Bands)
-- Log-returns
-- Encodage temporel cyclique (heure, jour de semaine)
-- Normalisation des features pour RL (scaling, clipping)
+Contient deux classes :
+- OHLCVProcessor : Nettoie les données OHLCV et ajoute des indicateurs techniques
+- DataProcessor : Classe unifiée pour le scaling et clipping des features (RobustScaler + Safety Patches)
 """
 
 import os
 import numpy as np
 import pandas as pd
+from typing import Optional, Dict, List
+from sklearn.preprocessing import RobustScaler
+from typing import Optional, Dict, List, Tuple
+from sklearn.preprocessing import RobustScaler
 
 
-class DataProcessor:
+class OHLCVProcessor:
     """Nettoie et enrichit les données de marché."""
 
     def __init__(self, processed_data_dir: str = "data/processed"):
         """
-        Initializes the DataProcessor.
+        Initializes the OHLCVProcessor.
 
         Args:
             processed_data_dir (str): Directory where processed data will be saved.
@@ -181,3 +183,185 @@ class DataProcessor:
         print(f"[SUCCESS] Saved to {output_path}")
 
         return df
+
+
+class DataProcessor:
+    """
+    Classe unifiée pour le preprocessing des features (Scaling, Clipping, Safety Patches).
+    
+    Centralise la logique de transformation des données pour garantir la cohérence
+    entre DataManager (Global), WFOPipeline (Segmented) et RegimeDetector.
+    
+    Permet une exécution "Leak-Free" pour le WFO en contrôlant sur quelles données
+    le .fit() est appelé.
+    
+    Usage:
+        # Mode WFO (leak-free)
+        processor = DataProcessor(config={'min_iqr': 1e-2, 'clip_range': (-5, 5)})
+        processor.fit(train_df[cols])
+        train_scaled = processor.transform(train_df[cols])
+        eval_scaled = processor.transform(eval_df[cols])
+        
+        # Mode Global (audit)
+        processor = DataProcessor()
+        processor.fit(full_data[cols])
+        full_scaled = processor.transform(full_data[cols])
+    """
+    
+    def __init__(self, config: Optional[Dict] = None):
+        """
+        Initialise le DataProcessor avec configuration centralisée.
+        
+        Args:
+            config: Dictionnaire de configuration optionnel avec:
+                - min_iqr: Minimum IQR pour Safety Patch (défaut: 1e-2)
+                - clip_range: Tuple (min, max) pour clipping (défaut: (-5, 5))
+        """
+        if config is None:
+            config = {}
+        
+        # Configuration centralisée (une seule vérité)
+        self.min_iqr = config.get('min_iqr', 1e-2)
+        self.clip_range = config.get('clip_range', (-5, 5))
+        
+        # Scaler (initialisé lors du fit)
+        self.scaler: Optional[RobustScaler] = None
+        
+        # Colonnes utilisées lors du fit (pour validation dans transform)
+        self.fitted_columns: Optional[List[str]] = None
+        
+    def fit(self, df: pd.DataFrame, columns: Optional[List[str]] = None) -> 'DataProcessor':
+        """
+        Apprend les statistiques (Mean, Median, IQR) sur les données d'entraînement.
+        
+        - En mode Audit : appelé sur tout le dataset.
+        - En mode WFO : appelé UNIQUEMENT sur le train_set (leak-free).
+        
+        Args:
+            df: DataFrame avec les données d'entraînement.
+            columns: Liste des colonnes à scaler. Si None, utilise toutes les colonnes numériques.
+            
+        Returns:
+            self pour permettre le chaining (processor.fit().transform())
+            
+        Raises:
+            ValueError: Si le DataFrame contient des NaNs ou des Inf.
+        """
+        # Sélectionner les colonnes à scaler
+        if columns is None:
+            target_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        else:
+            target_cols = columns
+        
+        if len(target_cols) == 0:
+            raise ValueError("No numeric columns found to scale")
+        
+        # Vérifier les NaNs (RobustScaler n'aime pas les NaNs)
+        if df[target_cols].isna().any().any():
+            raise ValueError(
+                "DataFrame contains NaN values. Please handle NaNs before calling fit(). "
+                "Use dropna(), ffill(), or bfill() as appropriate."
+            )
+        
+        # Vérifier les Inf
+        if np.isinf(df[target_cols].values).any():
+            raise ValueError(
+                "DataFrame contains Inf values. Please handle Inf before calling fit()."
+            )
+        
+        # 1. Initialiser le RobustScaler
+        self.scaler = RobustScaler()
+        self.scaler.fit(df[target_cols])
+        
+        # 2. Appliquer le Safety Patch (Centralisé ici !)
+        # Empêche l'explosion des valeurs si l'IQR est proche de 0 (ex: SPX_MACD_Hist)
+        self.scaler.scale_ = np.maximum(self.scaler.scale_, self.min_iqr)
+        
+        # 3. Stocker les colonnes utilisées (pour validation dans transform)
+        self.fitted_columns = target_cols.copy()
+        
+        return self
+    
+    def transform(self, df: pd.DataFrame, columns: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Applique la transformation (scaling + clipping) sans apprendre.
+        
+        IMPORTANT: Retourne un DataFrame avec l'index et les colonnes préservés,
+        contrairement à RobustScaler.transform() qui retourne un numpy array.
+        
+        Args:
+            df: DataFrame à transformer.
+            columns: Liste des colonnes à transformer. Si None, utilise les colonnes
+                    utilisées lors du fit().
+            
+        Returns:
+            DataFrame avec les colonnes transformées (index et colonnes préservés).
+            
+        Raises:
+            RuntimeError: Si fit() n'a pas été appelé avant.
+            ValueError: Si le DataFrame contient des NaNs ou des Inf.
+        """
+        if self.scaler is None:
+            raise RuntimeError("fit() must be called before transform()")
+        
+        # Sélectionner les colonnes à transformer
+        if columns is None:
+            # Utiliser les colonnes qui ont été fittées
+            if self.fitted_columns is None:
+                raise RuntimeError("Cannot determine columns to transform. Either call fit() with explicit columns, or pass columns parameter to transform().")
+            target_cols = self.fitted_columns
+        else:
+            target_cols = columns
+        
+        if len(target_cols) == 0:
+            raise ValueError("No numeric columns found to transform")
+        
+        # Vérifier les NaNs
+        if df[target_cols].isna().any().any():
+            raise ValueError(
+                "DataFrame contains NaN values. Please handle NaNs before calling transform()."
+            )
+        
+        # Vérifier les Inf
+        if np.isinf(df[target_cols].values).any():
+            raise ValueError(
+                "DataFrame contains Inf values. Please handle Inf before calling transform()."
+            )
+        
+        # Créer une copie pour ne pas modifier l'original
+        df_out = df.copy()
+        
+        # 1. Scaling
+        data_scaled = self.scaler.transform(df[target_cols])
+        
+        # 2. Clipping (Centralisé ici !)
+        if self.clip_range is not None:
+            clip_min, clip_max = self.clip_range
+            data_scaled = np.clip(data_scaled, clip_min, clip_max)
+        
+        # 3. Retourner le DataFrame avec les colonnes modifiées (index préservé)
+        df_out[target_cols] = data_scaled
+        
+        return df_out
+    
+    def fit_transform(self, df: pd.DataFrame, columns: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Fit puis transform (méthode de convenance).
+        
+        Args:
+            df: DataFrame avec les données d'entraînement.
+            columns: Liste des colonnes à scaler. Si None, utilise toutes les colonnes numériques.
+            
+        Returns:
+            DataFrame avec les colonnes transformées.
+        """
+        return self.fit(df, columns).transform(df, columns)
+    
+    def get_scaler(self) -> Optional[RobustScaler]:
+        """
+        Retourne le RobustScaler interne (pour sauvegarde/compatibilité).
+        
+        Returns:
+            RobustScaler fitté, ou None si fit() n'a pas été appelé.
+        """
+        return self.scaler

@@ -27,31 +27,28 @@ except ImportError:
 from src.data_engineering.loader import MultiAssetDownloader
 from src.data_engineering.features import FeatureEngineer
 from src.data_engineering.historical_downloader import HistoricalDownloader
+from src.data_engineering.processor import DataProcessor
 
 
 class RegimeDetector:
     """
     Détecteur de régimes de marché via GMM-HMM avec K-Means Warm Start.
 
-    Approche SOTA avec Leading Indicators + Archetype Alignment:
-    1. Features dédiées au HMM (7 features):
-       - HMM_Trend: Moyenne glissante 168h des Log-Returns
+    Approche SOTA avec Leading Indicators + Post-Training State Sorting:
+    1. Features dédiées au HMM (4 features):
+       - HMM_Trend: Z-Score glissant des Log-Returns (normalisé pour éviter d'être écrasé par les autres features)
        - HMM_Vol: Volatilité Parkinson rolling 168h
        - HMM_RSI_14: RSI 14 depuis FeatureEngineer (via TA-Lib)
-       - HMM_MACD_Hist: MACD Histogram depuis FeatureEngineer (via TA-Lib)
        - HMM_ADX_14: ADX 14 depuis FeatureEngineer (via TA-Lib)
-       - HMM_Funding: REMOVED (synthetic funding causes spurious correlations - audit P1.2)
-       - HMM_RiskOnOff: SPX - DXY (risk-on/off signal)
-       - HMM_VolRatio: Vol court/long terme (early warning)
 
     2. Initialisation K-Means pour garantir des clusters séparés
 
-    3. Archetype Alignment via Hungarian Algorithm:
-       - Prob_0 = Crash (-5%/h, 4% vol) - ABSOLU
-       - Prob_1 = Downtrend (-0.1%/h, 1.5% vol)
-       - Prob_2 = Range (0%, 0.5% vol)
-       - Prob_3 = Uptrend (+0.15%/h, 2% vol)
-       - Résout le problème de "Semantic Drift" entre segments WFO
+    3. Post-Training State Sorting par Trend croissant:
+       - Après l'entraînement, les états sont triés par Trend (rendement) croissant
+       - État 0 = Trend le plus bas (baissier)
+       - État N = Trend le plus haut (haussier)
+       - Les matrices internes du HMM sont réorganisées pour garantir un ordre stable
+       - Résout le problème de "Label Switching" (Seed Robustness 30% -> 100%)
     """
 
     # Features dédiées au HMM (calculées en interne)
@@ -141,11 +138,18 @@ class RegimeDetector:
         """
         df_result = df.copy()
 
-        # 1. Trend_Feature: Moyenne glissante 168h des Log-Returns
-        df_result['HMM_Trend'] = df['BTC_LogRet'].rolling(
+        # 1. Trend_Feature: Z-Score glissant des Log-Returns (normalisé pour éviter d'être écrasé)
+        # Z-Score = (val - mean) / std sur fenêtre glissante
+        # Cela normalise l'amplitude de HMM_Trend pour qu'elle soit comparable aux autres features HMM
+        rolling_mean = df['BTC_LogRet'].rolling(
             window=self.SMOOTHING_WINDOW,
             min_periods=self.SMOOTHING_WINDOW
         ).mean()
+        rolling_std = df['BTC_LogRet'].rolling(
+            window=self.SMOOTHING_WINDOW,
+            min_periods=self.SMOOTHING_WINDOW
+        ).std()
+        df_result['HMM_Trend'] = (df['BTC_LogRet'] - rolling_mean) / (rolling_std + 1e-8)  # +1e-8 pour éviter div/0
 
         # 2. Vol_Feature: Volatilité Parkinson rolling 168h
         # Apply Log transform for more Gaussian distribution (HMM-friendly)
@@ -203,7 +207,8 @@ class RegimeDetector:
         # Clip HMM features pour stabilité numérique (outliers extrêmes uniquement)
         # NOTE: Le scaling interne du RegimeDetector (fit_predict) normalise ces features
         # avant de les passer au HMM, donc on ne clippe que les outliers vraiment extrêmes
-        df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-0.10, 0.10)  # ±10%/h max (outliers)
+        # HMM_Trend est maintenant un Z-Score (normalisé), donc on clippe à ±5 (5 écarts-types)
+        df_result['HMM_Trend'] = df_result['HMM_Trend'].clip(-5.0, 5.0)  # Z-Score: ±5 std max (outliers)
         df_result['HMM_Vol'] = df_result['HMM_Vol'].clip(-12, 0)  # Log-vol bounds (élargi)
         # RSI, MACD, ADX: valeurs BRUTES ici, scalées dans fit_predict() - pas de clip agressif
         # RSI: 0-100, ADX: 0-100, MACD: variable selon prix
@@ -317,6 +322,76 @@ class RegimeDetector:
         diag_after = np.diag(A_sticky).mean()
         print(f"  Transition Penalty applied (penalty={penalty:.2f}): "
               f"diag_avg {diag_before:.3f} -> {diag_after:.3f}")
+
+    def _sort_states_by_trend(self) -> np.ndarray:
+        """
+        Trie les états HMM par Trend croissant (rendement croissant).
+
+        Après l'entraînement du HMM, réorganise les états pour garantir un ordre stable:
+        - État 0 = Trend le plus bas (baissier)
+        - État N = Trend le plus haut (haussier)
+
+        Cette méthode réorganise les matrices internes du HMM (startprob_, transmat_, means_, covars_)
+        pour garantir que l'ordre des états est toujours cohérent entre différents entraînements.
+
+        Returns:
+            np.ndarray: Permutation [old_state_idx -> new_state_idx]
+                       Exemple: [2, 0, 3, 1] signifie que l'ancien état 2 devient le nouvel état 0.
+        """
+        if not self._is_fitted or self.hmm is None:
+            raise RuntimeError("HMM must be fitted before sorting states")
+
+        # Trouver l'index de la feature Trend dans HMM_FEATURES
+        try:
+            trend_idx = self.HMM_FEATURES.index('HMM_Trend')
+        except ValueError:
+            # Fallback: utiliser le dernier élément si 'HMM_Trend' n'est pas trouvé
+            trend_idx = len(self.HMM_FEATURES) - 1
+            print(f"  [WARNING] 'HMM_Trend' not found in HMM_FEATURES, using index {trend_idx}")
+
+        # Extraire les moyennes de Trend pour chaque état
+        # means_ shape: (n_components, n_mix, n_features)
+        # On prend la moyenne des mixtures pour chaque état
+        trend_means = np.zeros(self.n_components)
+        for state in range(self.n_components):
+            trend_means[state] = self.hmm.means_[state, :, trend_idx].mean()
+
+        # Trouver l'ordre de tri (du plus baissier au plus haussier)
+        sorted_indices = np.argsort(trend_means)
+
+        print(f"  [HMM State Sorting] Trend means (before sort): {trend_means}")
+        print(f"  [HMM State Sorting] Sorted order: {sorted_indices}")
+
+        # Réorganiser les matrices internes du HMM
+        # Note: sorted_indices[i] = ancien état qui devient le nouvel état i
+        # Pour réorganiser, on utilise l'inverse: on veut que new_state[i] = old_state[sorted_indices[i]]
+
+        # 1. startprob_ (probabilités initiales)
+        self.hmm.startprob_ = self.hmm.startprob_[sorted_indices]
+
+        # 2. transmat_ (matrice de transition)
+        # Réorganiser les lignes ET les colonnes
+        self.hmm.transmat_ = self.hmm.transmat_[sorted_indices][:, sorted_indices]
+
+        # 3. means_ (moyennes des mixtures)
+        self.hmm.means_ = self.hmm.means_[sorted_indices]
+
+        # 4. covars_ (covariances des mixtures)
+        self.hmm.covars_ = self.hmm.covars_[sorted_indices]
+
+        # 5. weights_ (poids des mixtures dans GMMHMM)
+        if hasattr(self.hmm, 'weights_'):
+            self.hmm.weights_ = self.hmm.weights_[sorted_indices]
+
+        # Après réorganisation des matrices internes, les prédictions du HMM
+        # retourneront déjà les états dans le bon ordre (trié par Trend croissant).
+        # On retourne l'identité [0, 1, 2, 3] pour indiquer qu'il n'y a plus besoin de mapping.
+        print(f"  [HMM State Sorting] States reordered by Trend (ascending): "
+              f"Old state order was {sorted_indices.tolist()}, now using identity mapping")
+
+        # Retourner l'identité car les matrices sont maintenant dans le bon ordre
+        # Les prédictions seront directement dans l'ordre trié (Trend croissant)
+        return np.arange(self.n_components)
 
     def align_to_archetypes(self) -> np.ndarray:
         """
@@ -460,8 +535,11 @@ class RegimeDetector:
         1. Calcul des features HMM dédiées (168h smoothing)
         2. K-Means warm start
         3. Fit HMM
-        4. Archetype Alignment: aligner états sur archétypes fixes via Hungarian Algorithm
-        5. Création des colonnes Prob_0 (Crash), Prob_1 (Downtrend), Prob_2 (Range), Prob_3 (Uptrend)
+        4. Post-Training State Sorting: trie les états par Trend croissant (rendement croissant)
+        5. Création des colonnes Prob_0 (Trend le plus bas), Prob_1, ..., Prob_N (Trend le plus haut)
+
+        Les états sont réorganisés dans les matrices internes du HMM pour garantir un ordre stable
+        entre différents entraînements, résolvant le problème de "Label Switching" (Seed Robustness).
 
         Args:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Fracdiff.
@@ -471,6 +549,7 @@ class RegimeDetector:
 
         Returns:
             DataFrame avec colonnes HMM et Prob_* ajoutées.
+            Prob_0 = Trend le plus bas (baissier), Prob_N = Trend le plus haut (haussier).
         """
         print(f"\n[RegimeDetector] Fitting GMM-HMM ({self.n_components} states) with K-Means warm start...")
 
@@ -497,21 +576,18 @@ class RegimeDetector:
 
         print(f"  Valid samples: {len(features_valid)}")
 
-        # 3. Scaler les features
-        self.scaler.fit(features_valid)
-
-        # --- FIX: Numerical Stability for Flat Features ---
-        # Empêche l'explosion des valeurs si l'IQR est proche de 0 (ex: SPX_MACD_Hist)
-        # MIN_IQR=1.0 garantit que les valeurs scalées restent dans une plage raisonnable
-        # avant le clip(-5, 5)
-        MIN_IQR = 1.0
-        self.scaler.scale_ = np.maximum(self.scaler.scale_, MIN_IQR)
-        # --------------------------------------------------
-
-        features_scaled = self.scaler.transform(features_valid)
-
-        # Clip scaled features to [-5, 5] for numerical stability
-        features_scaled = np.clip(features_scaled, -5, 5)
+        # 3. Scaler les features - Utilise DataProcessor unifié (config spécifique pour HMM)
+        # Note: HMM utilise min_iqr=1.0 (plus élevé) car les features HMM sont déjà partiellement normalisées
+        hmm_processor = DataProcessor(config={'min_iqr': 1.0, 'clip_range': (-5, 5)})
+        
+        # Convertir en DataFrame pour DataProcessor
+        features_df = pd.DataFrame(features_valid, columns=self.HMM_FEATURES)
+        hmm_processor.fit(features_df)
+        features_scaled_df = hmm_processor.transform(features_df)
+        features_scaled = features_scaled_df.values
+        
+        # Récupérer le scaler pour compatibilité (utilisé dans align_to_archetypes)
+        self.scaler = hmm_processor.get_scaler()
 
         # Pré-calculer les log-returns pour validation de qualité
         btc_close = df_result.loc[df_result.index[valid_mask], 'BTC_Close'].values
@@ -636,36 +712,43 @@ class RegimeDetector:
         # 6. Compute stats for debug
         self._compute_state_stats()
 
-        # 7. Archetype-Based Alignment (remplace Smart Sorting)
-        #    Utilise Hungarian Algorithm pour aligner les états sur des archétypes fixes
-        #    Résout le problème de "Semantic Drift" entre segments WFO
-        #    Prob_0 = Crash, Prob_1 = Downtrend, Prob_2 = Range, Prob_3 = Uptrend (ABSOLU)
-        self.sorted_indices = self.align_to_archetypes()
+        # 7. Post-Training State Sorting by Trend (rendement croissant)
+        #    Trie les états HMM par Trend croissant pour garantir un ordre stable entre entraînements.
+        #    État 0 = Trend le plus bas (baissier), État N = Trend le plus haut (haussier)
+        #    Réorganise les matrices internes du HMM (startprob_, transmat_, means_, covars_)
+        #    pour garantir la cohérence de l'ordre des états.
+        self.sorted_indices = self._sort_states_by_trend()
+
+        # Recalculer proba après réorganisation (les matrices sont maintenant dans le bon ordre)
+        try:
+            proba = self.hmm.predict_proba(features_scaled)
+        except ValueError:
+            proba = np.ones((len(features_scaled), self.n_components)) / self.n_components
 
         # Calculer les mean_returns réels pour TensorBoard (info seulement)
         state_returns = []
         dominant = proba.argmax(axis=1)
         for i in range(self.n_components):
-            hmm_state = self.sorted_indices[i]
-            state_mask = dominant == hmm_state
+            # Après réorganisation, l'état i correspond déjà au nouvel état i (trié)
+            state_mask = dominant == i
             if state_mask.sum() > 0:
                 mean_ret = real_log_returns[state_mask].mean()
             else:
                 mean_ret = 0.0
-            state_returns.append((hmm_state, mean_ret))
+            state_returns.append((i, mean_ret))
 
-        print(f"  Final mapping: Prob_i -> HMM_State {self.sorted_indices.tolist()}")
+        print(f"  Final state order (sorted by Trend ascending): States 0..{self.n_components-1}")
 
-        # 9. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées)
+        # 9. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (déjà triées après réorganisation)
         col_names = [f'Prob_{i}' for i in range(self.n_components)]
 
         for col in col_names:
             df_result[col] = np.nan
 
         valid_indices = df_result.index[valid_mask]
+        # Après réorganisation des matrices, proba est déjà dans le bon ordre
         for i in range(self.n_components):
-            original_state = self.sorted_indices[i]
-            df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, original_state]
+            df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, i]
 
         print(f"  Added columns: {', '.join(col_names)}")
 
@@ -674,11 +757,20 @@ class RegimeDetector:
             dominant = proba.argmax(axis=1)
             for i, (state, mean_ret) in enumerate(state_returns):
                 annual_ret = mean_ret * 24 * 365 * 100
-                state_pct = (dominant == self.sorted_indices[i]).sum() / len(dominant) * 100
+                # Après réorganisation, l'état i correspond déjà au nouvel état i (trié)
+                state_pct = (dominant == i).sum() / len(dominant) * 100
                 writer.add_scalar(f"hmm/state_{i}/annual_return_pct", annual_ret, segment_id)
                 writer.add_scalar(f"hmm/state_{i}/distribution_pct", state_pct, segment_id)
 
             writer.close()
+
+        # 10. Extraire les Belief States (probabilités filtrées) pour alimenter le TQC
+        # NOTE: Pour l'entraînement, on utilise use_forward_only=False (accepte le lissage intra-segment)
+        # Pour le live/test, utiliser get_belief_states_df() avec use_forward_only=True
+        print("\n[RegimeDetector] Extracting belief states for TQC...")
+        df_result = self.get_belief_states_df(df_result, use_forward_only=False)
+        print("  [NOTE] Belief states extracted with Forward-Backward (acceptable for training)")
+        print("  [NOTE] For live/test inference, use get_belief_states_df(use_forward_only=True)")
 
         return df_result
 
@@ -687,13 +779,15 @@ class RegimeDetector:
         Prédit les probabilités de régime avec un HMM déjà entraîné.
 
         Utilisé pour le test set (évite data leakage).
-        Utilise sorted_indices pour garantir un mapping stable.
+        Les états sont triés par Trend croissant (rendement croissant) après fit_predict(),
+        donc les prédictions sont déjà dans le bon ordre.
 
         Args:
             df: DataFrame avec BTC_LogRet, BTC_Parkinson, BTC_Close.
 
         Returns:
             DataFrame avec colonnes Prob_0, Prob_1, ..., Prob_N ajoutées.
+            Prob_0 = Trend le plus bas (baissier), Prob_N = Trend le plus haut (haussier).
         """
         if not self._is_fitted:
             raise RuntimeError("HMM not fitted. Call fit_predict() first or load() a saved model.")
@@ -713,11 +807,16 @@ class RegimeDetector:
 
         print(f"  Valid samples: {len(features_valid)}")
 
-        # 3. Scaler les features (utilise le scaler déjà fitté)
-        features_scaled = self.scaler.transform(features_valid)
-
-        # Clip scaled features to [-5, 5] for numerical stability
-        features_scaled = np.clip(features_scaled, -5, 5)
+        # 3. Scaler les features (utilise le scaler déjà fitté via DataProcessor)
+        # Convertir en DataFrame pour compatibilité avec DataProcessor
+        features_df = pd.DataFrame(features_valid, columns=self.HMM_FEATURES)
+        
+        # Créer un DataProcessor temporaire avec le scaler déjà fitté
+        # (pour utiliser transform() qui gère le clipping)
+        temp_processor = DataProcessor(config={'min_iqr': 1.0, 'clip_range': (-5, 5)})
+        temp_processor.scaler = self.scaler  # Utiliser le scaler déjà fitté
+        features_scaled_df = temp_processor.transform(features_df, columns=self.HMM_FEATURES)
+        features_scaled = features_scaled_df.values
 
         # 4. Prédire les probabilités brutes
         try:
@@ -727,19 +826,279 @@ class RegimeDetector:
             print(f"  [FALLBACK] Using uniform probabilities")
             proba = np.ones((len(features_scaled), self.n_components)) / self.n_components
 
-        # 5. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées par Smart Sorting)
+        # 5. Créer les colonnes Prob_0, Prob_1, ..., Prob_N (triées par Trend croissant)
+        # Après réorganisation des matrices dans fit_predict(), les prédictions sont déjà dans le bon ordre.
+        # sorted_indices est l'identité [0,1,2,3] après réorganisation, donc on utilise directement proba[:, i]
         col_names = [f'Prob_{i}' for i in range(self.n_components)]
 
         for col in col_names:
             df_result[col] = np.nan
 
         valid_indices = df_result.index[valid_mask]
-        for i in range(self.n_components):
-            original_state = self.sorted_indices[i]
-            df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, original_state]
+        # Matrices réorganisées: proba est déjà dans le bon ordre (Trend croissant)
+        # Pour compatibilité avec anciens modèles, on vérifie si sorted_indices est l'identité
+        if np.array_equal(self.sorted_indices, np.arange(self.n_components)):
+            for i in range(self.n_components):
+                df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, i]
+        else:
+            # Ancien modèle (avant réorganisation): utiliser le mapping
+            for i in range(self.n_components):
+                original_state = self.sorted_indices[i]
+                df_result.loc[valid_indices, f'Prob_{i}'] = proba[:, original_state]
 
         print(f"  Added columns: {', '.join(col_names)}")
 
+        # 6. Extraire les Belief States (probabilités filtrées) pour alimenter le TQC
+        # Pour le test/live, on utilise Forward-Only pour éviter le look-ahead bias
+        print("\n[RegimeDetector] Extracting belief states (forward-only, no look-ahead)...")
+        df_result = self.get_belief_states_df(df_result, use_forward_only=True)
+
+        return df_result
+
+    def get_belief_states(
+        self,
+        features_scaled: np.ndarray,
+        use_forward_only: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extrait les probabilités filtrées (Belief States) des états HMM.
+        
+        IMPORTANT: Cette méthode calcule P(s_t | y_{1:t}) (Forward-Only) pour éviter
+        le Look-Ahead Bias. Contrairement à `predict_proba()` qui utilise Forward-Backward
+        et inclut l'information future, cette méthode est adaptée au trading en temps réel.
+        
+        Args:
+            features_scaled: Features HMM scalées (n_samples, n_features).
+                             Doit être déjà scalé avec le même scaler que l'entraînement.
+            use_forward_only: Si True, utilise l'algorithme Forward uniquement (pas de look-ahead).
+                             Si False, utilise predict_proba() standard (plus rapide mais avec look-ahead).
+        
+        Returns:
+            Tuple (probs, entropy):
+            - probs: Array (n_samples, n_components) avec probabilités filtrées P(s_t | y_{1:t})
+            - entropy: Array (n_samples,) avec entropie de Shannon normalisée [0, 1]
+                      (0.0 = certitude absolue, 1.0 = confusion totale)
+        
+        Note:
+            Pour le backtesting WFO, on peut accepter le lissage intra-segment d'entraînement,
+            mais pour l'inférence live/test, il faut utiliser use_forward_only=True.
+        """
+        if not self._is_fitted or self.hmm is None:
+            raise RuntimeError("HMM must be fitted before extracting belief states")
+        
+        if use_forward_only:
+            # Algorithme Forward-Only (pas de look-ahead bias)
+            probs = self._forward_filter(features_scaled)
+        else:
+            # Utilise Forward-Backward (plus rapide mais avec look-ahead)
+            # Acceptable pour l'entraînement si on accepte le lissage intra-segment
+            probs = self.hmm.predict_proba(features_scaled)
+        
+        # Calcul de l'entropie de Shannon (incertitude du régime)
+        # H = -sum_i P(s_t=i) * log(P(s_t=i))
+        # Plus l'entropie est élevée, plus l'incertitude est grande
+        from scipy.stats import entropy
+        entropy_vals = entropy(probs.T, base=2)  # base=2 pour bits
+        
+        # Normalisation: 0.0 = certitude absolue, 1.0 = confusion totale
+        # L'entropie max pour n_components états est log2(n_components)
+        max_entropy = np.log2(self.n_components)  # log2(4) ≈ 1.386 pour 4 états
+        normalized_entropy = entropy_vals / max_entropy
+        
+        return probs, normalized_entropy
+    
+    def _forward_filter(self, X: np.ndarray) -> np.ndarray:
+        """
+        Implémente l'algorithme Forward pour calculer P(s_t | y_{1:t}).
+        
+        Algorithme Forward:
+        - alpha[t, i] = P(y_1:t, s_t=i | model)
+        - P(s_t=i | y_{1:t}) = alpha[t, i] / sum_j alpha[t, j]
+        
+        Args:
+            X: Features scalées (n_samples, n_features)
+        
+        Returns:
+            Array (n_samples, n_components) avec probabilités filtrées
+        """
+        n_samples, n_features = X.shape
+        n_states = self.n_components
+        
+        # Initialisation: alpha[0, i] = startprob[i] * P(y_0 | s_0=i)
+        alpha = np.zeros((n_samples, n_states))
+        
+        # Émission probabilities pour t=0
+        log_emissions = self._compute_log_emissions(X[0:1])  # (1, n_states)
+        log_emissions = log_emissions[0]  # (n_states,)
+        
+        # Initialisation avec normalisation log-space pour stabilité numérique
+        log_alpha_prev = np.log(self.hmm.startprob_ + 1e-10) + log_emissions
+        # Normalisation log-space: log(sum(exp(log_alpha))) = logsumexp
+        log_alpha_prev = log_alpha_prev - self._logsumexp(log_alpha_prev)
+        alpha[0] = np.exp(log_alpha_prev)
+        
+        # Récursion Forward pour t=1 à T-1
+        for t in range(1, n_samples):
+            # Émission probabilities pour t
+            log_emissions = self._compute_log_emissions(X[t:t+1])[0]  # (n_states,)
+            
+            # Forward recursion: alpha[t, i] = sum_j alpha[t-1, j] * transmat[j, i] * emission[i, y_t]
+            # En log-space pour stabilité: log_alpha[t, i] = logsumexp_j(log_alpha[t-1, j] + log_trans[j, i] + log_emission[i])
+            log_alpha_t = np.zeros(n_states)
+            for i in range(n_states):
+                # log_alpha[t-1, j] + log_trans[j, i]
+                log_transitions = np.log(self.hmm.transmat_[:, i] + 1e-10)  # (n_states,)
+                log_terms = log_alpha_prev + log_transitions
+                # logsumexp pour sommer sur j
+                log_alpha_t[i] = self._logsumexp(log_terms) + log_emissions[i]
+            
+            # Normalisation
+            log_alpha_t = log_alpha_t - self._logsumexp(log_alpha_t)
+            alpha[t] = np.exp(log_alpha_t)
+            log_alpha_prev = log_alpha_t.copy()
+        
+        return alpha
+    
+    def _compute_log_emissions(self, X: np.ndarray) -> np.ndarray:
+        """
+        Calcule les log-probabilités d'émission P(y_t | s_t=i) pour un GMMHMM.
+        
+        Pour GMMHMM: P(y_t | s_t=i) = sum_mix w[i, mix] * N(y_t | mean[i, mix], cov[i, mix])
+        
+        Args:
+            X: Features (n_samples, n_features)
+        
+        Returns:
+            Array (n_samples, n_states) avec log P(y_t | s_t=i)
+        """
+        from scipy.stats import multivariate_normal
+        
+        n_samples, n_features = X.shape
+        n_states = self.n_components
+        n_mix = self.n_mix
+        
+        log_emissions = np.zeros((n_samples, n_states))
+        
+        for state in range(n_states):
+            # Pour chaque mixture dans l'état
+            log_mixture_probs = np.zeros((n_samples, n_mix))
+            
+            for mix in range(n_mix):
+                mean = self.hmm.means_[state, mix, :]  # (n_features,)
+                cov = self.hmm.covars_[state, mix, :]  # (n_features,) pour diag
+                
+                # Convertir en matrice de covariance diagonale
+                cov_matrix = np.diag(cov)
+                
+                # Log-probabilité de la mixture
+                try:
+                    log_pdf = multivariate_normal.logpdf(X, mean=mean, cov=cov_matrix)
+                except Exception:
+                    # Fallback si problème numérique
+                    log_pdf = np.full(n_samples, -np.inf)
+                
+                # Poids de la mixture
+                if hasattr(self.hmm, 'weights_'):
+                    weight = self.hmm.weights_[state, mix]
+                else:
+                    weight = 1.0 / n_mix  # Uniforme si pas de weights
+                
+                log_mixture_probs[:, mix] = np.log(weight + 1e-10) + log_pdf
+            
+            # Logsumexp sur les mixtures: log(sum_mix w_mix * N(...))
+            log_emissions[:, state] = self._logsumexp(log_mixture_probs, axis=1)
+        
+        return log_emissions
+    
+    def _logsumexp(self, x: np.ndarray, axis: int = -1) -> np.ndarray:
+        """
+        Calcul stable de log(sum(exp(x))) pour éviter l'overflow.
+        
+        Formule: logsumexp(x) = max(x) + log(sum(exp(x - max(x))))
+        
+        Args:
+            x: Array à sommer
+            axis: Axe pour la sommation
+        
+        Returns:
+            log(sum(exp(x))) le long de l'axe spécifié
+        """
+        x_max = np.max(x, axis=axis, keepdims=True)
+        x_shifted = x - x_max
+        log_sum = np.log(np.sum(np.exp(x_shifted), axis=axis, keepdims=True) + 1e-10)
+        result = x_max + log_sum
+        
+        # Retirer keepdims si nécessaire
+        if axis == -1 and x.ndim > 1:
+            result = result.squeeze(axis=axis)
+        elif axis is not None:
+            result = result.squeeze(axis=axis)
+        
+        return result
+
+    def get_belief_states_df(
+        self,
+        df: pd.DataFrame,
+        use_forward_only: bool = True
+    ) -> pd.DataFrame:
+        """
+        Extrait les probabilités filtrées (Belief States) depuis un DataFrame.
+        
+        Cette méthode calcule les probabilités filtrées P(s_t | y_{1:t}) et les ajoute
+        au DataFrame sous forme de colonnes HMM_Prob_0, HMM_Prob_1, ..., HMM_Prob_N
+        et HMM_Entropy.
+        
+        Args:
+            df: DataFrame avec les features nécessaires (BTC_LogRet, BTC_Parkinson, etc.)
+            use_forward_only: Si True, utilise Forward-Only (pas de look-ahead).
+                            Si False, utilise predict_proba() standard (plus rapide).
+        
+        Returns:
+            DataFrame avec colonnes HMM_Prob_* et HMM_Entropy ajoutées.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("HMM must be fitted before extracting belief states")
+        
+        print(f"\n[RegimeDetector] Extracting belief states (forward_only={use_forward_only})...")
+        
+        # 1. Calculer les features HMM dédiées
+        df_result = df.copy()
+        df_result = self._compute_hmm_features(df_result)
+        
+        # 2. Extraire les features et identifier les lignes valides
+        features_raw = df_result[self.HMM_FEATURES].values
+        valid_mask = np.isfinite(features_raw).all(axis=1)
+        features_valid = features_raw[valid_mask]
+        
+        print(f"  Valid samples: {len(features_valid)}")
+        
+        # 3. Scaler les features (utilise le scaler déjà fitté)
+        from src.data_engineering.processor import DataProcessor
+        temp_processor = DataProcessor(config={'min_iqr': 1.0, 'clip_range': (-5, 5)})
+        temp_processor.scaler = self.scaler
+        features_df = pd.DataFrame(features_valid, columns=self.HMM_FEATURES)
+        features_scaled_df = temp_processor.transform(features_df, columns=self.HMM_FEATURES)
+        features_scaled = features_scaled_df.values
+        
+        # 4. Calculer les belief states (probabilités filtrées)
+        probs, entropy_vals = self.get_belief_states(features_scaled, use_forward_only=use_forward_only)
+        
+        # 5. Créer les colonnes HMM_Prob_* et HMM_Entropy
+        col_names = [f'HMM_Prob_{i}' for i in range(self.n_components)]
+        
+        # Initialiser avec NaN
+        for col in col_names + ['HMM_Entropy']:
+            df_result[col] = np.nan
+        
+        # Remplir les valeurs valides
+        valid_indices = df_result.index[valid_mask]
+        for i in range(self.n_components):
+            df_result.loc[valid_indices, f'HMM_Prob_{i}'] = probs[:, i]
+        
+        df_result.loc[valid_indices, 'HMM_Entropy'] = entropy_vals
+        
+        print(f"  Added columns: {', '.join(col_names)}, HMM_Entropy")
+        
         return df_result
 
     def save(self, path: str) -> None:
@@ -882,6 +1241,10 @@ class DataManager:
             'BTC_LogRet', 'ETH_LogRet', 'SPX_LogRet', 'DXY_LogRet', 'NASDAQ_LogRet',
             # Probabilités HMM (déjà dans [0, 1], triées par Smart Sorting)
             'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
+            # Belief States HMM (probabilités filtrées Forward-Only, déjà dans [0, 1])
+            'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2', 'HMM_Prob_3',
+            # Entropie HMM (incertitude du régime, déjà normalisée)
+            'HMM_Entropy',
         ]
 
     def pipeline(
@@ -989,9 +1352,9 @@ class DataManager:
         print(f"  Dropped {dropped} rows with NaN ({len(df)} remaining)")
 
         # =====================================================================
-        # ÉTAPE 5: Global Scaling (Leak-Free)
+        # ÉTAPE 5: Global Scaling (Leak-Free) - Utilise DataProcessor unifié
         # =====================================================================
-        print("\n[5/6] Applying RobustScaler...")
+        print("\n[5/6] Applying RobustScaler (via DataProcessor)...")
 
         # Identifier les colonnes à scaler
         cols_to_scale = [
@@ -1002,37 +1365,28 @@ class DataManager:
 
         print(f"  Scaling {len(cols_to_scale)} columns")
 
+        # Utiliser DataProcessor unifié (configuration standardisée)
+        processor = DataProcessor(config={'min_iqr': 1e-2, 'clip_range': (-5, 5)})
+
         # Appliquer le scaler - LEAK-FREE MODE
         if train_end_idx is not None:
             # Fit on train only, transform all (prevents data leakage)
             print(f"  [LEAK-FREE] Fitting scaler on train only (first {train_end_idx} rows)")
-            self.scaler.fit(df.iloc[:train_end_idx][cols_to_scale])
-
-            # --- FIX: Numerical Stability for Flat Features ---
-            MIN_IQR = 1e-4
-            self.scaler.scale_ = np.maximum(self.scaler.scale_, MIN_IQR)
-            print(f"  [Safety] Applied min_scale={MIN_IQR} to prevent div/0 explosion.")
-            # --------------------------------------------------
-
-            df[cols_to_scale] = self.scaler.transform(df[cols_to_scale])
+            processor.fit(df.iloc[:train_end_idx][cols_to_scale], columns=cols_to_scale)
+            df[cols_to_scale] = processor.transform(df[cols_to_scale], columns=cols_to_scale)
         else:
             # Legacy mode - fit_transform on full dataset (DATA LEAKAGE WARNING)
-            import warnings
             warnings.warn(
                 "Scaler fit on full dataset - this causes data leakage! "
                 "Use train_end_idx parameter for production. See audit P0.1.",
                 UserWarning
             )
             print("  [WARNING] Legacy mode: fit_transform on full dataset (data leakage risk)")
-            self.scaler.fit(df[cols_to_scale])
+            processor.fit(df[cols_to_scale], columns=cols_to_scale)
+            df[cols_to_scale] = processor.transform(df[cols_to_scale], columns=cols_to_scale)
 
-            # --- FIX: Numerical Stability for Flat Features ---
-            MIN_IQR = 1e-4
-            self.scaler.scale_ = np.maximum(self.scaler.scale_, MIN_IQR)
-            print(f"  [Safety] Applied min_scale={MIN_IQR} to prevent div/0 explosion.")
-            # --------------------------------------------------
-
-            df[cols_to_scale] = self.scaler.transform(df[cols_to_scale])
+        # Récupérer le scaler pour sauvegarde (compatibilité)
+        self.scaler = processor.get_scaler()
 
         # Sauvegarder le scaler
         with open(scaler_path, 'wb') as f:
