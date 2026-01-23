@@ -40,6 +40,7 @@ sys.path.insert(0, ROOT_DIR)
 from src.data_engineering.features import FeatureEngineer
 from src.data_engineering.manager import RegimeDetector
 from src.data_engineering.splitter import validate_purge_window
+from src.data_engineering.processor import DataProcessor
 from src.config import WFOTrainingConfig
 
 
@@ -107,6 +108,10 @@ class WFOConfig:
         'BTC_Vol_ZScore', 'ETH_Vol_ZScore', 'SPX_Vol_ZScore', 'DXY_Vol_ZScore', 'NASDAQ_Vol_ZScore',
         # Probabilités HMM (déjà dans [0, 1])
         'Prob_0', 'Prob_1', 'Prob_2', 'Prob_3',
+        # Belief States HMM (probabilités filtrées Forward-Only, déjà dans [0, 1])
+        'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2', 'HMM_Prob_3',
+        # Entropie HMM (incertitude du régime, déjà normalisée)
+        'HMM_Entropy',
     ])
 
     # === Overfitting Guard parameters are now in WFOTrainingConfig ===
@@ -365,10 +370,9 @@ class WFOPipeline:
 
         print(f"  Train: {len(train_df)} rows, Eval: {len(eval_df)} rows, Test: {len(test_df)} rows")
 
-        # 3. Leak-Free Scaling: fit on TRAIN only (NOT eval!)
-        print("  Applying RobustScaler (fit on train only, NOT eval)...")
-        scaler = RobustScaler()
-
+        # 3. Leak-Free Scaling: fit on TRAIN only (NOT eval!) - Utilise DataProcessor unifié
+        print("  Applying RobustScaler (fit on train only, NOT eval) via DataProcessor...")
+        
         # Identify columns to scale
         cols_to_scale = [
             col for col in train_df.columns
@@ -378,27 +382,19 @@ class WFOPipeline:
 
         print(f"  Scaling {len(cols_to_scale)} columns")
 
-        # Fit on train ONLY
-        scaler.fit(train_df[cols_to_scale])
-
-        # --- FIX: Numerical Stability for Flat Features ---
-        # Empêche l'explosion des valeurs si l'IQR est proche de 0 (ex: SPX_MACD_Hist)
-        # MIN_IQR=1.0 garantit que les valeurs scalées restent dans une plage raisonnable
-        MIN_IQR = 1.0
-        scaler.scale_ = np.maximum(scaler.scale_, MIN_IQR)
-        print(f"  [Safety] Applied min_scale={MIN_IQR} to RobustScaler to prevent div/0 explosion.")
-        # --------------------------------------------------
-
-        # Transform all three splits
-        train_df[cols_to_scale] = scaler.transform(train_df[cols_to_scale])
-        eval_df[cols_to_scale] = scaler.transform(eval_df[cols_to_scale])
-        test_df[cols_to_scale] = scaler.transform(test_df[cols_to_scale])
-
-        # Clip scaled features to [-5, 5]
-        train_df[cols_to_scale] = train_df[cols_to_scale].clip(-5, 5)
-        eval_df[cols_to_scale] = eval_df[cols_to_scale].clip(-5, 5)
-        test_df[cols_to_scale] = test_df[cols_to_scale].clip(-5, 5)
-        print(f"  Clipped {len(cols_to_scale)} scaled columns to [-5, 5]")
+        # Utiliser DataProcessor unifié (configuration standardisée pour WFO)
+        processor = DataProcessor(config={'min_iqr': 1e-2, 'clip_range': (-5, 5)})
+        
+        # Fit on train ONLY (leak-free)
+        processor.fit(train_df[cols_to_scale], columns=cols_to_scale)
+        
+        # Transform all three splits (scaling + clipping gérés par DataProcessor)
+        train_df[cols_to_scale] = processor.transform(train_df[cols_to_scale], columns=cols_to_scale)
+        eval_df[cols_to_scale] = processor.transform(eval_df[cols_to_scale], columns=cols_to_scale)
+        test_df[cols_to_scale] = processor.transform(test_df[cols_to_scale], columns=cols_to_scale)
+        
+        # Récupérer le scaler pour retour (compatibilité)
+        scaler = processor.get_scaler()
 
         # Clip ZScores to [-5, 5] (already normalized, just safety clip)
         zscore_cols = [c for c in train_df.columns if 'ZScore' in c]

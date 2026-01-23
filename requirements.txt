@@ -5,6 +5,7 @@ torch
 pandas
 numpy
 matplotlib
+seaborn
 yfinance
 ta-lib  # Requires: apt-get install -y libta-lib0-dev (or brew install ta-lib on macOS)
 pandas-ta

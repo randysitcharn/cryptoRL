@@ -145,8 +145,13 @@ class CryptoDataset(Dataset):
         close_future = self.close_prices[idx + self.seq_len]
         close_current = self.close_prices[idx + self.seq_len - 1]
 
-        # Target: 1.0 si hausse, 0.0 sinon (pour BCEWithLogitsLoss)
-        direction = 1.0 if close_future > close_current else 0.0
+        # Vérifier les NaN et les remplacer par 0.0 (sécurité)
+        if np.isnan(close_future) or np.isnan(close_current):
+            direction = 0.0
+        else:
+            # Target: 1.0 si hausse, 0.0 sinon (pour BCEWithLogitsLoss)
+            direction = 1.0 if close_future > close_current else 0.0
+        
         target = torch.tensor([direction], dtype=torch.float32)
 
         return window_tensor, target
