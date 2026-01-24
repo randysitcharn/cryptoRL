@@ -4671,6 +4671,7 @@ def analyze_tqc_value_add(
         "oracle_total_return": oracle_total_return,
         "oracle_max_dd": oracle_max_dd,
         "oracle_win_rate": oracle_win_rate,
+        "oracle_returns": oracle_returns,
         "delta_sharpe_vs_bh": delta_sharpe_vs_bh,
         "delta_sharpe_vs_oracle": delta_sharpe_vs_oracle,
         "regime_metrics": regime_metrics,
@@ -4935,6 +4936,32 @@ def _generate_tqc_plots(results: Dict, plots_dir: str):
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.savefig(os.path.join(plots_dir, "calibration_reliability_diagram.png"), dpi=150)
+            plt.close()
+    
+    # C.1 Value Add: TQC vs B&H vs Oracle cumulative returns
+    if 'value_add' in results:
+        va = results['value_add']
+        tr = va.get('tqc_returns')
+        br = va.get('bh_returns')
+        or_ret = va.get('oracle_returns')
+        if tr is not None and len(tr) > 0:
+            n = len(tr)
+            tqc_curve = np.cumprod(1.0 + np.array(tr, dtype=np.float64))
+            plt.figure(figsize=(10, 6))
+            plt.plot(tqc_curve, label='TQC', alpha=0.9)
+            if br is not None and len(br) >= n:
+                bh_curve = np.cumprod(1.0 + np.array(br[:n], dtype=np.float64))
+                plt.plot(bh_curve, label='B&H', alpha=0.9)
+            if or_ret is not None and len(or_ret) >= n:
+                ora_curve = np.cumprod(1.0 + np.array(or_ret[:n], dtype=np.float64))
+                plt.plot(ora_curve, label='Oracle', alpha=0.9)
+            plt.xlabel('Step')
+            plt.ylabel('Cumulative Return (1 + r)')
+            plt.title('C.1 Value Add: TQC vs B&H vs Oracle')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plots_dir, "value_add_tqc_vs_baselines.png"), dpi=150)
             plt.close()
     
     # D. Action Distribution: Histogram
