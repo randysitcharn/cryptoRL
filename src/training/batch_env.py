@@ -266,10 +266,14 @@ class BatchCryptoEnv(VecEnv):
         # ═══════════════════════════════════════════════════════════════════
         # MORL: w_cost preference parameter per environment
         # Shape: (n_envs, 1) for proper broadcasting in reward calculation
-        # Sampled at reset() with biased distribution (20%/60%/20%)
+        # Sampled at reset() with biased distribution (20%/60%/20%) or curriculum
         # ═══════════════════════════════════════════════════════════════════
         self.w_cost = torch.zeros(n, 1, device=device)
         self._eval_w_cost = None  # Fixed w_cost for evaluation mode (None = sample)
+        
+        # Curriculum learning state
+        self._w_cost_target = None  # Target w_cost for curriculum (None = disabled)
+        self._use_curriculum_sampling = False  # Use curriculum sampling if True
 
         # Reward component buffers (pour observabilité)
         self._rew_pnl = torch.zeros(n, device=device)
@@ -531,15 +535,24 @@ class BatchCryptoEnv(VecEnv):
             self._sample_domain_params(torch.arange(self.num_envs, device=self.device))
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL: Sample w_cost with biased distribution (Audit SOTA Fix)
-        # 20% extremes (0 or 1) + 60% uniform to ensure agent explores
-        # both pure scalping and pure B&H strategies, not just the middle
+        # MORL: Sample w_cost (curriculum or biased distribution)
+        # Priority: eval_w_cost > curriculum > biased distribution
         # ═══════════════════════════════════════════════════════════════════
         if self._eval_w_cost is not None:
-            # Evaluation mode: use fixed w_cost for reproducibility
+            # Evaluation mode: use fixed w_cost for reproducibility (highest priority)
             self.w_cost.fill_(self._eval_w_cost)
+        elif self._use_curriculum_sampling and self._w_cost_target is not None:
+            # Curriculum mode: sample around target with truncated normal
+            # std=0.1 provides exploration while following curriculum
+            target = self._w_cost_target
+            std = 0.1
+            # Sample from normal distribution, then clip to [0, 1]
+            samples = torch.normal(mean=target, std=std, size=(self.num_envs, 1), device=self.device)
+            self.w_cost = torch.clamp(samples, min=0.0, max=1.0)
         else:
-            # Training mode: sample with biased distribution
+            # Training mode: sample with biased distribution (20%/60%/20%)
+            # 20% extremes (0 or 1) + 60% uniform to ensure agent explores
+            # both pure scalping and pure B&H strategies, not just the middle
             sample_type = torch.rand(self.num_envs, device=self.device)
             # 20% chance: w_cost = 0 (scalping mode - ignore costs)
             # 20% chance: w_cost = 1 (B&H mode - maximize cost avoidance)
@@ -605,11 +618,32 @@ class BatchCryptoEnv(VecEnv):
         """
         Set fixed w_cost for evaluation mode (MORL Pareto Front).
         
+        CRITICAL: This method has HIGHEST PRIORITY and overrides curriculum learning.
+        When called, the environment will use the fixed w_cost value instead of
+        curriculum sampling or biased distribution. This ensures reproducible evaluation
+        with specific preference values (e.g., 0.0, 0.5, 1.0 for Pareto front).
+        
         Args:
             w_cost: Fixed preference in [0, 1], or None to resume sampling.
                    0 = Scalping (ignore costs), 1 = B&H (minimize costs)
         """
         self._eval_w_cost = w_cost
+    
+    def set_w_cost_target(self, target_w_cost: float) -> None:
+        """
+        Set target w_cost for curriculum learning.
+        
+        The environment will sample w_cost around this target value
+        instead of using the fixed biased distribution (20%/60%/20%).
+        
+        Sampling uses a truncated normal distribution centered on target_w_cost
+        with std=0.1 to maintain exploration while following the curriculum.
+        
+        Args:
+            target_w_cost: Target w_cost value [0, 1] for curriculum.
+        """
+        self._w_cost_target = max(0.0, min(1.0, target_w_cost))
+        self._use_curriculum_sampling = True
 
     def step_async(self, actions) -> None:
         """Store actions for step_wait (VecEnv interface).
@@ -843,11 +877,20 @@ class BatchCryptoEnv(VecEnv):
                 self._sample_domain_params(done_indices)
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL: Resample w_cost for done envs (biased distribution)
+        # MORL: Resample w_cost for done envs (curriculum or biased distribution)
+        # Priority: eval_w_cost > curriculum > biased distribution
         # ═══════════════════════════════════════════════════════════════════
         if self._eval_w_cost is not None:
-            # Evaluation mode: use fixed w_cost
+            # Evaluation mode: use fixed w_cost (highest priority)
             self.w_cost[dones] = self._eval_w_cost
+        elif self._use_curriculum_sampling and self._w_cost_target is not None:
+            # Curriculum mode: sample around target with truncated normal
+            target = self._w_cost_target
+            std = 0.1
+            # Sample from normal distribution, then clip to [0, 1]
+            samples = torch.normal(mean=target, std=std, size=(n_done, 1), device=self.device)
+            new_w_cost = torch.clamp(samples, min=0.0, max=1.0)
+            self.w_cost[dones] = new_w_cost
         else:
             # Training mode: sample with biased distribution (20%/60%/20%)
             sample_type = torch.rand(n_done, device=self.device)

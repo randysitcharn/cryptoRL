@@ -73,7 +73,9 @@ def get_underlying_batch_env(env):
     depth = 0
     while depth < 20:
         # Cible atteinte (méthode spécifique BatchCryptoEnv)
-        if hasattr(env, 'set_smoothness_penalty'):
+        # Utiliser set_w_cost_target() qui est unique à BatchCryptoEnv (MORL)
+        # ou set_progress() pour curriculum_lambda (ancien système)
+        if hasattr(env, 'set_w_cost_target') or hasattr(env, 'set_progress'):
             return env
         # Wrapper VecEnv (ex: VecMonitor, VecNormalize)
         elif hasattr(env, 'venv'):
@@ -490,10 +492,20 @@ class UnifiedMetricsCallback(BaseCallback):
 # OBSOLETE: CurriculumFeesCallback removed - replaced by ThreePhaseCurriculumCallback
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# OBSOLETE: ThreePhaseCurriculumCallback - Replaced by MORLCurriculumCallback
+# ═══════════════════════════════════════════════════════════════════════
+# This callback managed curriculum_lambda (0.0 → 0.4) for the OLD reward function.
+# The new MORL architecture uses w_cost in observation instead.
+# Use MORLCurriculumCallback for progressive w_cost modulation.
+# ═══════════════════════════════════════════════════════════════════════
 class ThreePhaseCurriculumCallback(BaseCallback):
     """
     Three-Phase Curriculum Learning with IPC Fault Tolerance.
     Refactored 2026-01-16 to fix multiprocessing crashes.
+    
+    ⚠️ OBSOLETE: This callback manages curriculum_lambda for the OLD reward function.
+    It has been replaced by MORLCurriculumCallback which modulates w_cost for MORL.
     
     This callback manages curriculum_lambda for the environment, controlling
     the gradual introduction of cost penalties during training (MORL architecture).
@@ -506,6 +518,12 @@ class ThreePhaseCurriculumCallback(BaseCallback):
     ]
 
     def __init__(self, total_timesteps: int, verbose: int = 0):
+        import warnings
+        warnings.warn(
+            "ThreePhaseCurriculumCallback is OBSOLETE. Use MORLCurriculumCallback instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         super().__init__(verbose)
         self.total_timesteps = total_timesteps
         self._phase = 1
@@ -556,6 +574,92 @@ class ThreePhaseCurriculumCallback(BaseCallback):
             for i, phase in enumerate(self.PHASES):
                 pct = int(phase['end_progress'] * 100)
                 print(f"  Phase {i+1} (0-{pct}%): curriculum_lambda={0.4 * min(1.0, max(0, (phase['end_progress'] - 0.15) / 0.60)):.2f}")
+
+
+# ============================================================================
+# MORL Curriculum Callback (Replaces ThreePhaseCurriculumCallback)
+# ============================================================================
+
+class MORLCurriculumCallback(BaseCallback):
+    """
+    MORL Curriculum Learning: Progressive w_cost modulation.
+    
+    Gradually increases w_cost (cost preference parameter) during training to
+    introduce cost constraints progressively. This allows the agent to first
+    learn to maximize performance (w_cost ≈ 0) then gradually learn to balance
+    performance and costs (w_cost → end_cost).
+    
+    Architecture:
+        - Linear ramp: w_cost goes from start_cost to end_cost over progress_ratio
+        - Plateau: w_cost stays at end_cost for the remaining training
+    
+    The environment samples w_cost around the target value to maintain exploration.
+    
+    Args:
+        start_cost: Initial w_cost value (default: 0.0 = pure performance)
+        end_cost: Final w_cost value (default: 0.1 = balanced)
+        progress_ratio: Ratio where ramp ends (default: 0.5 = ramp on first half)
+        total_timesteps: Total training timesteps for progress calculation
+        verbose: Verbosity level
+    """
+    
+    def __init__(
+        self,
+        start_cost: float = 0.0,
+        end_cost: float = 0.1,
+        progress_ratio: float = 0.5,
+        total_timesteps: int = 30_000_000,
+        verbose: int = 0
+    ):
+        super().__init__(verbose)
+        self.start_cost = max(0.0, min(1.0, start_cost))
+        self.end_cost = max(0.0, min(1.0, end_cost))
+        self.progress_ratio = max(0.0, min(1.0, progress_ratio))
+        self.total_timesteps = total_timesteps
+        
+        if self.start_cost > self.end_cost:
+            raise ValueError(f"start_cost ({start_cost}) must be <= end_cost ({end_cost})")
+    
+    def _on_step(self) -> bool:
+        """Update w_cost target based on training progress."""
+        # 1. Calculate progress (0.0 to 1.0)
+        progress = self.num_timesteps / self.total_timesteps
+        
+        # 2. Calculate w_cost target (linear ramp then plateau)
+        if progress < self.progress_ratio:
+            # Linear ramp phase
+            alpha = progress / self.progress_ratio
+            current_w = self.start_cost + alpha * (self.end_cost - self.start_cost)
+        else:
+            # Plateau phase
+            current_w = self.end_cost
+        
+        # 3. Apply to environment via dedicated method
+        # CRITICAL: Only apply to training environment, never to eval environment
+        # self.model.env is the training environment (passed to model.learn())
+        # The eval environment is separate and managed by EvalCallback
+        real_env = get_underlying_batch_env(self.model.env)
+        if real_env is not None and hasattr(real_env, 'set_w_cost_target'):
+            real_env.set_w_cost_target(current_w)
+        else:
+            if self.verbose > 0 and self.n_calls % 1000 == 0:
+                print(f"[MORLCurriculumCallback] Warning: BatchCryptoEnv.set_w_cost_target() not found")
+        
+        # 4. Log to TensorBoard
+        self.logger.record("curriculum/w_cost_target", current_w)
+        self.logger.record("curriculum/w_cost_progress", progress)
+        
+        return True
+    
+    def _on_training_start(self) -> None:
+        """Print curriculum configuration at training start."""
+        if self.verbose > 0:
+            print(f"\n[MORL Curriculum] Progressive w_cost modulation:")
+            print(f"  Start w_cost: {self.start_cost:.3f} (pure performance)")
+            print(f"  End w_cost: {self.end_cost:.3f} (balanced)")
+            print(f"  Ramp duration: {self.progress_ratio*100:.0f}% of training")
+            print(f"  Plateau duration: {(1-self.progress_ratio)*100:.0f}% of training")
+            print(f"  Total timesteps: {self.total_timesteps:,}")
 
 
 # ============================================================================

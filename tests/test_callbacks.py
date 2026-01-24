@@ -25,6 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.training.callbacks import (
     UnifiedMetricsCallback,
     ThreePhaseCurriculumCallback,
+    MORLCurriculumCallback,
     OverfittingGuardCallbackV2,
     ModelEMACallback,
     get_underlying_batch_env,
@@ -533,6 +534,251 @@ class TestThreePhaseCurriculumCallback:
             assert "curriculum/phase" in keys_logged
             assert "curriculum/progress" in keys_logged
             assert "curriculum/lambda" in keys_logged
+
+
+# ============================================================================
+# TestMORLCurriculumCallback
+# ============================================================================
+
+class TestMORLCurriculumCallback:
+    """Tests for MORLCurriculumCallback (replaces ThreePhaseCurriculumCallback)."""
+    
+    def test_initialization_default(self):
+        """Test callback initialization with default values."""
+        callback = MORLCurriculumCallback(total_timesteps=100_000)
+        
+        assert callback.start_cost == 0.0
+        assert callback.end_cost == 0.1
+        assert callback.progress_ratio == 0.5
+        assert callback.total_timesteps == 100_000
+        assert callback.verbose == 0
+    
+    def test_initialization_custom(self):
+        """Test callback initialization with custom values."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.2,
+            progress_ratio=0.75,
+            total_timesteps=50_000,
+            verbose=1
+        )
+        
+        assert callback.start_cost == 0.0
+        assert callback.end_cost == 0.2
+        assert callback.progress_ratio == 0.75
+        assert callback.total_timesteps == 50_000
+        assert callback.verbose == 1
+    
+    def test_initialization_validation(self):
+        """Test that start_cost <= end_cost validation works."""
+        # Valid: start_cost < end_cost
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            total_timesteps=100_000
+        )
+        assert callback.start_cost == 0.0
+        assert callback.end_cost == 0.1
+        
+        # Valid: start_cost == end_cost
+        callback = MORLCurriculumCallback(
+            start_cost=0.1,
+            end_cost=0.1,
+            total_timesteps=100_000
+        )
+        assert callback.start_cost == 0.1
+        assert callback.end_cost == 0.1
+        
+        # Invalid: start_cost > end_cost
+        with pytest.raises(ValueError, match="start_cost.*must be <= end_cost"):
+            MORLCurriculumCallback(
+                start_cost=0.2,
+                end_cost=0.1,
+                total_timesteps=100_000
+            )
+    
+    def test_clipping_values(self):
+        """Test that cost values are clipped to [0, 1]."""
+        # Values > 1.0 should be clipped
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=1.5,  # > 1.0
+            total_timesteps=100_000
+        )
+        assert callback.end_cost == 1.0
+        
+        # Values < 0.0 should be clipped
+        callback = MORLCurriculumCallback(
+            start_cost=-0.5,  # < 0.0
+            end_cost=0.1,
+            total_timesteps=100_000
+        )
+        assert callback.start_cost == 0.0
+    
+    def test_linear_ramp_phase(self):
+        """Test linear ramp calculation during ramp phase (progress < progress_ratio)."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            progress_ratio=0.5,
+            total_timesteps=100_000
+        )
+        callback.model = create_mock_model()
+        mock_env = Mock()
+        mock_env.set_w_cost_target = Mock()
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            # At 0% progress: should be start_cost
+            callback.num_timesteps = 0
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.0) < 1e-6
+            
+            # At 25% progress (half of ramp): should be midpoint
+            callback.num_timesteps = 25_000  # 25% of total, 50% of ramp
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.05) < 1e-6  # Midpoint: (0.0 + 0.1) / 2
+            
+            # At 50% progress (end of ramp): should be end_cost
+            callback.num_timesteps = 50_000  # Exactly at progress_ratio
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.1) < 1e-6
+    
+    def test_plateau_phase(self):
+        """Test plateau phase (progress >= progress_ratio)."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            progress_ratio=0.5,
+            total_timesteps=100_000
+        )
+        callback.model = create_mock_model()
+        mock_env = Mock()
+        mock_env.set_w_cost_target = Mock()
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            # At 50% progress: should be end_cost (boundary)
+            callback.num_timesteps = 50_000
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.1) < 1e-6
+            
+            # At 75% progress: should still be end_cost (plateau)
+            callback.num_timesteps = 75_000
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.1) < 1e-6
+            
+            # At 100% progress: should still be end_cost (plateau)
+            callback.num_timesteps = 100_000
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.1) < 1e-6
+    
+    def test_env_update_called(self):
+        """Test that set_w_cost_target is called on environment."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            progress_ratio=0.5,
+            total_timesteps=100_000
+        )
+        callback.model = create_mock_model()
+        mock_env = Mock()
+        mock_env.set_w_cost_target = Mock()
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            callback.num_timesteps = 25_000  # 25% progress
+            callback._on_step()
+            
+            # Verify set_w_cost_target was called
+            assert mock_env.set_w_cost_target.called
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert 0.0 <= call_args <= 0.1  # Should be in valid range
+    
+    def test_logging_records(self):
+        """Test that metrics are logged to TensorBoard."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            progress_ratio=0.5,
+            total_timesteps=100_000
+        )
+        callback.model = create_mock_model()
+        mock_env = Mock()
+        mock_env.set_w_cost_target = Mock()
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            callback.num_timesteps = 25_000  # 25% progress
+            callback._on_step()
+            
+            # Verify logger.record was called
+            record_calls = callback.logger.record.call_args_list
+            keys_logged = [call[0][0] for call in record_calls]
+            
+            assert "curriculum/w_cost_target" in keys_logged
+            assert "curriculum/w_cost_progress" in keys_logged
+            
+            # Verify values are correct
+            w_cost_target_call = next(call for call in record_calls if call[0][0] == "curriculum/w_cost_target")
+            w_cost_progress_call = next(call for call in record_calls if call[0][0] == "curriculum/w_cost_progress")
+            
+            assert abs(w_cost_target_call[0][1] - 0.05) < 1e-6  # 25% of ramp = 0.05
+            assert abs(w_cost_progress_call[0][1] - 0.25) < 1e-6  # 25% progress
+    
+    def test_no_env_warning(self):
+        """Test that warning is printed if BatchCryptoEnv not found."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            total_timesteps=100_000,
+            verbose=1
+        )
+        callback.model = create_mock_model()
+        callback.n_calls = 1000  # Multiple of 1000 to trigger warning
+        
+        # Mock env without set_w_cost_target
+        mock_env = Mock()
+        del mock_env.set_w_cost_target  # Remove the method
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            with patch('builtins.print') as mock_print:
+                callback._on_step()
+                # Warning should be printed (verbose=1 and n_calls % 1000 == 0)
+                assert any("Warning" in str(call) for call in mock_print.call_args_list)
+    
+    def test_custom_progress_ratio(self):
+        """Test with custom progress_ratio (ramp on 75% of training)."""
+        callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.2,
+            progress_ratio=0.75,  # Ramp on first 75%
+            total_timesteps=100_000
+        )
+        callback.model = create_mock_model()
+        mock_env = Mock()
+        mock_env.set_w_cost_target = Mock()
+        
+        with patch('src.training.callbacks.get_underlying_batch_env', return_value=mock_env):
+            # At 37.5% progress (half of ramp): should be midpoint
+            callback.num_timesteps = 37_500  # 37.5% of total, 50% of ramp
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.1) < 1e-6  # Midpoint: (0.0 + 0.2) / 2
+            
+            # At 75% progress (end of ramp): should be end_cost
+            callback.num_timesteps = 75_000
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.2) < 1e-6
+            
+            # At 90% progress (plateau): should still be end_cost
+            callback.num_timesteps = 90_000
+            callback._on_step()
+            call_args = mock_env.set_w_cost_target.call_args[0][0]
+            assert abs(call_args - 0.2) < 1e-6
 
 
 # ============================================================================

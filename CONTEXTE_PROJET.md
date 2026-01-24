@@ -94,9 +94,10 @@ WFO Pipeline (run_full_wfo.py)
 - `BatchCryptoEnv` (batch_env.py) - GPU/CPU, supporte n_envs=1 pour évaluation
 
 **Callbacks:**
-- `ThreePhaseCurriculumCallback` - Curriculum learning (3 phases)
+- `MORLCurriculumCallback` - Curriculum learning progressif (modulation w_cost)
+- `ThreePhaseCurriculumCallback` - ⚠️ OBSOLETE (remplacé par MORLCurriculumCallback)
 - `RotatingCheckpointCallback` - Optimisation disque
-- `TrainingMetricsCallback` - Logging NAV mode WFO
+- `UnifiedMetricsCallback` - Logging TensorBoard unifié
 
 ---
 
@@ -121,13 +122,14 @@ WFO Pipeline (run_full_wfo.py)
 | learning_rate | 1e-4 |
 | gamma | 0.95 |
 
-### Curriculum (3 phases)
+### Curriculum (MORL)
 
-| Phase | Progression | Churn | Smooth |
-|-------|-------------|-------|--------|
-| 1 - Discovery | 0-10% | 0.0 → 0.10 | 0.0 |
-| 2 - Discipline | 10-30% | 0.10 → 0.50 | 0.0 → 0.02 |
-| 3 - Consolidation | 30-100% | 0.50 (fixe) | 0.02 (fixe) |
+| Phase | Progression | w_cost | Description |
+|-------|-------------|--------|-------------|
+| Rampe | 0-50% | 0.0 → 0.1 | Introduction progressive des coûts |
+| Plateau | 50-100% | 0.1 (fixe) | Stabilisation |
+
+**Note:** L'ancien système `ThreePhaseCurriculumCallback` (curriculum_lambda) est obsolète. Le nouveau système `MORLCurriculumCallback` module directement `w_cost` dans l'observation (architecture MORL).
 
 ---
 
@@ -156,13 +158,17 @@ ssh -p 20941 -L 8081:localhost:8081 root@158.51.110.52
 Le projet utilise une architecture MORL (Multi-Objective Reinforcement Learning) pour gérer l'équilibre entre performance et coûts:
 
 ```python
-reward = r_perf + curriculum_lambda * w_cost * r_cost * MAX_PENALTY_SCALE
+reward = r_perf + w_cost * r_cost * MAX_PENALTY_SCALE
 ```
 
 où:
 - `r_perf`: Log-returns (objectif performance)
-- `w_cost ∈ [0, 1]`: Paramètre MORL dans l'observation
-- `curriculum_lambda ∈ [0, 0.4]`: Progression contrôlée
+- `w_cost ∈ [0, 1]`: Paramètre MORL dans l'observation (modulé par `MORLCurriculumCallback`)
+- `MAX_PENALTY_SCALE = 0.4`: Facteur d'échelle des pénalités
+
+**Curriculum Learning:**
+- `MORLCurriculumCallback` module progressivement `w_cost` de 0.0 (performance pure) à 0.1 (équilibré) sur 50% du training
+- L'agent apprend d'abord à maximiser la performance, puis à équilibrer avec les coûts
 
 ---
 

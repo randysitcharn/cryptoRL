@@ -31,7 +31,7 @@ from src.training.batch_env import BatchCryptoEnv
 from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
     UnifiedMetricsCallback,
-    ThreePhaseCurriculumCallback,
+    MORLCurriculumCallback,
     OverfittingGuardCallback,
     OverfittingGuardCallbackV2,
     ModelEMACallback,
@@ -455,10 +455,14 @@ def create_callbacks(
 
     # Note: UnifiedMetricsCallback already added above (replaces DetailTensorboardCallback)
 
-    # Curriculum Learning callback (3-Phase: Discovery → Discipline → Refinement)
-    # Phases calibrées dans callbacks.py pour ratio |PnL|/|Penalties| ≈ 1.0
+    # Curriculum Learning callback (MORL: Progressive w_cost modulation)
+    # Gradually increases w_cost from 0.0 (pure performance) to 0.1 (balanced)
+    # over the first 50% of training, then plateaus at 0.1
     if config.use_curriculum:
-        curriculum_callback = ThreePhaseCurriculumCallback(
+        curriculum_callback = MORLCurriculumCallback(
+            start_cost=0.0,
+            end_cost=0.1,
+            progress_ratio=0.5,
             total_timesteps=config.total_timesteps,
             verbose=1
         )
