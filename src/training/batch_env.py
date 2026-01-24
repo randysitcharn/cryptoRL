@@ -92,7 +92,7 @@ class BatchCryptoEnv(VecEnv):
             initial_balance: Starting capital per env.
             commission: Transaction fee rate.
             slippage: Slippage cost rate.
-            reward_scaling: Reward multiplier (keep at 1.0, SCALE=100 internal).
+            reward_scaling: Reward multiplier (keep at 1.0, SCALE=10 internal).
             downside_coef: Sortino downside penalty coefficient.
             upside_coef: Upside bonus coefficient.
             action_discretization: Action discretization step (0.1 = 21 levels).
@@ -427,17 +427,17 @@ class BatchCryptoEnv(VecEnv):
         Returns:
             Rewards for all envs. Shape: (n_envs,)
         """
-        SCALE = 100.0
+        SCALE = 10.0  # Reduced from 100.0 to prevent gradient saturation (Reward Downscaling)
 
         # ═══════════════════════════════════════════════════════════════════
         # MORL CALIBRATION: MAX_PENALTY_SCALE (Reward Rescue - FiLM audit)
         # Audit: Policy Paralysis — agent stuck in Cash (92%) when penalty too high.
         # Original 2.0 was too punitive; divide by 5 so agent learns Alpha before Cost.
         # ═══════════════════════════════════════════════════════════════════
-        MAX_PENALTY_SCALE = 0.4  # 2.0 / 5 — softer cost penalty, avoid policy paralysis
+        MAX_PENALTY_SCALE = 0.4  # Unchanged (relative): penalty weight in MORL scalarization
 
-        # Safety caps to prevent NaN/explosion
-        COST_PENALTY_CAP = 20.0
+        # Safety caps to prevent NaN/explosion. Scaled down with SCALE (absolute magnitude).
+        COST_PENALTY_CAP = 2.0  # Reduced from 20.0 (SCALE / 10) for reward downscaling
 
         # ═══════════════════════════════════════════════════════════════════
         # 1. OBJECTIVE 1: Performance (Log Returns)
