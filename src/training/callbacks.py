@@ -189,10 +189,13 @@ class UnifiedMetricsCallback(BaseCallback):
     def _on_step(self) -> bool:
         """Log metrics at each step (light metrics buffered, heavy metrics at log_freq)."""
         should_log = (self.n_calls % self.log_freq == 0)
-        
+
+        # 0. Collect raw data for diagnostics (every step)
+        self._collect_actions_and_entropy()
+
         # 1. Collect light metrics (every step, buffered) - from infos if available
         self._collect_light_metrics()
-        
+
         # 2. Log heavy metrics (only at log_freq)
         if should_log:
             # Log buffered metrics first
@@ -204,15 +207,54 @@ class UnifiedMetricsCallback(BaseCallback):
             self._log_tqc_stats()
             # Dump to TensorBoard
             self.logger.dump(self.num_timesteps)
-        
+
         # 3. Episode end logging (event-driven)
         self._handle_episode_end()
-        
+
         # 4. Console logging (if verbose and at log_freq)
         if should_log and self.verbose > 0:
             self._log_console()
-        
+
         return True
+
+    def _collect_actions_and_entropy(self):
+        """
+        Collect actions and entropy coefficient for diagnostics.
+
+        Called every step to build statistics for:
+        - Action saturation (% of actions near ±1)
+        - Average entropy coefficient (exploration level)
+        """
+        # Collect actions
+        if 'actions' in self.locals and self.locals['actions'] is not None:
+            actions = self.locals['actions']
+            if isinstance(actions, torch.Tensor):
+                actions = actions.cpu().numpy()
+            # Store raw actions (not abs) for proper saturation calculation
+            self.all_actions.extend(actions.flatten().tolist())
+
+        # Collect entropy coefficient (alpha) for TQC/SAC
+        try:
+            if hasattr(self.model, 'ent_coef_tensor'):
+                # TQC/SAC with learnable alpha
+                ent_coef = self.model.ent_coef_tensor
+                if isinstance(ent_coef, torch.Tensor):
+                    ent_coef = ent_coef.item()
+                self.entropy_values.append(float(ent_coef))
+            elif hasattr(self.model, 'ent_coef'):
+                # Static entropy coefficient
+                ent_coef = self.model.ent_coef
+                if isinstance(ent_coef, torch.Tensor):
+                    ent_coef = ent_coef.item()
+                elif isinstance(ent_coef, str):
+                    # "auto" case - try to get from log_ent_coef
+                    if hasattr(self.model, 'log_ent_coef'):
+                        ent_coef = torch.exp(self.model.log_ent_coef).item()
+                    else:
+                        return  # Can't get value
+                self.entropy_values.append(float(ent_coef))
+        except Exception:
+            pass  # Silently fail if entropy not accessible
     
     def _collect_light_metrics(self):
         """Collect light metrics from infos dict (fast, no GPU call)."""
@@ -466,10 +508,47 @@ class UnifiedMetricsCallback(BaseCallback):
         return total_norm ** 0.5
     
     def get_training_metrics(self) -> dict:
-        """Return diagnostic metrics at end of training (for compatibility)."""
+        """
+        Return diagnostic metrics at end of training.
+
+        Metrics:
+            action_saturation: Ratio of actions with |a| > 0.95 (policy collapse indicator)
+            avg_entropy: Mean entropy coefficient (exploration level)
+            action_mean: Mean action value (position bias)
+            action_std: Action standard deviation (exploration diversity)
+        """
+        # Default metrics if no data collected
+        default_metrics = {
+            "action_saturation": 0.0,
+            "avg_entropy": 0.0,
+            "action_mean": 0.0,
+            "action_std": 0.0,
+            "avg_critic_loss": 0.0,
+            "avg_actor_loss": 0.0,
+            "avg_churn_ratio": 0.0,
+            "avg_actor_grad_norm": 0.0,
+            "avg_critic_grad_norm": 0.0,
+        }
+
+        if not self.all_actions:
+            return default_metrics
+
+        # Convert to numpy for calculations
+        actions_array = np.array(list(self.all_actions))
+
+        # Action saturation: ratio of actions near ±1 (|a| > 0.95)
+        saturation_threshold = 0.95
+        saturated_ratio = float(np.mean(np.abs(actions_array) > saturation_threshold))
+
+        # Action statistics
+        action_mean = float(np.mean(actions_array))
+        action_std = float(np.std(actions_array))
+
         return {
-            "action_saturation": float(np.mean(self.all_actions)) if self.all_actions else 0.0,
+            "action_saturation": saturated_ratio,
             "avg_entropy": float(np.mean(self.entropy_values)) if self.entropy_values else 0.0,
+            "action_mean": action_mean,
+            "action_std": action_std,
             "avg_critic_loss": float(np.mean(self.critic_losses)) if self.critic_losses else 0.0,
             "avg_actor_loss": float(np.mean(self.actor_losses)) if self.actor_losses else 0.0,
             "avg_churn_ratio": float(np.mean(self.churn_ratios)) if self.churn_ratios else 0.0,

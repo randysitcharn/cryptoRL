@@ -845,6 +845,8 @@ def train(
 
     print("\n[Training Diagnostics]")
     print(f"  Action Saturation: {training_metrics['action_saturation']:.3f}")
+    print(f"  Action Mean: {training_metrics['action_mean']:.4f}")
+    print(f"  Action Std: {training_metrics['action_std']:.4f}")
     print(f"  Avg Entropy: {training_metrics['avg_entropy']:.4f}")
     print(f"  Avg Critic Loss: {training_metrics['avg_critic_loss']:.4f}")
     print(f"  Avg Actor Loss: {training_metrics['avg_actor_loss']:.4f}")
