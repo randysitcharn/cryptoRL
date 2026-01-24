@@ -15,9 +15,12 @@ Pipeline per Segment:
 Usage:
     python scripts/run_full_wfo.py --segments 10 --timesteps 300000
     python scripts/run_full_wfo.py --segment 0 --timesteps 300000  # Single segment
+    python scripts/run_full_wfo.py --clean              # Nettoyer artefacts WFO puis quitter
+    python scripts/run_full_wfo.py --clean --clean-dry-run  # Simuler le nettoyage
 """
 
 import os
+import subprocess
 import sys
 import gc
 import json
@@ -2443,6 +2446,12 @@ def main():
     parser.add_argument("--no-ensemble-parallel", action="store_true",
                         help="Disable parallel training (use single GPU)")
 
+    # === Clean WFO artefacts ===
+    parser.add_argument("--clean", action="store_true",
+                        help="Run clean_wfo.py (remove logs, TB, weights, encoder, data) then exit")
+    parser.add_argument("--clean-dry-run", action="store_true",
+                        help="With --clean: dry-run only (no deletion)")
+
     args = parser.parse_args()
 
     # Create config
@@ -2509,6 +2518,16 @@ def main():
         print(f"  Seeds: {config.ensemble_seeds[:config.ensemble_n_members]}")
         print(f"  Aggregation: {config.ensemble_aggregation}")
         print(f"  Parallel training: {config.ensemble_parallel}")
+
+    # === Clean WFO artefacts (then exit) ===
+    if args.clean:
+        clean_script = Path(__file__).resolve().parents[1] / "scripts" / "clean_wfo.py"
+        cmd = [sys.executable, str(clean_script), "--yes"]
+        if args.clean_dry_run:
+            cmd.append("--dry-run")
+        subprocess.run(cmd, cwd=ROOT_DIR, check=True)
+        print("[WFO] Clean done. Exiting.")
+        sys.exit(0)
 
     # Create pipeline
     pipeline = WFOPipeline(config)
