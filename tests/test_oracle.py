@@ -367,7 +367,7 @@ def test_gradient_flow():
     
     # 4. Forward Pass
     print("[>] Forward Pass...")
-    features = model.policy.features_extractor(obs)
+    features = model.actor.features_extractor(obs)
     loss = features.mean()  # Une Loss bidon
     
     # 5. Backward Pass
