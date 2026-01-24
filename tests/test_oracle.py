@@ -346,7 +346,7 @@ def test_gradient_flow():
     # 2. Initialiser le modèle (avec encodeur gele)
     from src.config import TQCTrainingConfig
     from src.training.train_agent import create_policy_kwargs
-    from src.models.tqc_dropout import TQCDropoutPolicy
+    from src.models.tqc_dropout_policy import TQCDropoutPolicy
 
     config = TQCTrainingConfig()
     config.freeze_encoder = True  # On teste le cas critique
