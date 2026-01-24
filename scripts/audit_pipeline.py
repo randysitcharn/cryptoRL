@@ -4045,6 +4045,13 @@ def analyze_tqc_quantiles(
     window_size = test_env.window_size if hasattr(test_env, 'window_size') else 64
     df_start_idx = window_size
     
+    # Debugging counters
+    debug_warnings = []
+    n_zero_obs = 0
+    n_nan_obs = 0
+    n_zero_std_obs = 0
+    n_identical_q_values = 0
+    
     while not done and step_count < n_steps:
         # Get action from policy
         action, _ = model.predict(obs, deterministic=True)
@@ -4058,8 +4065,32 @@ def analyze_tqc_quantiles(
         
         # Get quantiles from critic
         with torch.no_grad():
+            # SANITY CHECK: Inputs (obs)
+            market_obs = obs['market']
+            if isinstance(market_obs, np.ndarray):
+                market_obs_tensor = torch.tensor(market_obs, dtype=torch.float32)
+            else:
+                market_obs_tensor = torch.tensor(market_obs, dtype=torch.float32)
+            
+            # Check for zeros, NaNs, or zero std
+            if torch.allclose(market_obs_tensor, torch.zeros_like(market_obs_tensor), atol=1e-5):
+                n_zero_obs += 1
+                if n_zero_obs == 1:  # Log only first occurrence
+                    debug_warnings.append(f"Step {step_count}: Observation 'market' is all zeros!")
+            
+            if torch.isnan(market_obs_tensor).any():
+                n_nan_obs += 1
+                if n_nan_obs == 1:
+                    debug_warnings.append(f"Step {step_count}: Observation 'market' contains NaNs!")
+            
+            market_std = market_obs_tensor.std().item()
+            if market_std < 1e-6:
+                n_zero_std_obs += 1
+                if n_zero_std_obs == 1:
+                    debug_warnings.append(f"Step {step_count}: Observation 'market' has zero std ({market_std:.2e})!")
+            
             obs_tensor = {
-                'market': torch.tensor(obs['market'], dtype=torch.float32).unsqueeze(0).to(device),
+                'market': market_obs_tensor.unsqueeze(0).to(device),
                 'position': torch.tensor(obs['position'], dtype=torch.float32).unsqueeze(0).to(device),
                 'w_cost': torch.tensor(obs['w_cost'], dtype=torch.float32).unsqueeze(0).to(device)
             }
@@ -4073,6 +4104,14 @@ def analyze_tqc_quantiles(
             # Average across critics
             quantiles_flat = quantiles.mean(dim=1)  # (batch, n_quantiles)
             quantiles_flat = quantiles_flat.squeeze(0).cpu().numpy()  # (n_quantiles,)
+            
+            # SANITY CHECK: Outputs (Q-values)
+            if len(quantiles_flat) > 1:
+                q_unique = len(np.unique(quantiles_flat))
+                if q_unique == 1:
+                    n_identical_q_values += 1
+                    if n_identical_q_values == 1:
+                        debug_warnings.append(f"Step {step_count}: All Q-values are identical ({quantiles_flat[0]:.6f})!")
             
             # Calculate IQR (Q90 - Q10)
             n_quantiles = len(quantiles_flat)
@@ -4139,6 +4178,24 @@ def analyze_tqc_quantiles(
         else:
             print(f"  [OK] Correlation >= 0.3 (TQC responds to market uncertainty)")
     
+    # Display debugging warnings
+    if debug_warnings:
+        print(f"\n  [DEBUG] Sanity Check Warnings:")
+        for warning in debug_warnings[:5]:  # Show first 5 warnings
+            print(f"    ⚠️ {warning}")
+        if len(debug_warnings) > 5:
+            print(f"    ... and {len(debug_warnings) - 5} more warnings")
+        print(f"  [DEBUG] Summary: {n_zero_obs} zero obs, {n_nan_obs} NaN obs, {n_zero_std_obs} zero-std obs, {n_identical_q_values} identical Q-values")
+    
+    # Add debug stats to results
+    results['debug_stats'] = {
+        'n_zero_obs': n_zero_obs,
+        'n_nan_obs': n_nan_obs,
+        'n_zero_std_obs': n_zero_std_obs,
+        'n_identical_q_values': n_identical_q_values,
+        'warnings': debug_warnings[:10]  # Keep first 10 warnings in results
+    }
+    
     return results
 
 
@@ -4181,14 +4238,45 @@ def analyze_tqc_calibration(
     window_size = test_env.window_size if hasattr(test_env, 'window_size') else 64
     df_start_idx = window_size
     
+    # Debugging counters
+    debug_warnings = []
+    n_zero_obs = 0
+    n_nan_obs = 0
+    n_zero_std_obs = 0
+    n_identical_q_values = 0
+    
     while not done and step_count < n_steps:
         # Get action and Q-value
         action, _ = model.predict(obs, deterministic=True)
         
         # Get Q-value from critic
         with torch.no_grad():
+            # SANITY CHECK: Inputs (obs)
+            market_obs = obs['market']
+            if isinstance(market_obs, np.ndarray):
+                market_obs_tensor = torch.tensor(market_obs, dtype=torch.float32)
+            else:
+                market_obs_tensor = torch.tensor(market_obs, dtype=torch.float32)
+            
+            # Check for zeros, NaNs, or zero std
+            if torch.allclose(market_obs_tensor, torch.zeros_like(market_obs_tensor), atol=1e-5):
+                n_zero_obs += 1
+                if n_zero_obs == 1:
+                    debug_warnings.append(f"Step {step_count}: Observation 'market' is all zeros!")
+            
+            if torch.isnan(market_obs_tensor).any():
+                n_nan_obs += 1
+                if n_nan_obs == 1:
+                    debug_warnings.append(f"Step {step_count}: Observation 'market' contains NaNs!")
+            
+            market_std = market_obs_tensor.std().item()
+            if market_std < 1e-6:
+                n_zero_std_obs += 1
+                if n_zero_std_obs == 1:
+                    debug_warnings.append(f"Step {step_count}: Observation 'market' has zero std ({market_std:.2e})!")
+            
             obs_tensor = {
-                'market': torch.tensor(obs['market'], dtype=torch.float32).unsqueeze(0).to(device),
+                'market': market_obs_tensor.unsqueeze(0).to(device),
                 'position': torch.tensor(obs['position'], dtype=torch.float32).unsqueeze(0).to(device),
                 'w_cost': torch.tensor(obs['w_cost'], dtype=torch.float32).unsqueeze(0).to(device)
             }
@@ -4196,6 +4284,14 @@ def analyze_tqc_calibration(
             
             quantiles = model.policy.critic(obs_tensor, action_tensor)
             quantiles_flat = quantiles.mean(dim=1).squeeze(0).cpu().numpy()
+            
+            # SANITY CHECK: Outputs (Q-values)
+            if len(quantiles_flat) > 1:
+                q_unique = len(np.unique(quantiles_flat))
+                if q_unique == 1:
+                    n_identical_q_values += 1
+                    if n_identical_q_values == 1:
+                        debug_warnings.append(f"Step {step_count}: All Q-values are identical ({quantiles_flat[0]:.6f})!")
             
             q_mean = quantiles_flat.mean()
             q_std = quantiles_flat.std()
@@ -4298,6 +4394,24 @@ def analyze_tqc_calibration(
         print(f"  Correlation (HMM_Entropy, Q_std): {entropy_correlation:.4f}")
     if entropy_action_correlation is not None:
         print(f"  Correlation (HMM_Entropy, |action|): {entropy_action_correlation:.4f}")
+    
+    # Display debugging warnings
+    if debug_warnings:
+        print(f"\n  [DEBUG] Sanity Check Warnings:")
+        for warning in debug_warnings[:5]:
+            print(f"    ⚠️ {warning}")
+        if len(debug_warnings) > 5:
+            print(f"    ... and {len(debug_warnings) - 5} more warnings")
+        print(f"  [DEBUG] Summary: {n_zero_obs} zero obs, {n_nan_obs} NaN obs, {n_zero_std_obs} zero-std obs, {n_identical_q_values} identical Q-values")
+    
+    # Add debug stats to results
+    results['debug_stats'] = {
+        'n_zero_obs': n_zero_obs,
+        'n_nan_obs': n_nan_obs,
+        'n_zero_std_obs': n_zero_std_obs,
+        'n_identical_q_values': n_identical_q_values,
+        'warnings': debug_warnings[:10]
+    }
     
     return results
 
@@ -4446,6 +4560,11 @@ def analyze_tqc_attribution(
             'w_cost': w_cost_tensor
         }
         action_tensor = torch.tensor([action_sample], dtype=torch.float32).unsqueeze(0).to(device)
+
+        # SANITY CHECK: Verify if obs_tensor is empty (all zeros)
+        baseline = torch.zeros_like(market_tensor)
+        if torch.allclose(market_tensor, baseline, atol=1e-5):
+            print(f"  [WARNING] Step {idx}: L'observation entrante est vide (tous zéros) lors de l'analyse d'attribution !")
 
         try:
             # Get Q-value - try different critic interfaces
@@ -5260,19 +5379,235 @@ def run_tqc_audit(
     print(f"\n[6/7] Generating report...")
     report_path = generate_tqc_audit_report(results, output_dir)
     
-    # Save metrics
-    print(f"\n[7/7] Saving metrics...")
-    metrics_path = os.path.join(output_dir, "metrics.json")
-    # Convert numpy arrays to lists for JSON serialization
-    metrics_serializable = _serialize_results(results)
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics_serializable, f, indent=2)
+    # Save metrics (Lazy Loading architecture)
+    print(f"\n[7/7] Saving metrics (Lazy Loading)...")
+    
+    # Create details directory
+    details_dir = os.path.join(output_dir, "details")
+    os.makedirs(details_dir, exist_ok=True)
+    
+    # Helper function to compute histogram (10 bins)
+    def compute_histogram(values, n_bins=10):
+        """Compute histogram with n_bins and return bin edges and counts."""
+        if len(values) == 0:
+            return {"bins": [], "counts": []}
+        values_array = np.array(values)
+        if np.all(np.isnan(values_array)):
+            return {"bins": [], "counts": []}
+        valid_values = values_array[~np.isnan(values_array)]
+        if len(valid_values) == 0:
+            return {"bins": [], "counts": []}
+        counts, bin_edges = np.histogram(valid_values, bins=n_bins)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        return {
+            "bin_centers": bin_centers.tolist(),
+            "counts": counts.tolist(),
+            "min": float(np.min(valid_values)),
+            "max": float(np.max(valid_values))
+        }
+    
+    # Extract long series and save to details/
+    details_files = {}
+    
+    # 1. Series Q-values (from quantiles)
+    if 'quantiles' in results:
+        quantiles_data = results['quantiles']
+        q_values_mean = quantiles_data.get('q_values_mean', [])
+        q_values_std = quantiles_data.get('q_values_std', [])
+        
+        if len(q_values_mean) > 10:
+            details_files['series_q_values'] = {
+                'q_values_mean': q_values_mean,
+                'q_values_std': q_values_std
+            }
+            with open(os.path.join(details_dir, 'series_q_values.json'), 'w') as f:
+                json.dump({
+                    'q_values_mean': _serialize_results(q_values_mean),
+                    'q_values_std': _serialize_results(q_values_std)
+                }, f, indent=2)
+    
+    # 2. Series Uncertainty (from quantiles)
+    if 'quantiles' in results:
+        quantiles_data = results['quantiles']
+        iqrs = quantiles_data.get('iqrs', [])
+        hmm_entropies = quantiles_data.get('hmm_entropies', [])
+        
+        if len(iqrs) > 10:
+            # Convert hmm_entropies (may contain None) to list
+            hmm_entropies_clean = [h if h is not None else np.nan for h in hmm_entropies]
+            details_files['series_uncertainty'] = {
+                'iqrs': iqrs.tolist() if isinstance(iqrs, np.ndarray) else iqrs,
+                'hmm_entropies': hmm_entropies_clean
+            }
+            with open(os.path.join(details_dir, 'series_uncertainty.json'), 'w') as f:
+                json.dump({
+                    'iqrs': _serialize_results(iqrs),
+                    'hmm_entropies': _serialize_results(hmm_entropies_clean)
+                }, f, indent=2)
+    
+    # 3. Series Calibration (from calibration)
+    if 'calibration' in results:
+        cal_data = results['calibration']
+        actions = cal_data.get('actions', [])
+        rewards = cal_data.get('actual_returns', [])  # actual_returns are the rewards
+        q_values = cal_data.get('q_values', [])
+        
+        if len(actions) > 10:
+            details_files['series_calibration'] = {
+                'actions': actions.tolist() if isinstance(actions, np.ndarray) else actions,
+                'rewards': rewards.tolist() if isinstance(rewards, np.ndarray) else rewards,
+                'q_values': q_values.tolist() if isinstance(q_values, np.ndarray) else q_values
+            }
+            with open(os.path.join(details_dir, 'series_calibration.json'), 'w') as f:
+                json.dump({
+                    'actions': _serialize_results(actions),
+                    'rewards': _serialize_results(rewards),
+                    'q_values': _serialize_results(q_values)
+                }, f, indent=2)
+    
+    # Build summary (lightweight, no lists > 10 elements)
+    summary = {
+        'output_dir': results.get('output_dir'),
+        'segment_id': results.get('segment_id'),
+        'tqc_path': results.get('tqc_path'),
+        'test_data_path': results.get('test_data_path'),
+        'config': results.get('config', {}),
+        '__lazy_load': {}
+    }
+    
+    # Add scalar summaries from quantiles
+    if 'quantiles' in results:
+        quantiles_data = results['quantiles']
+        q_values_mean = quantiles_data.get('q_values_mean', [])
+        q_values_std = quantiles_data.get('q_values_std', [])
+        iqrs = quantiles_data.get('iqrs', [])
+        
+        if len(q_values_mean) > 10:
+            summary['__lazy_load']['q_values'] = 'details/series_q_values.json'
+            summary['quantiles'] = {
+                'q_values_mean': {
+                    'mean': float(np.mean(q_values_mean)) if len(q_values_mean) > 0 else 0.0,
+                    'std': float(np.std(q_values_mean)) if len(q_values_mean) > 0 else 0.0,
+                    'min': float(np.min(q_values_mean)) if len(q_values_mean) > 0 else 0.0,
+                    'max': float(np.max(q_values_mean)) if len(q_values_mean) > 0 else 0.0,
+                    'histogram': compute_histogram(q_values_mean, n_bins=10)
+                },
+                'q_values_std': {
+                    'mean': float(np.mean(q_values_std)) if len(q_values_std) > 0 else 0.0,
+                    'std': float(np.std(q_values_std)) if len(q_values_std) > 0 else 0.0,
+                    'min': float(np.min(q_values_std)) if len(q_values_std) > 0 else 0.0,
+                    'max': float(np.max(q_values_std)) if len(q_values_std) > 0 else 0.0
+                },
+                'correlation': quantiles_data.get('correlation'),
+                'overconfidence_detected': quantiles_data.get('overconfidence_detected', False),
+                'n_steps': quantiles_data.get('n_steps', 0)
+            }
+        else:
+            # If small, include directly
+            summary['quantiles'] = {
+                'q_values_mean': q_values_mean.tolist() if isinstance(q_values_mean, np.ndarray) else q_values_mean,
+                'q_values_std': q_values_std.tolist() if isinstance(q_values_std, np.ndarray) else q_values_std,
+                'correlation': quantiles_data.get('correlation'),
+                'overconfidence_detected': quantiles_data.get('overconfidence_detected', False),
+                'n_steps': quantiles_data.get('n_steps', 0)
+            }
+        
+        # IQRs and uncertainty
+        if len(iqrs) > 10:
+            summary['__lazy_load']['uncertainty'] = 'details/series_uncertainty.json'
+            summary['quantiles']['iqrs'] = {
+                'mean': float(np.mean(iqrs)) if len(iqrs) > 0 else 0.0,
+                'std': float(np.std(iqrs)) if len(iqrs) > 0 else 0.0,
+                'min': float(np.min(iqrs)) if len(iqrs) > 0 else 0.0,
+                'max': float(np.max(iqrs)) if len(iqrs) > 0 else 0.0,
+                'histogram': compute_histogram(iqrs, n_bins=10)
+            }
+        else:
+            summary['quantiles']['iqrs'] = iqrs.tolist() if isinstance(iqrs, np.ndarray) else iqrs
+    
+    # Add scalar summaries from calibration
+    if 'calibration' in results:
+        cal_data = results['calibration']
+        actions = cal_data.get('actions', [])
+        rewards = cal_data.get('actual_returns', [])
+        q_values = cal_data.get('q_values', [])
+        
+        if len(actions) > 10:
+            summary['__lazy_load']['calibration'] = 'details/series_calibration.json'
+            summary['calibration'] = {
+                'ece': cal_data.get('ece'),
+                'brier_score': cal_data.get('brier_score'),
+                'entropy_correlation': cal_data.get('entropy_correlation'),
+                'entropy_action_correlation': cal_data.get('entropy_action_correlation'),
+                'n_steps': cal_data.get('n_steps', 0),
+                'actions': {
+                    'mean': float(np.mean(actions)) if len(actions) > 0 else 0.0,
+                    'std': float(np.std(actions)) if len(actions) > 0 else 0.0,
+                    'min': float(np.min(actions)) if len(actions) > 0 else 0.0,
+                    'max': float(np.max(actions)) if len(actions) > 0 else 0.0,
+                    'histogram': compute_histogram(actions, n_bins=10)
+                },
+                'rewards': {
+                    'mean': float(np.mean(rewards)) if len(rewards) > 0 else 0.0,
+                    'std': float(np.std(rewards)) if len(rewards) > 0 else 0.0,
+                    'min': float(np.min(rewards)) if len(rewards) > 0 else 0.0,
+                    'max': float(np.max(rewards)) if len(rewards) > 0 else 0.0
+                },
+                'q_values': {
+                    'mean': float(np.mean(q_values)) if len(q_values) > 0 else 0.0,
+                    'std': float(np.std(q_values)) if len(q_values) > 0 else 0.0,
+                    'min': float(np.min(q_values)) if len(q_values) > 0 else 0.0,
+                    'max': float(np.max(q_values)) if len(q_values) > 0 else 0.0,
+                    'histogram': compute_histogram(q_values, n_bins=10)
+                }
+            }
+        else:
+            summary['calibration'] = {
+                'ece': cal_data.get('ece'),
+                'brier_score': cal_data.get('brier_score'),
+                'entropy_correlation': cal_data.get('entropy_correlation'),
+                'entropy_action_correlation': cal_data.get('entropy_action_correlation'),
+                'n_steps': cal_data.get('n_steps', 0),
+                'actions': actions.tolist() if isinstance(actions, np.ndarray) else actions,
+                'rewards': rewards.tolist() if isinstance(rewards, np.ndarray) else rewards,
+                'q_values': q_values.tolist() if isinstance(q_values, np.ndarray) else q_values
+            }
+    
+    # Add other sections (action_distribution, attribution, value_add, convergence)
+    # Keep them as-is if they're small, otherwise extract scalars
+    for section in ['action_distribution', 'attribution', 'value_add', 'convergence']:
+        if section in results:
+            section_data = results[section]
+            # For now, keep small sections as-is, but remove long arrays
+            section_summary = {}
+            for key, value in section_data.items():
+                if isinstance(value, (list, np.ndarray)):
+                    if len(value) > 10:
+                        # Skip long lists in summary
+                        continue
+                    else:
+                        section_summary[key] = value.tolist() if isinstance(value, np.ndarray) else value
+                else:
+                    section_summary[key] = value
+            summary[section] = section_summary
+    
+    # Save summary
+    metrics_summary_path = os.path.join(output_dir, "metrics_summary.json")
+    with open(metrics_summary_path, 'w') as f:
+        json.dump(_serialize_results(summary), f, indent=2)
+    
+    print(f"  Summary saved: {metrics_summary_path}")
+    if details_files:
+        print(f"  Details saved in: {details_dir}/")
+        for key in details_files.keys():
+            print(f"    - {key}.json")
     
     print("\n" + "=" * 70)
     print("TQC AUDIT COMPLETE")
     print("=" * 70)
     print(f"Report: {report_path}")
-    print(f"Metrics: {metrics_path}")
+    print(f"Metrics Summary: {metrics_summary_path}")
+    print(f"Details: {details_dir}/")
     print(f"Plots: {plots_dir}")
     
     return results
