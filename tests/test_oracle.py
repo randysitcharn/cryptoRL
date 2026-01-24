@@ -323,20 +323,25 @@ class TestOracleSignalCorrelation:
 
 def test_gradient_flow():
     """
-    Diagnostic du flux de gradient avec encodeur gelé.
-    
-    Vérifie que les gradients remontent jusqu'aux observations d'entrée
-    même quand l'encodeur est gelé. Si l'encodeur utilise .detach(),
-    le graphe de calcul est cassé et les gradients ne remontent pas.
-    
-    Ce test permet de détecter si freeze_encoder casse le graphe.
+    Diagnostic du flux de gradient avec encodeur gele.
+
+    Verifie que les gradients remontent jusqu'aux observations d'entree
+    meme quand l'encodeur est gele. Si l'encodeur utilise .detach(),
+    le graphe de calcul est casse et les gradients ne remontent pas.
+
+    Ce test permet de detecter si freeze_encoder casse le graphe.
     """
     from src.training.batch_env import BatchCryptoEnv
-    
+    import os
+
     print("--- DIAGNOSTIC DU FLUX DE GRADIENT ---")
-    
-    # 1. Charger un environnement factice pour les dimensions
-    env = BatchCryptoEnv(n_envs=1)
+
+    # 1. Charger un environnement avec les donnees WFO segment 0
+    wfo_train_path = "data/wfo/segment_0/train.parquet"
+    if not os.path.exists(wfo_train_path):
+        pytest.skip(f"WFO data not found: {wfo_train_path}")
+
+    env = BatchCryptoEnv(parquet_path=wfo_train_path, n_envs=1)
     
     # 2. Initialiser le modèle (avec encodeur gelé)
     from src.config import TQCTrainingConfig
