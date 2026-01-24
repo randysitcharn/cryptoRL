@@ -4697,33 +4697,341 @@ def analyze_tqc_value_add(
     return results
 
 
+def to_sparkline(values: List[float]) -> str:
+    """
+    Convertit une liste de valeurs en sparkline ASCII (mini-graphique texte).
+    
+    Args:
+        values: Liste de valeurs numériques
+    
+    Returns:
+        Chaîne Unicode avec les caractères blocs ( ▂▃▄▅▆▇█ )
+    """
+    if not values or len(values) == 0:
+        return ""
+    
+    # Filtrer les NaN et inf
+    clean_values = [v for v in values if not (np.isnan(v) or np.isinf(v))]
+    if not clean_values:
+        return "—" * len(values)
+    
+    min_v, max_v = min(clean_values), max(clean_values)
+    range_v = max_v - min_v
+    
+    if range_v == 0:
+        return "—" * len(clean_values)
+    
+    chars = u" ▂▃▄▅▆▇█"
+    spark = ""
+    for v in clean_values:
+        # Normaliser entre 0 et 7
+        idx = int(((v - min_v) / range_v) * 7)
+        idx = max(0, min(7, idx))  # Clamp
+        spark += chars[idx]
+    
+    return spark
+
+
+def extract_and_resample(
+    log_dir: str,
+    tag: str,
+    n_samples: int = 40
+) -> Optional[Tuple[List[float], List[int]]]:
+    """
+    Extrait et rééchantillonne les valeurs scalaires d'un tag TensorBoard.
+    
+    Args:
+        log_dir: Répertoire des logs TensorBoard
+        tag: Tag à extraire (ex: 'train/critic_loss')
+        n_samples: Nombre de buckets pour le downsampling
+    
+    Returns:
+        Tuple (valeurs rééchantillonnées, steps) ou None si échec
+    """
+    try:
+        # Essayer d'importer tensorboard
+        try:
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        except ImportError:
+            print(f"  [WARNING] tensorboard library not available. Install with: pip install tensorboard")
+            return None
+        
+        if not os.path.exists(log_dir):
+            return None
+        
+        # Charger les événements TensorBoard
+        # EventAccumulator gère automatiquement la recherche des fichiers event
+        ea = EventAccumulator(log_dir)
+        ea.Reload()
+        
+        # Vérifier si le tag existe
+        scalar_tags = ea.Tags().get('scalars', [])
+        if tag not in scalar_tags:
+            return None
+        
+        # Extraire toutes les valeurs
+        scalar_events = ea.Scalars(tag)
+        if not scalar_events:
+            return None
+        
+        # Extraire steps et values
+        steps = [e.step for e in scalar_events]
+        values = [e.value for e in scalar_events]
+        
+        if len(values) == 0:
+            return None
+        
+        # Downsampling intelligent : diviser en n_samples buckets
+        if len(values) <= n_samples:
+            # Pas besoin de downsampling
+            return (values, steps)
+        
+        # Créer des buckets égaux
+        n_buckets = n_samples
+        bucket_size = len(values) / n_buckets
+        
+        resampled_values = []
+        resampled_steps = []
+        
+        for i in range(n_buckets):
+            start_idx = int(i * bucket_size)
+            end_idx = int((i + 1) * bucket_size)
+            if end_idx > len(values):
+                end_idx = len(values)
+            
+            if start_idx < end_idx:
+                bucket_values = values[start_idx:end_idx]
+                bucket_steps = steps[start_idx:end_idx]
+                # Moyenne du bucket
+                resampled_values.append(np.mean(bucket_values))
+                resampled_steps.append(bucket_steps[len(bucket_steps) // 2])  # Step médian
+        
+        return (resampled_values, resampled_steps)
+    
+    except Exception as e:
+        print(f"  [ERROR] Failed to extract {tag}: {e}")
+        return None
+
+
+def extract_hyperparams_from_model(model) -> Dict[str, Any]:
+    """
+    Extrait les hyperparamètres depuis un modèle TQC chargé.
+    
+    Args:
+        model: Modèle TQC chargé
+    
+    Returns:
+        Dict avec les hyperparamètres extraits
+    """
+    hyperparams = {}
+    
+    try:
+        # Learning rate
+        if hasattr(model, 'learning_rate'):
+            lr = model.learning_rate
+            if callable(lr):
+                # C'est un schedule, prendre la valeur initiale
+                try:
+                    hyperparams['learning_rate'] = float(lr(1.0))
+                except:
+                    hyperparams['learning_rate'] = str(lr)
+            else:
+                hyperparams['learning_rate'] = float(lr) if lr is not None else None
+        
+        # Gamma
+        if hasattr(model, 'gamma'):
+            hyperparams['gamma'] = float(model.gamma)
+        
+        # Tau (Polyak)
+        if hasattr(model, 'tau'):
+            hyperparams['tau'] = float(model.tau)
+        
+        # Batch size
+        if hasattr(model, 'batch_size'):
+            hyperparams['batch_size'] = int(model.batch_size)
+        
+        # Entropy coefficient
+        if hasattr(model, 'ent_coef'):
+            ent_coef = model.ent_coef
+            if hasattr(ent_coef, 'item'):
+                hyperparams['ent_coef'] = float(ent_coef.item())
+            elif hasattr(ent_coef, '__float__'):
+                hyperparams['ent_coef'] = float(ent_coef)
+            else:
+                hyperparams['ent_coef'] = ent_coef
+        
+        # N quantiles
+        if hasattr(model, 'n_quantiles'):
+            hyperparams['n_quantiles'] = int(model.n_quantiles)
+        
+        # N critics
+        if hasattr(model, 'n_critics'):
+            hyperparams['n_critics'] = int(model.n_critics)
+        
+        # Buffer size
+        if hasattr(model, 'buffer_size'):
+            hyperparams['buffer_size'] = int(model.buffer_size)
+        
+        # Train frequency
+        if hasattr(model, 'train_freq'):
+            train_freq = model.train_freq
+            if isinstance(train_freq, (tuple, list)):
+                # train_freq peut être (freq, unit) ou juste freq
+                hyperparams['train_freq'] = int(train_freq[0]) if len(train_freq) > 0 else int(train_freq)
+            else:
+                hyperparams['train_freq'] = int(train_freq)
+        
+        # Gradient steps
+        if hasattr(model, 'gradient_steps'):
+            hyperparams['gradient_steps'] = int(model.gradient_steps)
+        
+        # Top quantiles to drop
+        if hasattr(model, 'top_quantiles_to_drop_per_net'):
+            hyperparams['top_quantiles_to_drop'] = int(model.top_quantiles_to_drop_per_net)
+        elif hasattr(model, 'top_quantiles_to_drop'):
+            hyperparams['top_quantiles_to_drop'] = int(model.top_quantiles_to_drop)
+        
+        # gSDE (State-Dependent Exploration)
+        if hasattr(model, 'use_sde'):
+            hyperparams['use_sde'] = bool(model.use_sde)
+        
+        # Log std init (pour gSDE)
+        if hasattr(model, 'log_std_init'):
+            hyperparams['log_std_init'] = float(model.log_std_init)
+        elif hasattr(model, 'policy') and hasattr(model.policy, 'log_std_init'):
+            hyperparams['log_std_init'] = float(model.policy.log_std_init)
+        
+        # SDE sample frequency
+        if hasattr(model, 'sde_sample_freq'):
+            hyperparams['sde_sample_freq'] = int(model.sde_sample_freq)
+        
+    except Exception as e:
+        print(f"  [WARNING] Could not extract all hyperparams: {e}")
+    
+    return hyperparams
+
+
 def analyze_tqc_convergence(
-    tensorboard_log_dir: str
+    tensorboard_log_dir: str,
+    model: Optional[Any] = None
 ) -> Dict:
     """
-    E.1 Training Curves Analysis from TensorBoard
+    E. Deep Convergence Analysis avec Sparklines
+    
+    Analyse la dynamique temporelle de l'entraînement avec visualisation ASCII.
     
     Args:
         tensorboard_log_dir: Path to TensorBoard log directory
+        model: Modèle TQC chargé (optionnel, pour extraire hyperparams)
     
     Returns:
-        Dict with convergence analysis
+        Dict avec convergence analysis enrichie
     """
-    print(f"\n[E] Analyzing TQC Convergence...")
+    print(f"\n[E] Analyzing TQC Convergence (Deep Analysis)...")
     
-    # Try to parse TensorBoard events
-    # This is a simplified version - full implementation would use tensorboard library
     results = {
         'log_dir': tensorboard_log_dir,
         'available': os.path.exists(tensorboard_log_dir),
-        'note': 'Full TensorBoard parsing requires tensorboard library'
+        'hyperparams': {},
+        'metrics': {}
     }
     
-    if os.path.exists(tensorboard_log_dir):
-        print(f"  TensorBoard log directory found: {tensorboard_log_dir}")
-        print(f"  [INFO] Full parsing requires tensorboard library (not implemented here)")
-    else:
+    # Extraire hyperparamètres depuis le modèle
+    if model is not None:
+        results['hyperparams'] = extract_hyperparams_from_model(model)
+        print(f"  Extracted hyperparams: {len(results['hyperparams'])} parameters")
+    
+    if not os.path.exists(tensorboard_log_dir):
         print(f"  [WARNING] TensorBoard log directory not found: {tensorboard_log_dir}")
+        return results
+    
+    print(f"  TensorBoard log directory found: {tensorboard_log_dir}")
+    
+    # Tags à analyser (métriques importantes)
+    tags_to_analyze = [
+        'train/critic_loss',
+        'train/actor_loss',
+        'train/ent_coef',
+        'train/learning_rate',
+        'rollout/ep_rew_mean',
+        'rollout/ep_len_mean',
+    ]
+    
+    # Extraire et analyser chaque métrique
+    for tag in tags_to_analyze:
+        print(f"  Extracting {tag}...")
+        resampled = extract_and_resample(tensorboard_log_dir, tag, n_samples=40)
+        
+        if resampled is None:
+            continue
+        
+        values, steps = resampled
+        
+        if len(values) == 0:
+            continue
+        
+        # Calculer statistiques
+        start_avg = np.mean(values[:5]) if len(values) >= 5 else values[0]
+        end_avg = np.mean(values[-5:]) if len(values) >= 5 else values[-1]
+        peak = max(values)
+        peak_idx = values.index(peak)
+        
+        # Générer sparkline
+        sparkline = to_sparkline(values)
+        
+        # Déterminer le statut
+        if 'loss' in tag.lower():
+            # Pour les loss, on veut qu'elles descendent
+            if end_avg < start_avg * 0.9:
+                status = "✅ Decreasing"
+                emoji = "🟢"
+            elif end_avg > start_avg * 1.1:
+                status = "🔴 Exploding"
+                emoji = "🔴"
+            else:
+                status = "➡️ Stable"
+                emoji = "🟡"
+        elif 'reward' in tag.lower() or 'rew' in tag.lower():
+            # Pour les rewards, on veut qu'elles montent
+            if end_avg > start_avg * 1.1:
+                status = "📈 Growing"
+                emoji = "🟢"
+            elif end_avg < start_avg * 0.9:
+                status = "📉 Collapsing"
+                emoji = "🔴"
+            else:
+                status = "➡️ Stable"
+                emoji = "🟡"
+        elif 'ent_coef' in tag.lower():
+            # Pour ent_coef, on veut voir l'évolution
+            if end_avg < start_avg * 0.5:
+                status = "📉 Collapsed"
+                emoji = "🟡"
+            elif end_avg > start_avg * 1.5:
+                status = "📈 Exploded"
+                emoji = "🔴"
+            else:
+                status = "➡️ Stable"
+                emoji = "🟢"
+        else:
+            status = "—"
+            emoji = "⚪"
+        
+        # Stocker les résultats
+        metric_name = tag.split('/')[-1]  # Nom simple (ex: 'critic_loss')
+        results['metrics'][metric_name] = {
+            'tag': tag,
+            'sparkline': sparkline,
+            'start': float(start_avg),
+            'end': float(end_avg),
+            'peak': float(peak),
+            'peak_step': int(steps[peak_idx]) if peak_idx < len(steps) else None,
+            'status': status,
+            'emoji': emoji,
+            'n_points': len(values)
+        }
+    
+    print(f"  Analyzed {len(results['metrics'])} metrics")
     
     return results
 
@@ -4843,7 +5151,12 @@ def run_tqc_audit(
     
     # Section E: Convergence (requires TensorBoard log)
     tensorboard_log = f"logs/tensorboard_tqc/segment_{segment_id}"
-    results['convergence'] = analyze_tqc_convergence(tensorboard_log)
+    # Essayer aussi logs/wfo/segment_X si le premier n'existe pas
+    if not os.path.exists(tensorboard_log):
+        tensorboard_log_alt = f"logs/wfo/segment_{segment_id}"
+        if os.path.exists(tensorboard_log_alt):
+            tensorboard_log = tensorboard_log_alt
+    results['convergence'] = analyze_tqc_convergence(tensorboard_log, model=model)
     
     # Generate plots
     print(f"\n[5/7] Generating plots...")
@@ -5085,13 +5398,111 @@ def generate_tqc_audit_report(
             if ad.get('saturation_pct', 0) > 95:
                 f.write("⚠️ **WARNING**: Policy collapse detected (>95% actions saturated).\n\n")
         
-        # Section E: Convergence
-        f.write("## E. Convergence Analysis\n\n")
+        # Section E: Convergence (Deep Analysis avec Sparklines)
+        f.write("## E. Deep Convergence Analysis\n\n")
         if 'convergence' in results:
             conv = results['convergence']
-            f.write(f"- **TensorBoard Log**: {conv.get('log_dir', 'N/A')}\n")
-            f.write(f"- **Available**: {conv.get('available', False)}\n")
-            f.write(f"- **Note**: {conv.get('note', 'N/A')}\n\n")
+            
+            # Hyperparamètres
+            if conv.get('hyperparams'):
+                f.write("### ⚙️ Configuration\n\n")
+                f.write("| Hyperparameter | Value |\n")
+                f.write("|----------------|-------|\n")
+                hyperparams = conv['hyperparams']
+                
+                # Hyperparamètres principaux (TQC core)
+                if 'learning_rate' in hyperparams:
+                    lr = hyperparams['learning_rate']
+                    if isinstance(lr, (int, float)):
+                        f.write(f"| Learning Rate | {lr:.6f} |\n")
+                    else:
+                        f.write(f"| Learning Rate | {lr} |\n")
+                if 'gamma' in hyperparams:
+                    f.write(f"| Gamma | {hyperparams['gamma']:.6f} |\n")
+                if 'tau' in hyperparams:
+                    f.write(f"| Polyak (Tau) | {hyperparams['tau']:.6f} |\n")
+                if 'batch_size' in hyperparams:
+                    f.write(f"| Batch Size | {hyperparams['batch_size']} |\n")
+                if 'buffer_size' in hyperparams:
+                    f.write(f"| Buffer Size | {hyperparams['buffer_size']:,} |\n")
+                
+                # Hyperparamètres d'entraînement
+                if 'train_freq' in hyperparams:
+                    f.write(f"| Train Frequency | {hyperparams['train_freq']} |\n")
+                if 'gradient_steps' in hyperparams:
+                    f.write(f"| Gradient Steps | {hyperparams['gradient_steps']} |\n")
+                
+                # Hyperparamètres TQC spécifiques
+                if 'n_quantiles' in hyperparams:
+                    f.write(f"| N Quantiles | {hyperparams['n_quantiles']} |\n")
+                if 'n_critics' in hyperparams:
+                    f.write(f"| N Critics | {hyperparams['n_critics']} |\n")
+                if 'top_quantiles_to_drop' in hyperparams:
+                    f.write(f"| Top Quantiles to Drop | {hyperparams['top_quantiles_to_drop']} |\n")
+                
+                # Hyperparamètres d'exploration
+                if 'ent_coef' in hyperparams:
+                    ent_coef = hyperparams['ent_coef']
+                    if isinstance(ent_coef, (int, float)):
+                        f.write(f"| Entropy Coef | {ent_coef:.6f} |\n")
+                    else:
+                        f.write(f"| Entropy Coef | {ent_coef} |\n")
+                if 'use_sde' in hyperparams:
+                    f.write(f"| Use gSDE | {hyperparams['use_sde']} |\n")
+                if 'log_std_init' in hyperparams:
+                    f.write(f"| Log Std Init | {hyperparams['log_std_init']:.4f} |\n")
+                if 'sde_sample_freq' in hyperparams:
+                    sde_freq = hyperparams['sde_sample_freq']
+                    if sde_freq == -1:
+                        f.write(f"| SDE Sample Freq | Once per episode |\n")
+                    else:
+                        f.write(f"| SDE Sample Freq | {sde_freq} |\n")
+                
+                f.write("\n")
+            
+            # Métriques avec Sparklines
+            if conv.get('metrics'):
+                f.write("### 📈 Dynamics\n\n")
+                f.write("| Metric | Shape (Trend) | Start | Peak | End | Status |\n")
+                f.write("|--------|---------------|-------|------|-----|--------|\n")
+                
+                metrics = conv['metrics']
+                # Ordre préféré pour l'affichage
+                metric_order = ['critic_loss', 'actor_loss', 'ent_coef', 'learning_rate', 
+                               'ep_rew_mean', 'ep_len_mean']
+                
+                for metric_name in metric_order:
+                    if metric_name not in metrics:
+                        continue
+                    
+                    m = metrics[metric_name]
+                    sparkline = m.get('sparkline', '—')
+                    start = m.get('start', 0.0)
+                    peak = m.get('peak', 0.0)
+                    end = m.get('end', 0.0)
+                    status = m.get('status', '—')
+                    emoji = m.get('emoji', '⚪')
+                    
+                    # Formater les valeurs selon leur magnitude
+                    def fmt_val(v):
+                        if abs(v) < 0.01:
+                            return f"{v:.6f}"
+                        elif abs(v) < 1:
+                            return f"{v:.4f}"
+                        elif abs(v) < 100:
+                            return f"{v:.2f}"
+                        else:
+                            return f"{v:.1f}"
+                    
+                    f.write(f"| {metric_name.replace('_', ' ').title()} | `{sparkline}` | {fmt_val(start)} | {fmt_val(peak)} | {fmt_val(end)} | {emoji} {status} |\n")
+                
+                f.write("\n")
+            else:
+                f.write(f"- **TensorBoard Log**: {conv.get('log_dir', 'N/A')}\n")
+                f.write(f"- **Available**: {conv.get('available', False)}\n")
+                if not conv.get('available'):
+                    f.write(f"- **Note**: TensorBoard logs not found. Install tensorboard library to enable deep analysis.\n")
+                f.write("\n")
         
         f.write("=" * 80 + "\n")
         f.write("END OF REPORT\n")
