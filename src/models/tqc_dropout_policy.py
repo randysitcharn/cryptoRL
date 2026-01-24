@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Type, Tuple, Union
 from sb3_contrib.tqc.policies import TQCPolicy, Actor
 from stable_baselines3.common.preprocessing import get_action_dim
 
+from src.config.constants import DEFAULT_LOG_STD_INIT
+
 
 # ==============================================================================
 # 1. Utility : MLP Builder avec LayerNorm & Dropout (Architecture DroQ)
@@ -128,7 +130,7 @@ class DropoutActor(Actor):
         features_dim: int,
         activation_fn: Type[nn.Module] = nn.ReLU,
         use_sde: bool = False,
-        log_std_init: float = -1.0,  # FIX: Hardcoded -1 for larger positions (was -3)
+        log_std_init: float = DEFAULT_LOG_STD_INIT,  # Single source of truth (constants.py)
         full_std: bool = True,
         use_expln: bool = False,
         clip_mean: float = 2.0,
@@ -339,7 +341,7 @@ class TQCDropoutPolicy(TQCPolicy):
         use_spectral_norm_critic: bool = False,  # Default False for reproducibility
         use_spectral_norm_actor: bool = False,    # Default False (conservative)
         # ====== Exploration Init (FIX for small positions) ======
-        log_std_init: float = -1.0,     # FIX: -1 gives std≈0.37 (vs SB3 default -3 giving std≈0.05)
+        log_std_init: float = DEFAULT_LOG_STD_INIT,  # Single source of truth (constants.py)
         **kwargs
     ):
         """

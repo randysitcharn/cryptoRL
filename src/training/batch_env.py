@@ -459,7 +459,8 @@ class BatchCryptoEnv(VecEnv):
         MAX_PENALTY_SCALE = 0.4  # Unchanged (relative): penalty weight in MORL scalarization
 
         # Safety caps to prevent NaN/explosion. Scaled down with SCALE (absolute magnitude).
-        COST_PENALTY_CAP = 2.0  # Reduced from 20.0 (SCALE / 10) for reward downscaling
+        COST_PENALTY_CAP = 0.1  # REDUCED from 2.0 to fix "Cash Trap" (Audit 2026-01-24)
+                                # Ratio Pénalité/Gain: 80:1 → 4:1 (viable pour trading)
 
         # ═══════════════════════════════════════════════════════════════════
         # 1. OBJECTIVE 1: Performance (Log Returns)

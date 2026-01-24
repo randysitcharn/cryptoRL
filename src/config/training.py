@@ -8,6 +8,8 @@ Centralizes all training-related settings for consistency across the codebase.
 from dataclasses import dataclass, field
 from typing import Optional, Union, List, Dict, Callable
 
+from src.config.constants import DEFAULT_LOG_STD_INIT
+
 
 
 # =============================================================================
@@ -65,7 +67,7 @@ class TQCTrainingConfig:
     d_model: int = 256  # Increased capacity for complex patterns
     n_heads: int = 4
     n_layers: int = 2
-    freeze_encoder: bool = True
+    freeze_encoder: bool = False  # Shock Therapy: dégel pour fine-tuning end-to-end
 
     # --- TQC Hyperparameters ---
     total_timesteps: int = 90_000_000  # 90M steps
@@ -88,7 +90,7 @@ class TQCTrainingConfig:
     use_sde: bool = True
     sde_sample_freq: int = -1  # -1 = resample once per episode
     use_sde_at_warmup: bool = True
-    log_std_init: float = -1.0  # FIX: Increased init exploration (default -3 too small)
+    log_std_init: float = DEFAULT_LOG_STD_INIT  # Single source of truth (constants.py)
 
     # Actor Noise (fallback when use_sde=False, ignored otherwise)
     # OrnsteinUhlenbeck noise for temporally correlated exploration

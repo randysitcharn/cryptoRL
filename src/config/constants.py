@@ -103,3 +103,11 @@ HMM_CONTEXT_COLS: List[str] = [
     'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2',
     'HMM_Prob_3', 'HMM_Entropy',
 ]
+
+# =============================================================================
+# RL Training Constants (Single Source of Truth)
+# =============================================================================
+# Default log_std_init for gSDE exploration
+# 0.0 gives std=1.0 (Shock Therapy: exploration maximale de l'espace [-1, 1])
+# Previous: -1.0 gave std≈0.37 (vs SB3 default -3 giving std≈0.05)
+DEFAULT_LOG_STD_INIT: float = 0.0
