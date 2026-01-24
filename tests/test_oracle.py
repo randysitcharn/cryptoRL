@@ -343,24 +343,27 @@ def test_gradient_flow():
 
     env = BatchCryptoEnv(parquet_path=wfo_train_path, price_column="BTC_Close", n_envs=1)
     
-    # 2. Initialiser le modèle (avec encodeur gelé)
+    # 2. Initialiser le modèle (avec encodeur gele)
     from src.config import TQCTrainingConfig
     from src.training.train_agent import create_policy_kwargs
-    
+    from src.models.tqc_dropout import TQCDropoutPolicy
+
     config = TQCTrainingConfig()
     config.freeze_encoder = True  # On teste le cas critique
+    config.encoder_path = "weights/wfo/segment_0/encoder.pth"  # Utiliser l'encodeur WFO
     policy_kwargs = create_policy_kwargs(config)
-    
-    model = TQC("MultiInputPolicy", env, policy_kwargs=policy_kwargs, device="cpu")
+
+    model = TQC(TQCDropoutPolicy, env, policy_kwargs=policy_kwargs, device="cpu")
     print("[OK] Modele charge (Encoder Frozen: True)")
 
-    # 3. Créer une fausse observation AVEC requires_grad=True
-    # C'est la clé : on veut voir si le gradient remonte jusqu'ici
+    # 3. Creer une fausse observation AVEC requires_grad=True
+    # C'est la cle : on veut voir si le gradient remonte jusqu'ici
     batch_size = 2
     market_obs = torch.randn(batch_size, env.window_size, env.n_features, requires_grad=True)
     pos_obs = torch.randn(batch_size, 1, requires_grad=True)
-    
-    obs = {"market": market_obs, "position": pos_obs}
+    w_cost_obs = torch.zeros(batch_size, 1)  # w_cost n'a pas besoin de gradient
+
+    obs = {"market": market_obs, "position": pos_obs, "w_cost": w_cost_obs}
     
     # 4. Forward Pass
     print("[>] Forward Pass...")
