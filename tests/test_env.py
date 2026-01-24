@@ -48,6 +48,12 @@ def create_dummy_data(n_rows: int = 1000) -> pd.DataFrame:
         'sin_day': np.random.uniform(-1, 1, n_rows),
         'cos_day': np.random.uniform(-1, 1, n_rows),
         'volume_rel': np.random.uniform(0.5, 2, n_rows),
+        # HMM features (required for FiLM alignment in BatchCryptoEnv)
+        'HMM_Prob_0': np.full(n_rows, 0.25),
+        'HMM_Prob_1': np.full(n_rows, 0.25),
+        'HMM_Prob_2': np.full(n_rows, 0.25),
+        'HMM_Prob_3': np.full(n_rows, 0.25),
+        'HMM_Entropy': np.full(n_rows, 0.5),
     }
 
     return pd.DataFrame(data)
@@ -96,7 +102,7 @@ def test_reset():
         assert 'position' in obs, "Observation should contain 'position'"
         
         # Check shapes
-        assert obs['market'].shape == (64, 12), f"Expected market shape (64, 12), got {obs['market'].shape}"
+        assert obs['market'].shape == (64, 17), f"Expected market shape (64, 17), got {obs['market'].shape}"
         assert obs['position'].shape == (1,), f"Expected position shape (1,), got {obs['position'].shape}"
         
         # Check info
@@ -183,7 +189,7 @@ def test_batch_mode():
         obs = env.reset()
         
         # Check batch shapes
-        assert obs['market'].shape == (4, 64, 12), f"Expected (4, 64, 12), got {obs['market'].shape}"
+        assert obs['market'].shape == (4, 64, 17), f"Expected (4, 64, 17), got {obs['market'].shape}"
         assert obs['position'].shape == (4, 1), f"Expected (4, 1), got {obs['position'].shape}"
         
         # Run a few steps

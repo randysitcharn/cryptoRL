@@ -36,6 +36,12 @@ def create_stable_price_data(n_rows: int = 200, price: float = 100.0) -> pd.Data
         'sin_day': np.zeros(n_rows),
         'cos_day': np.ones(n_rows),
         'volume_rel': np.ones(n_rows),
+        # HMM features (required for FiLM alignment in BatchCryptoEnv)
+        'HMM_Prob_0': np.full(n_rows, 0.25),
+        'HMM_Prob_1': np.full(n_rows, 0.25),
+        'HMM_Prob_2': np.full(n_rows, 0.25),
+        'HMM_Prob_3': np.full(n_rows, 0.25),
+        'HMM_Entropy': np.full(n_rows, 0.5),
     }
     return pd.DataFrame(data)
 
@@ -68,6 +74,12 @@ def create_variable_price_data(n_rows: int = 200, prices: list = None) -> pd.Dat
         'sin_day': np.zeros(n_rows),
         'cos_day': np.ones(n_rows),
         'volume_rel': np.ones(n_rows),
+        # HMM features (required for FiLM alignment in BatchCryptoEnv)
+        'HMM_Prob_0': np.full(n_rows, 0.25),
+        'HMM_Prob_1': np.full(n_rows, 0.25),
+        'HMM_Prob_2': np.full(n_rows, 0.25),
+        'HMM_Prob_3': np.full(n_rows, 0.25),
+        'HMM_Entropy': np.full(n_rows, 0.5),
     }
     return pd.DataFrame(data)
 

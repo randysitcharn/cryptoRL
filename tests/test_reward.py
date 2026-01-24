@@ -37,6 +37,12 @@ def create_price_series(prices: list) -> pd.DataFrame:
         'sin_day': np.zeros(n_rows),
         'cos_day': np.ones(n_rows),
         'volume_rel': np.ones(n_rows),
+        # HMM features (required for FiLM alignment in BatchCryptoEnv)
+        'HMM_Prob_0': np.full(n_rows, 0.25),
+        'HMM_Prob_1': np.full(n_rows, 0.25),
+        'HMM_Prob_2': np.full(n_rows, 0.25),
+        'HMM_Prob_3': np.full(n_rows, 0.25),
+        'HMM_Entropy': np.full(n_rows, 0.5),
     }
     return pd.DataFrame(data)
 

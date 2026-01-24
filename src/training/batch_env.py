@@ -166,6 +166,29 @@ class BatchCryptoEnv(VecEnv):
             if col not in EXCLUDE_COLS
             and df[col].dtype in ['float64', 'float32', 'int64']
         ]
+
+        # --- ALIGNMENT FIX START ---
+        # Force HMM features to be the last 5 columns for FiLM compatibility
+        EXPECTED_HMM_COLS = [
+            'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2',
+            'HMM_Prob_3', 'HMM_Entropy',
+        ]
+        available_cols = feature_cols
+
+        missing_hmm = [c for c in EXPECTED_HMM_COLS if c not in available_cols]
+        if missing_hmm:
+            raise ValueError(
+                f"[BatchEnv] Critical: Missing HMM columns for FiLM: {missing_hmm}"
+            )
+
+        tech_cols = [c for c in available_cols if c not in EXPECTED_HMM_COLS]
+        final_order = tech_cols + EXPECTED_HMM_COLS
+        feature_cols = final_order
+
+        print(f"[BatchEnv] 🔒 Features Aligned: {len(tech_cols)} Tech + {len(EXPECTED_HMM_COLS)} HMM")
+        print(f"[BatchEnv] 🔍 Last 5 columns (Must be HMM): {feature_cols[-5:]}")
+        # --- ALIGNMENT FIX END ---
+
         self.feature_names = feature_cols
         self.n_features = len(feature_cols)
         data_np = df[feature_cols].values.astype(np.float32)

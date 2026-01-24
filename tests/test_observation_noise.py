@@ -45,6 +45,12 @@ def create_dummy_data(n_rows: int = 1000) -> pd.DataFrame:
         'sin_day': np.random.uniform(-1, 1, n_rows),
         'cos_day': np.random.uniform(-1, 1, n_rows),
         'volume_rel': np.random.uniform(0.5, 2, n_rows),
+        # HMM features (required for FiLM alignment in BatchCryptoEnv)
+        'HMM_Prob_0': np.full(n_rows, 0.25),
+        'HMM_Prob_1': np.full(n_rows, 0.25),
+        'HMM_Prob_2': np.full(n_rows, 0.25),
+        'HMM_Prob_3': np.full(n_rows, 0.25),
+        'HMM_Entropy': np.full(n_rows, 0.5),
     }
     
     return pd.DataFrame(data)

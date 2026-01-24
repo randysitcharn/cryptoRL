@@ -37,13 +37,14 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
     - "market": (seq_len, n_features) market data (last 5 cols = HMM context)
     - "position": (1,) current position
 
-    Architecture:
-    - Market → MAE Encoder (frozen) → embeddings (B, 64, 128)
-    - HMM context = market[:, -1, -5:] (4 probs + entropy)
+    Architecture (Split Input):
+    - Technical features (cols 0 to N-5) → MAE Encoder (frozen) → embeddings (B, 64, 128)
+    - HMM context = market[:, -1, -5:] (4 probs + entropy) → FiLM modulation
     - FiLM(embeddings, HMM context) → modulated embeddings
     - Flatten → LayerNorm → Concat(position) → Linear → LeakyReLU
 
-    FiLM forces the model to use regime information to modulate MAE features.
+    Critical: The MAE receives ONLY technical features (excludes HMM columns) to match
+    the pre-trained weights. HMM features are injected via FiLM modulation only.
     The encoder is frozen; only FiLM and fusion layers are trainable.
     """
 
@@ -96,6 +97,14 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         # FiLM: use HMM context only if we have enough feature columns
         self.use_film = self.n_features >= HMM_CONTEXT_SIZE
 
+        # Adjust MAE input dimension: exclude HMM columns if FiLM is used
+        # This ensures the MAE receives only the features it was pre-trained on
+        if self.use_film:
+            self.mae_input_dim = self.n_features - HMM_CONTEXT_SIZE
+            print(f"[FoundationFeatureExtractor] Splitting Input: {self.mae_input_dim} Tech Features -> MAE | {HMM_CONTEXT_SIZE} HMM -> FiLM")
+        else:
+            self.mae_input_dim = self.n_features
+
         # Initialize parent class with features_dim
         super().__init__(observation_space, features_dim)
 
@@ -103,9 +112,9 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.encoder_path = encoder_path
         self._is_frozen = freeze_encoder
 
-        # Create CryptoMAE encoder with matching architecture
+        # Create CryptoMAE encoder with CORRECT input dimension (excludes HMM if FiLM is used)
         self.mae = CryptoMAE(
-            input_dim=self.n_features,
+            input_dim=self.mae_input_dim,  # Critical fix: matches pre-trained dimension
             d_model=d_model,
             n_heads=n_heads,
             n_layers=n_layers,
@@ -254,6 +263,9 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         Args:
             observations: Dict with:
                 - "market": (batch, seq_len, n_features) market data
+                  - If use_film=True: cols 0 to N-5 are technical features (→ MAE),
+                    cols N-5 to N are HMM context (→ FiLM)
+                  - If use_film=False: all cols go to MAE
                 - "position": (batch, 1) current position
 
         Returns:
@@ -263,24 +275,33 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         market_obs = observations["market"]    # (B, 64, n_features)
         position = observations["position"]    # (B, 1)
 
-        # 1. Encode market data using pretrained MAE encoder (frozen)
+        # 1. SPLIT INPUT: Tech features -> MAE, HMM features -> FiLM
+        if self.use_film:
+            # Split: Technical features (0 to N-5) go to MAE, HMM context (N-5 to N) goes to FiLM
+            mae_obs = market_obs[:, :, :-HMM_CONTEXT_SIZE]  # (B, 64, mae_input_dim)
+            hmm_context = market_obs[:, -1, -HMM_CONTEXT_SIZE:].float()  # (B, 5)
+        else:
+            # No FiLM, use full observation for MAE
+            mae_obs = market_obs
+            hmm_context = None
+
+        # 2. Encode technical features using pretrained MAE encoder (frozen)
         # Output: (batch, seq_len, d_model) = (B, 64, 128)
         encoder_dtype = next(self.mae.embedding.parameters()).dtype
         if encoder_dtype == torch.float16:
-            if market_obs.is_cuda:
+            if mae_obs.is_cuda:
                 with torch.amp.autocast('cuda'):
-                    encoded = self.mae.encode(market_obs.half())
+                    encoded = self.mae.encode(mae_obs.half())
                 encoded = encoded.float()
             else:
                 self.mae.embedding = self.mae.embedding.float()
                 self.mae.encoder = self.mae.encoder.float()
-                encoded = self.mae.encode(market_obs.float())
+                encoded = self.mae.encode(mae_obs.float())
         else:
-            encoded = self.mae.encode(market_obs.float())
+            encoded = self.mae.encode(mae_obs.float())
 
-        # 2. FiLM modulation: HMM context (last 5 cols at last timestep) scales/shifts MAE embeddings
+        # 3. FiLM modulation: HMM context (last 5 cols at last timestep) scales/shifts MAE embeddings
         if self.film_layer is not None:
-            hmm_context = market_obs[:, -1, -HMM_CONTEXT_SIZE:].float()  # (B, 5)
             modulated = self.film_layer(encoded, hmm_context)  # (B, 64, 128)
         else:
             modulated = encoded

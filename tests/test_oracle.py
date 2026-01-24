@@ -69,6 +69,12 @@ class TestOracleArchitecture:
             'BTC_Parkinson_Vol': np.full(n_rows, volatility),
             'BTC_GK_Vol': np.full(n_rows, volatility),
             'BTC_FFD': np.random.randn(n_rows) * 0.1,
+            # HMM features (required for FiLM alignment in BatchCryptoEnv)
+            'HMM_Prob_0': np.full(n_rows, 0.25),
+            'HMM_Prob_1': np.full(n_rows, 0.25),
+            'HMM_Prob_2': np.full(n_rows, 0.25),
+            'HMM_Prob_3': np.full(n_rows, 0.25),
+            'HMM_Entropy': np.full(n_rows, 0.5),
         })
 
         # Add dummy columns for other assets
