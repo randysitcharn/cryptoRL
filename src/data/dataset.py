@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional, List, Tuple
 
-from src.config import EXCLUDE_COLS
+from src.config import EXCLUDE_COLS, HMM_FEATURE_PREFIXES
 
 
 class CryptoDataset(Dataset):
@@ -68,11 +68,15 @@ class CryptoDataset(Dataset):
 
         # Déterminer les colonnes à utiliser
         if feature_cols is None:
-            # Auto-détection: exclure les prix bruts et garder les features scalées
+            # Auto-détection: exclure les prix bruts, volumes bruts, et colonnes HMM
+            # HMM features (HMM_Prob_*, HMM_Entropy) are excluded from MAE pre-training
+            # They are injected via FiLM modulation in RL training instead
+            # Uses centralized HMM_FEATURE_PREFIXES from constants.py
             feature_cols = [
                 col for col in df.columns
                 if col not in EXCLUDE_COLS
                 and df[col].dtype in ['float64', 'float32']
+                and not any(col.startswith(prefix) for prefix in HMM_FEATURE_PREFIXES)
             ]
 
         self.feature_cols = feature_cols

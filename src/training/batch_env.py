@@ -169,23 +169,22 @@ class BatchCryptoEnv(VecEnv):
 
         # --- ALIGNMENT FIX START ---
         # Force HMM features to be the last 5 columns for FiLM compatibility
-        EXPECTED_HMM_COLS = [
-            'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2',
-            'HMM_Prob_3', 'HMM_Entropy',
-        ]
+        # Uses centralized HMM_CONTEXT_COLS from constants.py
+        from src.config import HMM_CONTEXT_COLS
+        
         available_cols = feature_cols
 
-        missing_hmm = [c for c in EXPECTED_HMM_COLS if c not in available_cols]
+        missing_hmm = [c for c in HMM_CONTEXT_COLS if c not in available_cols]
         if missing_hmm:
             raise ValueError(
                 f"[BatchEnv] Critical: Missing HMM columns for FiLM: {missing_hmm}"
             )
 
-        tech_cols = [c for c in available_cols if c not in EXPECTED_HMM_COLS]
-        final_order = tech_cols + EXPECTED_HMM_COLS
+        tech_cols = [c for c in available_cols if c not in HMM_CONTEXT_COLS]
+        final_order = tech_cols + HMM_CONTEXT_COLS
         feature_cols = final_order
 
-        print(f"[BatchEnv] 🔒 Features Aligned: {len(tech_cols)} Tech + {len(EXPECTED_HMM_COLS)} HMM")
+        print(f"[BatchEnv] 🔒 Features Aligned: {len(tech_cols)} Tech + {len(HMM_CONTEXT_COLS)} HMM")
         print(f"[BatchEnv] 🔍 Last 5 columns (Must be HMM): {feature_cols[-5:]}")
         # --- ALIGNMENT FIX END ---
 

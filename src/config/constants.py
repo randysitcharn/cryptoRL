@@ -90,3 +90,16 @@ FRACDIFF_ASSETS: List[str] = ASSETS
 
 # Assets for which to compute Volume features
 VOLUME_ASSETS: List[str] = ASSETS
+
+# =============================================================================
+# Feature Filtering (Centralized Logic)
+# =============================================================================
+# HMM features that should be excluded from MAE pre-training
+# These are injected via FiLM modulation in RL training instead
+HMM_FEATURE_PREFIXES: List[str] = ['HMM_', 'Prob_']
+
+# Expected HMM context columns for FiLM (must be last 5 columns in RL observations)
+HMM_CONTEXT_COLS: List[str] = [
+    'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2',
+    'HMM_Prob_3', 'HMM_Entropy',
+]
