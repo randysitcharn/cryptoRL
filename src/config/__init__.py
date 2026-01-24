@@ -28,6 +28,7 @@ from src.config.constants import (
     TICKER_MAPPING,
     MAX_LOOKBACK_WINDOW,
     DEFAULT_PURGE_WINDOW,
+    HMM_FEATURE_PREFIXES,
 )
 
 # Training configurations
@@ -54,6 +55,7 @@ __all__ = [
     "TICKER_MAPPING",
     "MAX_LOOKBACK_WINDOW",
     "DEFAULT_PURGE_WINDOW",
+    "HMM_FEATURE_PREFIXES",
     # Base configs
     "PathConfig",
     "EnvConfig",
