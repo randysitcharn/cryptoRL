@@ -100,6 +100,16 @@ except ImportError:
 
 from src.training.batch_env import BatchCryptoEnv
 
+# FiLM audit imports
+try:
+    from src.models.rl_adapter import FoundationFeatureExtractor, HMM_CONTEXT_SIZE
+    from src.models.layers import FiLMLayer
+    from gymnasium import spaces
+    HAS_FILM = True
+except ImportError as e:
+    HAS_FILM = False
+    print(f"[WARNING] FiLM imports not available: {e}")
+
 # Import normalization audit
 # Add scripts directory to path for import
 scripts_dir = os.path.dirname(os.path.abspath(__file__))
@@ -4952,6 +4962,541 @@ def generate_tqc_audit_report(
 
 
 # ============================================================================
+# FiLM AUDIT
+# ============================================================================
+
+def audit_film_mechanics(
+    segment_id: int = 0,
+    tqc_path: Optional[str] = None,
+    encoder_path: Optional[str] = None,
+    test_data_path: Optional[str] = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    output_dir: Optional[str] = None,
+    n_samples: int = 1000
+) -> Dict:
+    """
+    Audit FiLM (Feature-wise Linear Modulation) mechanics with 3 critical tests:
+    
+    A. Static Analysis (Weights): Inspect param_generator weights
+    B. Dynamic Analysis (Activations): Capture Gamma and Beta for real data
+    C. Sensitivity Test (Crash Test): Test with pure HMM contexts
+    
+    Args:
+        segment_id: WFO segment ID (used to auto-detect paths if not provided)
+        tqc_path: Path to TQC model (auto-detected from segment if None)
+        encoder_path: Path to MAE encoder (auto-detected if None)
+        test_data_path: Path to test data parquet (auto-detected if None)
+        device: Device to use
+        output_dir: Output directory (auto-generated if None)
+        n_samples: Number of samples for dynamic analysis
+    
+    Returns:
+        Dict with all audit results
+    """
+    if not HAS_FILM:
+        raise ImportError("FiLM imports not available. Cannot run FiLM audit.")
+    if not HAS_TQC:
+        raise ImportError("sb3_contrib not available. Cannot load TQC model.")
+    
+    print("=" * 70)
+    print("FiLM MECHANICS AUDIT")
+    print("=" * 70)
+    print(f"Segment: {segment_id}, Device: {device}")
+    
+    # Auto-detect paths from segment_id
+    if tqc_path is None:
+        tqc_path = f"weights/wfo/segment_{segment_id}/tqc.zip"
+    if encoder_path is None:
+        encoder_path = f"weights/wfo/segment_{segment_id}/encoder.pth"
+    if test_data_path is None:
+        test_data_path = f"data/processed/wfo/segment_{segment_id}/test.parquet"
+    
+    # Validate paths exist
+    for name, path in [("TQC", tqc_path), ("Test Data", test_data_path)]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{name} not found: {path}")
+    
+    # Create output directory
+    if output_dir is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_base = os.path.join("results", "film_audit")
+        os.makedirs(output_base, exist_ok=True)
+        output_dir = os.path.join(output_base, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+    
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    print(f"\nOutput directory: {output_dir}")
+    
+    results = {
+        'output_dir': output_dir,
+        'segment_id': segment_id,
+        'tqc_path': tqc_path,
+        'test_data_path': test_data_path,
+        'config': {
+            'device': device,
+            'n_samples': n_samples
+        }
+    }
+    
+    # Load TQC model
+    print(f"\n[1/4] Loading TQC model...")
+    model = TQC.load(tqc_path, device=device)
+    print(f"  Model loaded from: {tqc_path}")
+    
+    # Extract FoundationFeatureExtractor
+    feature_extractor = model.policy.features_extractor
+    if not isinstance(feature_extractor, FoundationFeatureExtractor):
+        raise TypeError(f"Expected FoundationFeatureExtractor, got {type(feature_extractor)}")
+    
+    if feature_extractor.film_layer is None:
+        raise ValueError("FiLM layer is None! Model does not use FiLM.")
+    
+    film_layer = feature_extractor.film_layer
+    print(f"  FiLM layer found: feature_dim={film_layer.feature_dim}, context_dim={film_layer.context_dim}")
+    
+    # Load test data
+    print(f"\n[2/4] Loading test data...")
+    test_df = pd.read_parquet(test_data_path)
+    print(f"  Test data shape: {test_df.shape}")
+    
+    # Create test environment for data loading
+    test_env = BatchCryptoEnv(
+        parquet_path=test_data_path,
+        n_envs=1,
+        device=device,
+        window_size=64,
+        episode_length=len(test_df) - 64 - 1,
+        initial_balance=10000.0,
+        commission=0.001,
+        slippage=0.0001,
+        price_column='BTC_Close',
+        random_start=False
+    )
+    test_env.set_training_mode(False)
+    
+    # ========================================================================
+    # A. STATIC ANALYSIS (WEIGHTS)
+    # ========================================================================
+    print(f"\n[3/4] A. Static Analysis (Weights)...")
+    
+    # Get the MLP that generates gamma and beta
+    param_generator = film_layer.mlp
+    
+    # Extract weights and biases from the last layer (output layer)
+    last_layer = param_generator[-1]  # Last Linear layer
+    weight = last_layer.weight.data  # (2 * feature_dim, hidden_dim)
+    bias = last_layer.bias.data  # (2 * feature_dim,)
+    
+    # Split into gamma and beta parts
+    feature_dim = film_layer.feature_dim
+    gamma_weight = weight[:feature_dim, :]  # (feature_dim, hidden_dim)
+    beta_weight = weight[feature_dim:, :]   # (feature_dim, hidden_dim)
+    gamma_bias = bias[:feature_dim]         # (feature_dim,)
+    beta_bias = bias[feature_dim:]          # (feature_dim,)
+    
+    # Statistics
+    gamma_weight_mean = gamma_weight.mean().item()
+    gamma_weight_std = gamma_weight.std().item()
+    gamma_bias_mean = gamma_bias.mean().item()
+    gamma_bias_std = gamma_bias.std().item()
+    
+    beta_weight_mean = beta_weight.mean().item()
+    beta_weight_std = beta_weight.std().item()
+    beta_bias_mean = beta_bias.mean().item()
+    beta_bias_std = beta_bias.std().item()
+    
+    # Check if initialization is still visible (gamma_bias should be close to 1.0 initially)
+    init_gamma_visible = abs(gamma_bias_mean - 1.0) < 0.5  # Allow some drift
+    init_beta_visible = abs(beta_bias_mean - 0.0) < 0.5
+    
+    print(f"  Gamma weights: mean={gamma_weight_mean:.6f}, std={gamma_weight_std:.6f}")
+    print(f"  Gamma bias: mean={gamma_bias_mean:.6f}, std={gamma_bias_std:.6f}")
+    print(f"    → Initialization visible (≈1.0): {init_gamma_visible}")
+    print(f"  Beta weights: mean={beta_weight_mean:.6f}, std={beta_weight_std:.6f}")
+    print(f"  Beta bias: mean={beta_bias_mean:.6f}, std={beta_bias_std:.6f}")
+    print(f"    → Initialization visible (≈0.0): {init_beta_visible}")
+    
+    # Check for weight explosion
+    weight_exploded = gamma_weight_std > 10.0 or beta_weight_std > 10.0
+    if weight_exploded:
+        print(f"  ⚠️ WARNING: Weight explosion detected!")
+    
+    results['static_analysis'] = {
+        'gamma_weight_mean': gamma_weight_mean,
+        'gamma_weight_std': gamma_weight_std,
+        'gamma_bias_mean': gamma_bias_mean,
+        'gamma_bias_std': gamma_bias_std,
+        'beta_weight_mean': beta_weight_mean,
+        'beta_weight_std': beta_weight_std,
+        'beta_bias_mean': beta_bias_mean,
+        'beta_bias_std': beta_bias_std,
+        'init_gamma_visible': init_gamma_visible,
+        'init_beta_visible': init_beta_visible,
+        'weight_exploded': weight_exploded
+    }
+    
+    # ========================================================================
+    # B. DYNAMIC ANALYSIS (ACTIVATIONS)
+    # ========================================================================
+    print(f"\n[4/4] B. Dynamic Analysis (Activations)...")
+    
+    # Collect samples from test environment
+    obs_list = []
+    n_collected = 0
+    obs = test_env.reset()
+    
+    while n_collected < n_samples:
+        # Extract market observations (BatchCryptoEnv returns dict with numpy arrays)
+        if isinstance(obs, dict):
+            market_obs_np = obs["market"]  # (n_envs, seq_len, n_features) or (seq_len, n_features)
+        else:
+            raise ValueError(f"Unexpected observation type: {type(obs)}")
+        
+        # Convert to torch tensor
+        if isinstance(market_obs_np, np.ndarray):
+            market_obs = torch.from_numpy(market_obs_np).to(device).float()
+        else:
+            market_obs = market_obs_np.to(device).float()
+        
+        # Handle both single env and batch cases
+        if market_obs.dim() == 2:
+            # Single env: (seq_len, n_features) -> (1, seq_len, n_features)
+            market_obs = market_obs.unsqueeze(0)
+        
+        obs_list.append(market_obs)
+        n_collected += market_obs.shape[0]
+        
+        # Step environment
+        action = test_env.action_space.sample()
+        obs, _, done, _ = test_env.step(action)
+        if isinstance(done, np.ndarray) and done.all():
+            obs = test_env.reset()
+        elif isinstance(done, bool) and done:
+            obs = test_env.reset()
+    
+    # Concatenate all observations
+    all_market_obs = torch.cat(obs_list, dim=0)  # (B, seq_len, n_features)
+    batch_size = min(all_market_obs.shape[0], n_samples)
+    all_market_obs = all_market_obs[:batch_size]
+    
+    # Extract HMM context (last 5 columns at last timestep)
+    hmm_context = all_market_obs[:, -1, -HMM_CONTEXT_SIZE:].float()  # (B, 5)
+    
+    # Forward pass through FiLM MLP to get gamma and beta
+    with torch.no_grad():
+        params = film_layer.mlp(hmm_context)  # (B, 2 * feature_dim)
+        gamma, beta = params.chunk(2, dim=-1)  # each (B, feature_dim)
+    
+    # Convert to numpy for analysis
+    gamma_np = gamma.cpu().numpy().flatten()
+    beta_np = beta.cpu().numpy().flatten()
+    
+    # Statistics
+    gamma_mean = float(gamma_np.mean())
+    gamma_std = float(gamma_np.std())
+    gamma_min = float(gamma_np.min())
+    gamma_max = float(gamma_np.max())
+    gamma_median = float(np.median(gamma_np))
+    
+    beta_mean = float(beta_np.mean())
+    beta_std = float(beta_np.std())
+    beta_min = float(beta_np.min())
+    beta_max = float(beta_np.max())
+    beta_median = float(np.median(beta_np))
+    
+    # Check if gamma is centered around 1.0 (not collapsed to 0)
+    gamma_centered = abs(gamma_mean - 1.0) < 0.5
+    gamma_not_collapsed = gamma_std > 0.01  # Should have some variance
+    
+    print(f"  Gamma: mean={gamma_mean:.6f}, std={gamma_std:.6f}, "
+          f"min={gamma_min:.6f}, max={gamma_max:.6f}, median={gamma_median:.6f}")
+    print(f"    → Centered around 1.0: {gamma_centered}")
+    print(f"    → Not collapsed (std > 0.01): {gamma_not_collapsed}")
+    print(f"  Beta: mean={beta_mean:.6f}, std={beta_std:.6f}, "
+          f"min={beta_min:.6f}, max={beta_max:.6f}, median={beta_median:.6f}")
+    
+    # Plot histograms
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Gamma histogram
+    axes[0].hist(gamma_np, bins=50, alpha=0.7, edgecolor='black')
+    axes[0].axvline(1.0, color='r', linestyle='--', label='Initial (1.0)')
+    axes[0].axvline(gamma_mean, color='g', linestyle='--', label=f'Mean ({gamma_mean:.3f})')
+    axes[0].set_xlabel('Gamma Value')
+    axes[0].set_ylabel('Frequency')
+    axes[0].set_title(f'Gamma Distribution (mean={gamma_mean:.3f}, std={gamma_std:.3f})')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Beta histogram
+    axes[1].hist(beta_np, bins=50, alpha=0.7, edgecolor='black', color='orange')
+    axes[1].axvline(0.0, color='r', linestyle='--', label='Initial (0.0)')
+    axes[1].axvline(beta_mean, color='g', linestyle='--', label=f'Mean ({beta_mean:.3f})')
+    axes[1].set_xlabel('Beta Value')
+    axes[1].set_ylabel('Frequency')
+    axes[1].set_title(f'Beta Distribution (mean={beta_mean:.3f}, std={beta_std:.3f})')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "film_gamma_dist.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: film_gamma_dist.png")
+    
+    results['dynamic_analysis'] = {
+        'gamma_mean': gamma_mean,
+        'gamma_std': gamma_std,
+        'gamma_min': gamma_min,
+        'gamma_max': gamma_max,
+        'gamma_median': gamma_median,
+        'beta_mean': beta_mean,
+        'beta_std': beta_std,
+        'beta_min': beta_min,
+        'beta_max': beta_max,
+        'beta_median': beta_median,
+        'gamma_centered': gamma_centered,
+        'gamma_not_collapsed': gamma_not_collapsed
+    }
+    
+    # ========================================================================
+    # C. SENSITIVITY TEST (CRASH TEST)
+    # ========================================================================
+    print(f"\n[5/4] C. Sensitivity Test (Crash Test)...")
+    
+    # Get a fixed MAE embedding sample
+    # We need to encode a sample through the MAE encoder first
+    sample_market = all_market_obs[0:1]  # (1, seq_len, n_features)
+    
+    # Encode through MAE (frozen encoder)
+    # Handle float16/float32 conversion if needed
+    with torch.no_grad():
+        encoder_dtype = next(feature_extractor.mae.embedding.parameters()).dtype
+        if encoder_dtype == torch.float16:
+            if sample_market.is_cuda:
+                with torch.amp.autocast('cuda'):
+                    encoded = feature_extractor.mae.encode(sample_market.half())
+                encoded = encoded.float()
+            else:
+                # CPU doesn't support float16, convert to float32
+                encoded = feature_extractor.mae.encode(sample_market.float())
+        else:
+            encoded = feature_extractor.mae.encode(sample_market.float())  # (1, seq_len, d_model)
+    
+    # Create pure HMM contexts (one-hot for 4 states + entropy)
+    n_states = 4
+    contexts = []
+    
+    # State 0: [1, 0, 0, 0, entropy] - Crash pur
+    entropy_val = 0.0  # Low entropy (certain state)
+    context_0 = torch.tensor([[1.0, 0.0, 0.0, 0.0, entropy_val]], device=device, dtype=torch.float32)
+    contexts.append(context_0)
+    
+    # State 1: [0, 1, 0, 0, entropy]
+    context_1 = torch.tensor([[0.0, 1.0, 0.0, 0.0, entropy_val]], device=device, dtype=torch.float32)
+    contexts.append(context_1)
+    
+    # State 2: [0, 0, 1, 0, entropy]
+    context_2 = torch.tensor([[0.0, 0.0, 1.0, 0.0, entropy_val]], device=device, dtype=torch.float32)
+    contexts.append(context_2)
+    
+    # State 3: [0, 0, 0, 1, entropy] - Pump pur
+    context_3 = torch.tensor([[0.0, 0.0, 0.0, 1.0, entropy_val]], device=device, dtype=torch.float32)
+    contexts.append(context_3)
+    
+    # Repeat the encoded sample for each context
+    encoded_repeated = encoded.repeat(n_states, 1, 1)  # (n_states, seq_len, d_model)
+    contexts_tensor = torch.cat(contexts, dim=0)  # (n_states, 5)
+    
+    # Forward pass through FiLM
+    with torch.no_grad():
+        modulated_outputs = film_layer(encoded_repeated, contexts_tensor)  # (n_states, seq_len, d_model)
+    
+    # Flatten for distance calculation (or use mean over sequence)
+    # Option 1: Flatten completely
+    modulated_flat = modulated_outputs.view(n_states, -1)  # (n_states, seq_len * d_model)
+    
+    # Option 2: Mean over sequence (more interpretable)
+    modulated_mean = modulated_outputs.mean(dim=1)  # (n_states, d_model)
+    
+    # Calculate pairwise distances
+    dist_matrix_flat = torch.cdist(modulated_flat, modulated_flat, p=2)  # (n_states, n_states)
+    dist_matrix_mean = torch.cdist(modulated_mean, modulated_mean, p=2)  # (n_states, n_states)
+    
+    # Key metric: Distance between State 0 (Crash) and State 3 (Pump)
+    sensitivity_score_flat = dist_matrix_flat[0, 3].item()
+    sensitivity_score_mean = dist_matrix_mean[0, 3].item()
+    
+    # Mean distance across all pairs (excluding diagonal)
+    mask = ~torch.eye(n_states, dtype=torch.bool, device=device)
+    mean_distance_flat = dist_matrix_flat[mask].mean().item()
+    mean_distance_mean = dist_matrix_mean[mask].mean().item()
+    
+    print(f"  Sensitivity Score (State 0 vs State 3):")
+    print(f"    → Flattened: {sensitivity_score_flat:.6f}")
+    print(f"    → Mean over sequence: {sensitivity_score_mean:.6f}")
+    print(f"  Mean pairwise distance (all states):")
+    print(f"    → Flattened: {mean_distance_flat:.6f}")
+    print(f"    → Mean over sequence: {mean_distance_mean:.6f}")
+    
+    # Alert if score is too low (FiLM disconnected)
+    threshold = 0.01
+    film_disconnected = sensitivity_score_mean < threshold
+    
+    if film_disconnected:
+        print(f"  ⚠️ ALERT: FiLM appears disconnected! (score < {threshold})")
+        print(f"     The context is not significantly changing the output.")
+    else:
+        print(f"  ✓ FiLM is reactive to context changes.")
+    
+    # Plot sensitivity matrix
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Heatmap for flattened distances
+    im1 = axes[0].imshow(dist_matrix_flat.cpu().numpy(), cmap='viridis', aspect='auto')
+    axes[0].set_title('Sensitivity Matrix (Flattened)')
+    axes[0].set_xlabel('State')
+    axes[0].set_ylabel('State')
+    axes[0].set_xticks(range(n_states))
+    axes[0].set_yticks(range(n_states))
+    axes[0].set_xticklabels(['Crash', 'State1', 'State2', 'Pump'])
+    axes[0].set_yticklabels(['Crash', 'State1', 'State2', 'Pump'])
+    plt.colorbar(im1, ax=axes[0])
+    
+    # Add text annotations
+    for i in range(n_states):
+        for j in range(n_states):
+            text = axes[0].text(j, i, f'{dist_matrix_flat[i, j].item():.3f}',
+                              ha="center", va="center", color="white" if dist_matrix_flat[i, j] > dist_matrix_flat.max() / 2 else "black")
+    
+    # Heatmap for mean distances
+    im2 = axes[1].imshow(dist_matrix_mean.cpu().numpy(), cmap='viridis', aspect='auto')
+    axes[1].set_title('Sensitivity Matrix (Mean over Sequence)')
+    axes[1].set_xlabel('State')
+    axes[1].set_ylabel('State')
+    axes[1].set_xticks(range(n_states))
+    axes[1].set_yticks(range(n_states))
+    axes[1].set_xticklabels(['Crash', 'State1', 'State2', 'Pump'])
+    axes[1].set_yticklabels(['Crash', 'State1', 'State2', 'Pump'])
+    plt.colorbar(im2, ax=axes[1])
+    
+    # Add text annotations
+    for i in range(n_states):
+        for j in range(n_states):
+            text = axes[1].text(j, i, f'{dist_matrix_mean[i, j].item():.3f}',
+                              ha="center", va="center", color="white" if dist_matrix_mean[i, j] > dist_matrix_mean.max() / 2 else "black")
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "film_sensitivity_matrix.png"), dpi=150)
+    plt.close()
+    print(f"  Saved: film_sensitivity_matrix.png")
+    
+    results['sensitivity_test'] = {
+        'sensitivity_score_flat': sensitivity_score_flat,
+        'sensitivity_score_mean': sensitivity_score_mean,
+        'mean_distance_flat': mean_distance_flat,
+        'mean_distance_mean': mean_distance_mean,
+        'film_disconnected': film_disconnected,
+        'threshold': threshold,
+        'dist_matrix_flat': dist_matrix_flat.cpu().numpy().tolist(),
+        'dist_matrix_mean': dist_matrix_mean.cpu().numpy().tolist()
+    }
+    
+    # ========================================================================
+    # GENERATE REPORT
+    # ========================================================================
+    print(f"\n[6/4] Generating report...")
+    report_path = os.path.join(output_dir, "film_audit_report.txt")
+    
+    with open(report_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("FiLM MECHANICS AUDIT REPORT\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Segment ID: {segment_id}\n")
+        f.write(f"TQC Path: {tqc_path}\n")
+        f.write(f"Test Data: {test_data_path}\n\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("A. STATIC ANALYSIS (WEIGHTS)\n")
+        f.write("=" * 80 + "\n\n")
+        static = results['static_analysis']
+        f.write(f"Gamma Weights:\n")
+        f.write(f"  Mean: {static['gamma_weight_mean']:.6f}\n")
+        f.write(f"  Std:  {static['gamma_weight_std']:.6f}\n")
+        f.write(f"Gamma Bias:\n")
+        f.write(f"  Mean: {static['gamma_bias_mean']:.6f}\n")
+        f.write(f"  Std:  {static['gamma_bias_std']:.6f}\n")
+        f.write(f"  Initialization visible (≈1.0): {static['init_gamma_visible']}\n\n")
+        f.write(f"Beta Weights:\n")
+        f.write(f"  Mean: {static['beta_weight_mean']:.6f}\n")
+        f.write(f"  Std:  {static['beta_weight_std']:.6f}\n")
+        f.write(f"Beta Bias:\n")
+        f.write(f"  Mean: {static['beta_bias_mean']:.6f}\n")
+        f.write(f"  Std:  {static['beta_bias_std']:.6f}\n")
+        f.write(f"  Initialization visible (≈0.0): {static['init_beta_visible']}\n\n")
+        if static['weight_exploded']:
+            f.write("⚠️ WARNING: Weight explosion detected!\n\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("B. DYNAMIC ANALYSIS (ACTIVATIONS)\n")
+        f.write("=" * 80 + "\n\n")
+        dynamic = results['dynamic_analysis']
+        f.write(f"Gamma Statistics:\n")
+        f.write(f"  Mean:   {dynamic['gamma_mean']:.6f}\n")
+        f.write(f"  Std:    {dynamic['gamma_std']:.6f}\n")
+        f.write(f"  Min:    {dynamic['gamma_min']:.6f}\n")
+        f.write(f"  Max:    {dynamic['gamma_max']:.6f}\n")
+        f.write(f"  Median: {dynamic['gamma_median']:.6f}\n")
+        f.write(f"  Centered around 1.0: {dynamic['gamma_centered']}\n")
+        f.write(f"  Not collapsed (std > 0.01): {dynamic['gamma_not_collapsed']}\n\n")
+        f.write(f"Beta Statistics:\n")
+        f.write(f"  Mean:   {dynamic['beta_mean']:.6f}\n")
+        f.write(f"  Std:    {dynamic['beta_std']:.6f}\n")
+        f.write(f"  Min:    {dynamic['beta_min']:.6f}\n")
+        f.write(f"  Max:    {dynamic['beta_max']:.6f}\n")
+        f.write(f"  Median: {dynamic['beta_median']:.6f}\n\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("C. SENSITIVITY TEST (CRASH TEST)\n")
+        f.write("=" * 80 + "\n\n")
+        sensitivity = results['sensitivity_test']
+        f.write(f"Sensitivity Score (State 0 vs State 3):\n")
+        f.write(f"  Flattened: {sensitivity['sensitivity_score_flat']:.6f}\n")
+        f.write(f"  Mean over sequence: {sensitivity['sensitivity_score_mean']:.6f}\n\n")
+        f.write(f"Mean pairwise distance (all states):\n")
+        f.write(f"  Flattened: {sensitivity['mean_distance_flat']:.6f}\n")
+        f.write(f"  Mean over sequence: {sensitivity['mean_distance_mean']:.6f}\n\n")
+        if sensitivity['film_disconnected']:
+            f.write(f"⚠️ ALERT: FiLM appears disconnected! (score < {sensitivity['threshold']})\n")
+            f.write("   The context is not significantly changing the output.\n\n")
+        else:
+            f.write("✓ FiLM is reactive to context changes.\n\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("END OF REPORT\n")
+        f.write("=" * 80 + "\n")
+    
+    print(f"  Report saved: {report_path}")
+    
+    # Save metrics JSON
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    with open(metrics_path, 'w') as f:
+        json.dump(_serialize_results(results), f, indent=2)
+    print(f"  Metrics saved: {metrics_path}")
+    
+    print("\n" + "=" * 70)
+    print("FiLM AUDIT COMPLETE")
+    print("=" * 70)
+    print(f"Report: {report_path}")
+    print(f"Metrics: {metrics_path}")
+    print(f"Plots: {plots_dir}")
+    
+    return results
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -4963,9 +5508,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["hmm", "pipeline", "both", "synthetic", "mae", "tqc"],
+        choices=["hmm", "pipeline", "both", "synthetic", "mae", "tqc", "film"],
         default="both",
-        help="Analysis mode: hmm, pipeline, both, synthetic (old MAE test), mae (comprehensive MAE audit), or tqc (comprehensive TQC audit)"
+        help="Analysis mode: hmm, pipeline, both, synthetic (old MAE test), mae (comprehensive MAE audit), tqc (comprehensive TQC audit), or film (FiLM mechanics audit)"
     )
     parser.add_argument("--segment", type=int, default=0, help="WFO segment ID")
     parser.add_argument("--skip-mae", action="store_true", help="Skip MAE in pipeline mode")
@@ -5008,6 +5553,16 @@ def main():
                         help="Path to test data parquet (auto-detected if None)")
     parser.add_argument("--tqc-samples", type=int, default=1000,
                         help="Number of samples for attribution analysis")
+    
+    # FiLM audit arguments
+    parser.add_argument("--film-segment", type=int, default=0,
+                        help="WFO segment ID for FiLM audit")
+    parser.add_argument("--film-path", type=str, default=None,
+                        help="Path to TQC model for FiLM audit (auto-detected from segment if None)")
+    parser.add_argument("--film-test-data", type=str, default=None,
+                        help="Path to test data parquet for FiLM audit (auto-detected if None)")
+    parser.add_argument("--film-samples", type=int, default=1000,
+                        help="Number of samples for dynamic analysis")
     
     args = parser.parse_args()
 
@@ -5065,6 +5620,16 @@ def main():
             encoder_path=args.mae_encoder_path,  # Réutiliser argument MAE
             device=args.device,
             n_samples=args.tqc_samples
+        )
+    
+    if args.mode == "film":
+        audit_film_mechanics(
+            segment_id=args.film_segment,
+            tqc_path=args.film_path,
+            test_data_path=args.film_test_data,
+            encoder_path=args.mae_encoder_path,  # Réutiliser argument MAE
+            device=args.device,
+            n_samples=args.film_samples
         )
 
 
