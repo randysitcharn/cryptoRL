@@ -32,8 +32,8 @@ logs/*
 weights/*.pth
 !weights/.gitkeep
 
-# Models (too large for git)
-models/
+# Models (too large for git) - root level only
+/models/
 
 # Claude Code
 .claude/
