@@ -177,6 +177,26 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
 
             # Check if checkpoint is in nested format (our custom encoder-only format)
             if isinstance(checkpoint, dict) and 'embedding' in checkpoint and 'encoder' in checkpoint:
+                # CRITICAL: Check input_dim dimension mismatch (embedding layer)
+                # This detects if checkpoint was trained with different number of features
+                checkpoint_embedding = checkpoint['embedding']
+                model_input_dim = self.mae.embedding.weight.shape[1]
+                
+                if 'weight' in checkpoint_embedding:
+                    checkpoint_input_dim = checkpoint_embedding['weight'].shape[1]
+                    
+                    if checkpoint_input_dim != model_input_dim:
+                        raise ValueError(
+                            f"[FoundationFeatureExtractor] CRITICAL: Input dimension mismatch!\n"
+                            f"  Checkpoint was trained with {checkpoint_input_dim} features\n"
+                            f"  Current model expects {model_input_dim} features\n"
+                            f"  This usually means:\n"
+                            f"    - Old checkpoint (pre-trained with HMM features included)\n"
+                            f"    - OR new checkpoint (pre-trained without HMM features)\n"
+                            f"  Solution: Re-pre-train the MAE with the current feature set\n"
+                            f"  (dataset.py now auto-excludes HMM features for MAE pre-training)"
+                        )
+                
                 # Nested format: load each component separately
                 self.mae.embedding.load_state_dict(checkpoint['embedding'])
                 self.mae.encoder.load_state_dict(checkpoint['encoder'])
@@ -194,9 +214,29 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                           f"Saved: {saved_d_model}, Current: {self.d_model}")
 
                 print(f"[FoundationFeatureExtractor] Loaded pretrained encoder (nested format) from {encoder_path}")
+                if 'weight' in checkpoint_embedding:
+                    print(f"  ✓ Input dimension verified: {model_input_dim} features (matches checkpoint)")
 
             else:
                 # Standard state_dict format (full model or partial)
+                # Check input_dim dimension mismatch before loading
+                model_input_dim = self.mae.embedding.weight.shape[1]
+                
+                if 'embedding.weight' in checkpoint:
+                    checkpoint_input_dim = checkpoint['embedding.weight'].shape[1]
+                    
+                    if checkpoint_input_dim != model_input_dim:
+                        raise ValueError(
+                            f"[FoundationFeatureExtractor] CRITICAL: Input dimension mismatch!\n"
+                            f"  Checkpoint was trained with {checkpoint_input_dim} features\n"
+                            f"  Current model expects {model_input_dim} features\n"
+                            f"  This usually means:\n"
+                            f"    - Old checkpoint (pre-trained with HMM features included)\n"
+                            f"    - OR new checkpoint (pre-trained without HMM features)\n"
+                            f"  Solution: Re-pre-train the MAE with the current feature set\n"
+                            f"  (dataset.py now auto-excludes HMM features for MAE pre-training)"
+                        )
+                
                 missing, unexpected = self.mae.load_state_dict(checkpoint, strict=False)
 
                 if missing:
@@ -205,6 +245,8 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                     print(f"[FoundationFeatureExtractor] Unexpected keys: {len(unexpected)}")
 
                 print(f"[FoundationFeatureExtractor] Loaded pretrained weights from {encoder_path}")
+                if 'embedding.weight' in checkpoint:
+                    print(f"  ✓ Input dimension verified: {model_input_dim} features (matches checkpoint)")
 
         except FileNotFoundError:
             print(f"[FoundationFeatureExtractor] WARNING: Pretrained weights not found at {encoder_path}")
