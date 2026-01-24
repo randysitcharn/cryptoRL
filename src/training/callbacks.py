@@ -731,7 +731,29 @@ class MORLCurriculumCallback(BaseCallback):
         return True
     
     def _on_training_start(self) -> None:
-        """Print curriculum configuration at training start."""
+        """
+        Initialize curriculum target BEFORE first rollout begins.
+
+        This fixes a timing bug where the first episodes would use the default
+        biased distribution (20% w=0, 20% w=1, 60% uniform) instead of the
+        curriculum's start_cost value.
+        """
+        # 1. Set initial curriculum target on environment IMMEDIATELY
+        # This ensures the first reset() uses curriculum sampling, not biased distribution
+        real_env = get_underlying_batch_env(self.model.env)
+        if real_env is not None and hasattr(real_env, 'set_w_cost_target'):
+            real_env.set_w_cost_target(self.start_cost)
+            if self.verbose > 0:
+                print(f"[MORL Curriculum] Initial w_cost_target set to {self.start_cost:.3f}")
+        else:
+            if self.verbose > 0:
+                print(f"[MORL Curriculum] Warning: Could not set initial w_cost_target")
+
+        # 2. Log initial state to TensorBoard (step 0)
+        self.logger.record("curriculum/w_cost_target", self.start_cost)
+        self.logger.record("curriculum/w_cost_progress", 0.0)
+
+        # 3. Print configuration summary
         if self.verbose > 0:
             print(f"\n[MORL Curriculum] Progressive w_cost modulation:")
             print(f"  Start w_cost: {self.start_cost:.3f} (pure performance)")
