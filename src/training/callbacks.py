@@ -738,13 +738,14 @@ class MORLCurriculumCallback(BaseCallback):
         biased distribution (20% w=0, 20% w=1, 60% uniform) instead of the
         curriculum's start_cost value.
         """
-        # 1. Set initial curriculum target on environment IMMEDIATELY
-        # This ensures the first reset() uses curriculum sampling, not biased distribution
+        # 1. Set initial curriculum target AND current w_cost IMMEDIATELY
+        # apply_immediately=True fixes timing bug: first episode was using biased distribution
+        # because reset() happened before _on_training_start() was called
         real_env = get_underlying_batch_env(self.model.env)
         if real_env is not None and hasattr(real_env, 'set_w_cost_target'):
-            real_env.set_w_cost_target(self.start_cost)
+            real_env.set_w_cost_target(self.start_cost, apply_immediately=True)
             if self.verbose > 0:
-                print(f"[MORL Curriculum] Initial w_cost_target set to {self.start_cost:.3f}")
+                print(f"[MORL Curriculum] Initial w_cost set to {self.start_cost:.3f} (applied immediately)")
         else:
             if self.verbose > 0:
                 print(f"[MORL Curriculum] Warning: Could not set initial w_cost_target")

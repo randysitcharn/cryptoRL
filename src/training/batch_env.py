@@ -629,21 +629,35 @@ class BatchCryptoEnv(VecEnv):
         """
         self._eval_w_cost = w_cost
     
-    def set_w_cost_target(self, target_w_cost: float) -> None:
+    def set_w_cost_target(self, target_w_cost: float, apply_immediately: bool = False) -> None:
         """
         Set target w_cost for curriculum learning.
-        
+
         The environment will sample w_cost around this target value
         instead of using the fixed biased distribution (20%/60%/20%).
-        
+
         Sampling uses a truncated normal distribution centered on target_w_cost
         with std=0.1 to maintain exploration while following the curriculum.
-        
+
         Args:
             target_w_cost: Target w_cost value [0, 1] for curriculum.
+            apply_immediately: If True, also set current w_cost for all envs
+                              (fixes timing bug where first episode uses biased distribution).
         """
         self._w_cost_target = max(0.0, min(1.0, target_w_cost))
         self._use_curriculum_sampling = True
+
+        # Apply to currently running episodes (not just future resets)
+        if apply_immediately:
+            # Sample around target with std=0.1 (same as reset)
+            std = 0.1
+            samples = torch.normal(
+                mean=self._w_cost_target,
+                std=std,
+                size=(self.num_envs, 1),
+                device=self.device
+            )
+            self.w_cost = torch.clamp(samples, min=0.0, max=1.0)
 
     def step_async(self, actions) -> None:
         """Store actions for step_wait (VecEnv interface).
