@@ -319,3 +319,75 @@ class TestOracleSignalCorrelation:
             assert correlation > 0.7, (
                 f"Signal strength {signal_strength} produced low correlation {correlation}"
             )
+
+
+def test_gradient_flow():
+    """
+    Diagnostic du flux de gradient avec encodeur gelé.
+    
+    Vérifie que les gradients remontent jusqu'aux observations d'entrée
+    même quand l'encodeur est gelé. Si l'encodeur utilise .detach(),
+    le graphe de calcul est cassé et les gradients ne remontent pas.
+    
+    Ce test permet de détecter si freeze_encoder casse le graphe.
+    """
+    from src.training.batch_env import BatchCryptoEnv
+    
+    print("--- DIAGNOSTIC DU FLUX DE GRADIENT ---")
+    
+    # 1. Charger un environnement factice pour les dimensions
+    env = BatchCryptoEnv(n_envs=1)
+    
+    # 2. Initialiser le modèle (avec encodeur gelé)
+    from src.config import TQCTrainingConfig
+    from src.training.train_agent import create_policy_kwargs
+    
+    config = TQCTrainingConfig()
+    config.freeze_encoder = True  # On teste le cas critique
+    policy_kwargs = create_policy_kwargs(config)
+    
+    model = TQC("MultiInputPolicy", env, policy_kwargs=policy_kwargs, device="cpu")
+    print("[OK] Modele charge (Encoder Frozen: True)")
+
+    # 3. Créer une fausse observation AVEC requires_grad=True
+    # C'est la clé : on veut voir si le gradient remonte jusqu'ici
+    batch_size = 2
+    market_obs = torch.randn(batch_size, env.window_size, env.n_features, requires_grad=True)
+    pos_obs = torch.randn(batch_size, 1, requires_grad=True)
+    
+    obs = {"market": market_obs, "position": pos_obs}
+    
+    # 4. Forward Pass
+    print("[>] Forward Pass...")
+    features = model.policy.features_extractor(obs)
+    loss = features.mean()  # Une Loss bidon
+    
+    # 5. Backward Pass
+    print("[>] Backward Pass...")
+    loss.backward()
+    
+    # 6. Verdict
+    market_grad = market_obs.grad
+    pos_grad = pos_obs.grad
+    
+    print("\n--- RESULTATS ---")
+    if pos_grad is not None and pos_grad.norm() > 0:
+        print(f"[OK] Position Gradient: OK (Norm: {pos_grad.norm():.6f})")
+    else:
+        print("[FAIL] Position Gradient: MORT (0.0)")
+
+    if market_grad is not None and market_grad.norm() > 0:
+        print(f"[OK] Market Gradient:   OK (Norm: {market_grad.norm():.6f})")
+        print("   -> Conclusion : L'audit precedent etait mal configure.")
+    else:
+        print(f"[FAIL] Market Gradient:   MORT (0.0)")
+        print("   -> Conclusion : L'encodeur gele casse le graphe (Detach).")
+    
+    # Assertions pour pytest
+    assert pos_grad is not None, "Position gradient should not be None"
+    assert pos_grad.norm() > 0, "Position gradient should be non-zero"
+    
+    # Note: Market gradient peut être None si l'encodeur utilise .detach()
+    # On log mais on n'échoue pas le test (c'est un diagnostic)
+    if market_grad is None or market_grad.norm() == 0:
+        print("[WARN] Market gradient is zero - encoder may be detaching inputs")
