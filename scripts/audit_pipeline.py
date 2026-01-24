@@ -4697,6 +4697,104 @@ def analyze_tqc_value_add(
     return results
 
 
+def get_robust_trend_stats(series: List[float], n_bins: int = 50) -> Dict[str, Any]:
+    """
+    Analyse une série temporelle en distinguant la tendance de fond (Signal)
+    du bruit (Noise) via Binning + SNR (Signal-to-Noise Ratio).
+
+    Remplace l'heuristique naïve "Start vs End" pour éviter les faux positifs
+    "Exploding" dus au bruit ou à une légère hausse finale.
+
+    Args:
+        series: Série temporelle (loss, rewards, etc.)
+        n_bins: Nombre de bins pour le lissage
+
+    Returns:
+        Dict avec history_50, uncertainty_50, recent_slope, noise_level, snr,
+        status, emoji, start, end, peak. En cas de données insuffisantes,
+        uncertainty_50, snr, etc. peuvent être absents.
+    """
+    series = np.asarray(series, dtype=np.float64)
+    length = len(series)
+
+    if length < n_bins:
+        return {
+            "status": "INSUFFICIENT_DATA",
+            "history_50": series.tolist(),
+            "recent_slope": 0.0,
+            "emoji": "⚪",
+        }
+    bin_size = length // n_bins
+    truncated_len = bin_size * n_bins
+    reshaped = series[:truncated_len].reshape(n_bins, -1)
+
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        means = np.nanmean(reshaped, axis=1)
+        stds = np.nanstd(reshaped, axis=1)
+    stds = np.where(np.isnan(stds), 0.0, stds)
+
+    lookback = max(3, int(n_bins * 0.2))
+    recent_means = np.asarray(means[-lookback:], dtype=np.float64)
+    recent_stds = stds[-lookback:]
+    with np.errstate(invalid="ignore"):
+        recent_noise = float(np.nanmean(recent_stds))
+    if np.isnan(recent_noise):
+        recent_noise = 0.0
+
+    ok = ~np.isnan(recent_means)
+    if np.sum(ok) < 2:
+        slope = 0.0
+    else:
+        x = np.arange(len(recent_means))[ok]
+        y = recent_means[ok]
+        slope, _ = np.polyfit(x, y, 1)
+
+    start_val = float(means[0])
+    end_val = float(means[-1])
+    peak_val = float(np.nanmax(means))
+    end_is_nan = np.isnan(means[-1])
+    if np.isnan(start_val):
+        start_val = 0.0
+    if np.isnan(end_val):
+        end_val = 0.0
+    if np.isnan(peak_val):
+        peak_val = 0.0
+
+    snr = abs(slope) / (recent_noise + 1e-9)
+
+    if end_val > 1e4 or end_is_nan:
+        status = "🔴 EXPLODING"
+        emoji = "💥"
+    elif snr < 2.0:
+        status = "STABLE (Noisy)"
+        emoji = "〰️"
+    elif slope > 0:
+        if end_val < start_val * 1.5:
+            status = "RISING (Controlled)"
+            emoji = "📈"
+        else:
+            status = "DIVERGING"
+            emoji = "⚠️"
+    else:
+        status = "CONVERGING"
+        emoji = "✅"
+
+    out = {
+        "history_50": means.tolist(),
+        "uncertainty_50": stds.tolist(),
+        "recent_slope": float(slope),
+        "noise_level": recent_noise,
+        "snr": float(snr),
+        "status": status,
+        "emoji": emoji,
+        "start": start_val,
+        "end": end_val,
+        "peak": peak_val,
+    }
+    return out
+
+
 def to_sparkline(values: List[float]) -> str:
     """
     Convertit une liste de valeurs en sparkline ASCII (mini-graphique texte).
@@ -4971,7 +5069,7 @@ def analyze_tqc_convergence(
     # Extraire et analyser chaque métrique
     for tag in tags_to_analyze:
         print(f"  Extracting {tag}...")
-        resampled = extract_and_resample(tensorboard_log_dir, tag, n_samples=40)
+        resampled = extract_and_resample(tensorboard_log_dir, tag, n_samples=100)
         
         if resampled is None:
             continue
@@ -4981,66 +5079,51 @@ def analyze_tqc_convergence(
         if len(values) == 0:
             continue
         
-        # Calculer statistiques
-        start_avg = np.mean(values[:5]) if len(values) >= 5 else values[0]
-        end_avg = np.mean(values[-5:]) if len(values) >= 5 else values[-1]
-        peak = max(values)
-        peak_idx = values.index(peak)
-        
-        # Générer sparkline
-        sparkline = to_sparkline(values)
-        
-        # Déterminer le statut
-        if 'loss' in tag.lower():
-            # Pour les loss, on veut qu'elles descendent
-            if end_avg < start_avg * 0.9:
-                status = "✅ Decreasing"
-                emoji = "🟢"
-            elif end_avg > start_avg * 1.1:
-                status = "🔴 Exploding"
-                emoji = "🔴"
-            else:
-                status = "➡️ Stable"
-                emoji = "🟡"
-        elif 'reward' in tag.lower() or 'rew' in tag.lower():
-            # Pour les rewards, on veut qu'elles montent
-            if end_avg > start_avg * 1.1:
-                status = "📈 Growing"
-                emoji = "🟢"
-            elif end_avg < start_avg * 0.9:
-                status = "📉 Collapsing"
-                emoji = "🔴"
-            else:
-                status = "➡️ Stable"
-                emoji = "🟡"
-        elif 'ent_coef' in tag.lower():
-            # Pour ent_coef, on veut voir l'évolution
-            if end_avg < start_avg * 0.5:
-                status = "📉 Collapsed"
-                emoji = "🟡"
-            elif end_avg > start_avg * 1.5:
-                status = "📈 Exploded"
-                emoji = "🔴"
-            else:
-                status = "➡️ Stable"
-                emoji = "🟢"
-        else:
-            status = "—"
-            emoji = "⚪"
-        
-        # Stocker les résultats
-        metric_name = tag.split('/')[-1]  # Nom simple (ex: 'critic_loss')
-        results['metrics'][metric_name] = {
-            'tag': tag,
-            'sparkline': sparkline,
-            'start': float(start_avg),
-            'end': float(end_avg),
-            'peak': float(peak),
-            'peak_step': int(steps[peak_idx]) if peak_idx < len(steps) else None,
-            'status': status,
-            'emoji': emoji,
-            'n_points': len(values)
+        stats = get_robust_trend_stats(values, n_bins=50)
+        history = stats["history_50"]
+        sparkline = to_sparkline(history)
+        status = stats["status"]
+        emoji = stats.get("emoji", "⚪")
+
+        def _safe_float(v, default: float = 0.0) -> float:
+            if v is None:
+                return default
+            x = float(v)
+            return default if np.isnan(x) else x
+
+        start_val = stats.get("start")
+        end_val = stats.get("end")
+        peak_val = stats.get("peak")
+        if start_val is None and history:
+            start_val = history[0]
+        if end_val is None and history:
+            end_val = history[-1]
+        if peak_val is None and history:
+            peak_val = float(np.nanmax(history)) if history else 0.0
+        peak_step = None
+
+        metric_name = tag.split('/')[-1]
+        entry = {
+            "tag": tag,
+            "sparkline": sparkline,
+            "start": _safe_float(start_val),
+            "end": _safe_float(end_val),
+            "peak": _safe_float(peak_val),
+            "peak_step": peak_step,
+            "status": status,
+            "emoji": emoji,
+            "n_points": len(values),
+            "history_50": history,
         }
+        if "uncertainty_50" in stats:
+            entry["uncertainty_50"] = stats["uncertainty_50"]
+        if "snr" in stats:
+            entry["snr"] = stats["snr"]
+        if "noise_level" in stats:
+            entry["noise_level"] = stats["noise_level"]
+        if "recent_slope" in stats:
+            entry["recent_slope"] = stats["recent_slope"]
+        results["metrics"][metric_name] = entry
     
     print(f"  Analyzed {len(results['metrics'])} metrics")
     
@@ -5209,7 +5292,10 @@ def _serialize_results(results: Dict) -> Dict:
         elif isinstance(value, (np.integer, np.int64, np.int32)):
             return int(value)
         elif isinstance(value, (np.floating, np.float64, np.float32)):
-            return float(value)
+            v = float(value)
+            return None if np.isnan(v) else v
+        elif isinstance(value, float) and (value != value):  # NaN
+            return None
         elif isinstance(value, (np.bool_,)):
             return bool(value)
         else:
