@@ -2391,6 +2391,15 @@ def main():
                         help="Run specific segment only")
     parser.add_argument("--timesteps", type=int, default=WFOTrainingConfig.total_timesteps,
                         help="TQC training timesteps per segment")
+    # === TQC Hyperparameters ===
+    parser.add_argument("--learning-rate", type=float, default=None,
+                        help="TQC learning rate (default: from WFOTrainingConfig)")
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Discount factor (default: from WFOTrainingConfig)")
+    parser.add_argument("--ent-coef", type=float, default=None,
+                        help="Entropy coefficient (default: auto_1.0)")
+    parser.add_argument("--w-cost-scale", type=float, default=None,
+                        help="MORL w_cost end value for curriculum (default: 0.1)")
     parser.add_argument("--mae-epochs", type=int, default=WFOConfig.mae_epochs,
                         help="MAE training epochs per segment")
     parser.add_argument("--train-months", type=int, default=WFOConfig.train_months,
@@ -2487,6 +2496,20 @@ def main():
         tc.guard_nav_threshold = args.guard_nav_threshold
         tc.guard_patience = args.guard_patience
         tc.guard_check_freq = args.guard_check_freq
+
+    # === TQC Hyperparameters Override ===
+    if args.learning_rate is not None:
+        tc.learning_rate = args.learning_rate
+        print(f"[INFO] Learning rate: {tc.learning_rate}")
+    if args.gamma is not None:
+        tc.gamma = args.gamma
+        print(f"[INFO] Gamma: {tc.gamma}")
+    if args.ent_coef is not None:
+        tc.ent_coef = args.ent_coef
+        print(f"[INFO] Entropy coef: {tc.ent_coef}")
+    if args.w_cost_scale is not None:
+        tc.w_cost_end = args.w_cost_scale
+        print(f"[INFO] W_cost end (curriculum): {tc.w_cost_end}")
 
     # === Fail-over Strategy Configuration ===
     config.fallback_strategy = args.fallback_strategy
