@@ -29,6 +29,7 @@ from src.config.constants import (
     MAX_LOOKBACK_WINDOW,
     DEFAULT_PURGE_WINDOW,
     HMM_FEATURE_PREFIXES,
+    HMM_CONTEXT_COLS,
 )
 
 # Training configurations
@@ -56,6 +57,7 @@ __all__ = [
     "MAX_LOOKBACK_WINDOW",
     "DEFAULT_PURGE_WINDOW",
     "HMM_FEATURE_PREFIXES",
+    "HMM_CONTEXT_COLS",
     # Base configs
     "PathConfig",
     "EnvConfig",
