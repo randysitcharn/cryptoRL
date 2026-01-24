@@ -341,7 +341,7 @@ def test_gradient_flow():
     if not os.path.exists(wfo_train_path):
         pytest.skip(f"WFO data not found: {wfo_train_path}")
 
-    env = BatchCryptoEnv(parquet_path=wfo_train_path, n_envs=1)
+    env = BatchCryptoEnv(parquet_path=wfo_train_path, price_column="BTC_Close", n_envs=1)
     
     # 2. Initialiser le modèle (avec encodeur gelé)
     from src.config import TQCTrainingConfig
