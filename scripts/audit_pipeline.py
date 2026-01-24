@@ -4758,10 +4758,21 @@ def extract_and_resample(
         
         if not os.path.exists(log_dir):
             return None
-        
+
+        # Chercher le sous-dossier de run (TensorBoard crée des sous-dossiers par run)
+        # EventAccumulator ne cherche PAS récursivement
+        actual_log_dir = log_dir
+        subdirs = [d for d in os.listdir(log_dir) if os.path.isdir(os.path.join(log_dir, d))]
+        if subdirs:
+            # Prendre le premier sous-dossier qui contient des events
+            for subdir in sorted(subdirs):
+                subdir_path = os.path.join(log_dir, subdir)
+                if any(f.startswith('events.out.tfevents') for f in os.listdir(subdir_path)):
+                    actual_log_dir = subdir_path
+                    break
+
         # Charger les événements TensorBoard
-        # EventAccumulator gère automatiquement la recherche des fichiers event
-        ea = EventAccumulator(log_dir)
+        ea = EventAccumulator(actual_log_dir)
         ea.Reload()
         
         # Vérifier si le tag existe
