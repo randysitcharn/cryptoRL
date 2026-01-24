@@ -4229,6 +4229,8 @@ def analyze_tqc_calibration(
     q_values = np.array(q_values)
     actual_returns = np.array(actual_returns)
     q_value_stds = np.array(q_value_stds)
+    actions = np.array(actions)
+    action_abs = np.abs(actions)
     hmm_entropies = np.array([h if h is not None else np.nan for h in hmm_entropies])
     
     # A.1 Reliability Diagram
@@ -4260,28 +4262,33 @@ def analyze_tqc_calibration(
     # Calculate Brier Score (simplified - treating as regression)
     brier_score = np.mean((q_values - actual_returns) ** 2)
     
-    # A.2 Entropy Correlation
-    entropy_correlation = None
+    # A.2 Entropy Correlations (AUDIT_TQC)
+    entropy_correlation = None  # HMM_Entropy vs Q_std
+    entropy_action_correlation = None  # HMM_Entropy vs |action|
     if not np.all(np.isnan(hmm_entropies)):
         valid_mask = ~np.isnan(hmm_entropies)
         if valid_mask.sum() > 10:
-            entropy_correlation = np.corrcoef(
-                hmm_entropies[valid_mask],
-                q_value_stds[valid_mask]
-            )[0, 1]
+            entropy_correlation = float(
+                np.corrcoef(hmm_entropies[valid_mask], q_value_stds[valid_mask])[0, 1]
+            )
+            entropy_action_correlation = float(
+                np.corrcoef(hmm_entropies[valid_mask], action_abs[valid_mask])[0, 1]
+            )
     
     results = {
-        'q_values': q_values,
-        'actual_returns': actual_returns,
-        'q_value_stds': q_value_stds,
-        'hmm_entropies': hmm_entropies,
-        'bin_means_q': bin_means_q,
-        'bin_means_return': bin_means_return,
-        'bin_win_rates': bin_win_rates,
-        'ece': ece,
-        'brier_score': brier_score,
-        'entropy_correlation': entropy_correlation,
-        'n_steps': step_count
+        "q_values": q_values,
+        "actual_returns": actual_returns,
+        "q_value_stds": q_value_stds,
+        "actions": actions,
+        "hmm_entropies": hmm_entropies,
+        "bin_means_q": bin_means_q,
+        "bin_means_return": bin_means_return,
+        "bin_win_rates": bin_win_rates,
+        "ece": ece,
+        "brier_score": brier_score,
+        "entropy_correlation": entropy_correlation,
+        "entropy_action_correlation": entropy_action_correlation,
+        "n_steps": step_count,
     }
     
     print(f"  Collected {step_count} steps")
@@ -4289,6 +4296,8 @@ def analyze_tqc_calibration(
     print(f"  Brier Score: {brier_score:.4f}")
     if entropy_correlation is not None:
         print(f"  Correlation (HMM_Entropy, Q_std): {entropy_correlation:.4f}")
+    if entropy_action_correlation is not None:
+        print(f"  Correlation (HMM_Entropy, |action|): {entropy_action_correlation:.4f}")
     
     return results
 
@@ -4502,28 +4511,55 @@ def analyze_tqc_attribution(
     return results
 
 
+def _run_backtest_with_actions(
+    test_env: BatchCryptoEnv,
+    action_fn,
+    initial_nav: float = 10000.0,
+) -> tuple:
+    """Run backtest stepping env with actions from action_fn(step_count, obs, info) -> np.ndarray."""
+    returns_list = []
+    obs, info = test_env.gym_reset()
+    done = False
+    step_count = 0
+    prev_nav = info.get("nav", initial_nav)
+    while not done:
+        action = action_fn(step_count, obs, info)
+        obs, reward, terminated, truncated, info = test_env.gym_step(action)
+        done = terminated or truncated
+        nav = info.get("nav", prev_nav)
+        ret = (nav - prev_nav) / prev_nav if prev_nav > 0 else 0.0
+        returns_list.append(ret)
+        prev_nav = nav
+        step_count += 1
+    return np.array(returns_list), prev_nav, step_count
+
+
 def analyze_tqc_value_add(
     model: TQC,
     test_env: BatchCryptoEnv,
     test_df: pd.DataFrame,
-    baseline_strategy: str = "naive_mae"
+    baseline_strategy: str = "naive_mae",
 ) -> Dict:
     """
-    C.1 Baseline Comparison: Naive MAE vs TQC vs Oracle
+    C.1 Baseline Comparison: B&H, Oracle vs TQC (AUDIT_TQC)
     C.2 Regime-Specific Performance
     
     Args:
         model: Loaded TQC model
         test_env: Test environment
         test_df: Test dataframe with HMM features
-        baseline_strategy: Baseline strategy to use
+        baseline_strategy: Unused; baselines B&H and Oracle always computed.
     
     Returns:
-        Dict with value add metrics
+        Dict with value add metrics (TQC + B&H + Oracle, deltas, regime)
     """
     print(f"\n[C] Analyzing TQC Value Add...")
     
-    # C.1 Run backtest with TQC
+    window_size = getattr(test_env, "window_size", 64)
+    df_start_idx = window_size
+    initial_nav = 10000.0
+    
+    # C.1a TQC backtest
     tqc_returns = []
     tqc_actions = []
     tqc_hmm_states = []
@@ -4531,46 +4567,78 @@ def analyze_tqc_value_add(
     obs, info = test_env.gym_reset()
     done = False
     step_count = 0
-    initial_nav = info.get('nav', 10000.0)
-    prev_nav = initial_nav
+    prev_nav = info.get("nav", initial_nav)
     
     while not done:
         action, _ = model.predict(obs, deterministic=True)
         tqc_actions.append(action[0])
         
-        # Get HMM state (dominant probability)
-        if 'hmm_entropy' in obs or test_df is not None:
-            # Extract from dataframe if available
-            if test_df is not None and step_count < len(test_df):
-                hmm_probs = [
-                    test_df.iloc[step_count].get('HMM_Prob_0', 0),
-                    test_df.iloc[step_count].get('HMM_Prob_1', 0),
-                    test_df.iloc[step_count].get('HMM_Prob_2', 0),
-                    test_df.iloc[step_count].get('HMM_Prob_3', 0)
-                ]
-                dominant_state = np.argmax(hmm_probs)
-                tqc_hmm_states.append(dominant_state)
-            else:
-                tqc_hmm_states.append(None)
+        row = df_start_idx + step_count
+        if test_df is not None and row < len(test_df):
+            hmm_probs = [
+                test_df.iloc[row].get("HMM_Prob_0", 0),
+                test_df.iloc[row].get("HMM_Prob_1", 0),
+                test_df.iloc[row].get("HMM_Prob_2", 0),
+                test_df.iloc[row].get("HMM_Prob_3", 0),
+            ]
+            dominant_state = int(np.argmax(hmm_probs))
+            tqc_hmm_states.append(dominant_state)
         else:
             tqc_hmm_states.append(None)
         
         obs, reward, terminated, truncated, info = test_env.gym_step(action)
         done = terminated or truncated
-        
-        nav = info.get('nav', prev_nav)
+        nav = info.get("nav", prev_nav)
         ret = (nav - prev_nav) / prev_nav if prev_nav > 0 else 0.0
         tqc_returns.append(ret)
         prev_nav = nav
         step_count += 1
     
     tqc_returns = np.array(tqc_returns)
+    n_steps = step_count
     
-    # Calculate TQC metrics
     tqc_sharpe = calculate_sharpe_ratio(tqc_returns) if len(tqc_returns) > 1 else 0.0
     tqc_total_return = (prev_nav / initial_nav - 1.0) * 100
     tqc_max_dd = calculate_max_drawdown(tqc_returns)
     tqc_win_rate = (tqc_returns > 0).mean() * 100
+    
+    # C.1b B&H baseline
+    def bh_action(_sc, _obs, _info):
+        return np.array([[1.0]], dtype=np.float32)
+    
+    bh_returns, bh_final_nav, _ = _run_backtest_with_actions(test_env, bh_action, initial_nav)
+    bh_sharpe = calculate_sharpe_ratio(bh_returns) if len(bh_returns) > 1 else 0.0
+    bh_total_return = (bh_final_nav / initial_nav - 1.0) * 100
+    bh_max_dd = calculate_max_drawdown(bh_returns)
+    bh_win_rate = (bh_returns > 0).mean() * 100
+    
+    # C.1c Oracle baseline (perfect foresight of next-step return)
+    forward_ret = None
+    if "BTC_Close" in test_df.columns:
+        pr = test_df["BTC_Close"].astype(float)
+        forward_ret = np.log(pr.shift(-1) / pr).values
+        forward_ret = np.nan_to_num(forward_ret, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    def oracle_action(sc, _obs, _info):
+        r = df_start_idx + sc
+        if forward_ret is not None and r < len(forward_ret):
+            s = np.sign(forward_ret[r])
+            a = float(s) if s != 0 else 0.0
+        else:
+            a = 0.0
+        return np.array([[a]], dtype=np.float32)
+    
+    oracle_returns, oracle_final_nav, _ = _run_backtest_with_actions(
+        test_env, oracle_action, initial_nav
+    )
+    oracle_sharpe = calculate_sharpe_ratio(oracle_returns) if len(oracle_returns) > 1 else 0.0
+    oracle_total_return = (oracle_final_nav / initial_nav - 1.0) * 100
+    oracle_max_dd = calculate_max_drawdown(oracle_returns)
+    oracle_win_rate = (oracle_returns > 0).mean() * 100
+    
+    # Deltas vs baselines (key metric: Sharpe TQC - Sharpe B&H)
+    delta_sharpe_vs_bh = tqc_sharpe - bh_sharpe
+    delta_sharpe_vs_oracle = tqc_sharpe - oracle_sharpe
     
     # C.2 Regime-Specific Performance
     regime_metrics = {}
@@ -4579,21 +4647,34 @@ def analyze_tqc_value_add(
             state_mask = np.array([s == state for s in tqc_hmm_states])
             if state_mask.sum() > 10:
                 state_returns = tqc_returns[state_mask]
-                regime_metrics[f'state_{state}'] = {
-                    'sharpe': calculate_sharpe_ratio(state_returns) if len(state_returns) > 1 else 0.0,
-                    'win_rate': (state_returns > 0).mean() * 100,
-                    'avg_return': state_returns.mean() * 100,
-                    'n_trades': state_mask.sum()
+                regime_metrics[f"state_{state}"] = {
+                    "sharpe": calculate_sharpe_ratio(state_returns)
+                    if len(state_returns) > 1
+                    else 0.0,
+                    "win_rate": (state_returns > 0).mean() * 100,
+                    "avg_return": state_returns.mean() * 100,
+                    "n_trades": int(state_mask.sum()),
                 }
     
     results = {
-        'tqc_sharpe': tqc_sharpe,
-        'tqc_total_return': tqc_total_return,
-        'tqc_max_dd': tqc_max_dd,
-        'tqc_win_rate': tqc_win_rate,
-        'tqc_returns': tqc_returns,
-        'regime_metrics': regime_metrics,
-        'n_steps': step_count
+        "tqc_sharpe": tqc_sharpe,
+        "tqc_total_return": tqc_total_return,
+        "tqc_max_dd": tqc_max_dd,
+        "tqc_win_rate": tqc_win_rate,
+        "tqc_returns": tqc_returns,
+        "bh_sharpe": bh_sharpe,
+        "bh_total_return": bh_total_return,
+        "bh_max_dd": bh_max_dd,
+        "bh_win_rate": bh_win_rate,
+        "bh_returns": bh_returns,
+        "oracle_sharpe": oracle_sharpe,
+        "oracle_total_return": oracle_total_return,
+        "oracle_max_dd": oracle_max_dd,
+        "oracle_win_rate": oracle_win_rate,
+        "delta_sharpe_vs_bh": delta_sharpe_vs_bh,
+        "delta_sharpe_vs_oracle": delta_sharpe_vs_oracle,
+        "regime_metrics": regime_metrics,
+        "n_steps": n_steps,
     }
     
     print(f"  TQC Performance:")
@@ -4601,6 +4682,11 @@ def analyze_tqc_value_add(
     print(f"    Total Return: {tqc_total_return:.2f}%")
     print(f"    Max Drawdown: {tqc_max_dd:.2f}%")
     print(f"    Win Rate: {tqc_win_rate:.1f}%")
+    print(f"  B&H Baseline: Sharpe={bh_sharpe:.4f}, Return={bh_total_return:.2f}%")
+    print(f"  Oracle Baseline: Sharpe={oracle_sharpe:.4f}, Return={oracle_total_return:.2f}%")
+    print(f"  Delta Sharpe vs B&H: {delta_sharpe_vs_bh:+.4f}")
+    if delta_sharpe_vs_bh < 0:
+        print(f"  [!] TQC underperforms B&H (Delta < 0)")
     
     if regime_metrics:
         print(f"  Regime-Specific Performance:")
@@ -4905,9 +4991,16 @@ def generate_tqc_audit_report(
         f.write("## A. Calibration Analysis\n\n")
         if 'calibration' in results:
             cal = results['calibration']
-            f.write(f"- **ECE (Expected Calibration Error)**: {cal.get('ece', 'N/A'):.4f}\n")
-            f.write(f"- **Brier Score**: {cal.get('brier_score', 'N/A'):.4f}\n")
-            f.write(f"- **Entropy Correlation**: {cal.get('entropy_correlation', 'N/A')}\n")
+            ece = cal.get('ece')
+            brier = cal.get('brier_score')
+            ec = cal.get('entropy_correlation')
+            eac = cal.get('entropy_action_correlation')
+            def _num(v):
+                return v is not None and not (isinstance(v, float) and np.isnan(v))
+            f.write(f"- **ECE (Expected Calibration Error)**: {ece:.4f}\n" if _num(ece) else "- **ECE**: N/A\n")
+            f.write(f"- **Brier Score**: {brier:.4f}\n" if _num(brier) else "- **Brier Score**: N/A\n")
+            f.write(f"- **Entropy Correlation (HMM_Entropy vs Q_std)**: {ec:.4f}\n" if _num(ec) else "- **Entropy Correlation (HMM_Entropy vs Q_std)**: N/A\n")
+            f.write(f"- **Entropy-Action Correlation (HMM_Entropy vs |action|)**: {eac:.4f}\n" if _num(eac) else "- **Entropy-Action Correlation**: N/A\n")
             f.write(f"- **Steps Analyzed**: {cal.get('n_steps', 0)}\n\n")
         
         # Section B: Attribution
@@ -4928,9 +5021,28 @@ def generate_tqc_audit_report(
             f.write(f"- **Total Return**: {va.get('tqc_total_return', 'N/A'):.2f}%\n")
             f.write(f"- **Max Drawdown**: {va.get('tqc_max_dd', 'N/A'):.2f}%\n")
             f.write(f"- **Win Rate**: {va.get('tqc_win_rate', 'N/A'):.1f}%\n\n")
-            
+            f.write("**C.1 Baseline Comparison**:\n\n")
+            bh_s, bh_r = va.get('bh_sharpe'), va.get('bh_total_return')
+            or_s, or_r = va.get('oracle_sharpe'), va.get('oracle_total_return')
+            if bh_s is not None and bh_r is not None:
+                f.write(f"- **B&H**: Sharpe={bh_s:.4f}, Return={bh_r:.2f}%\n")
+            else:
+                f.write("- **B&H**: N/A\n")
+            if or_s is not None and or_r is not None:
+                f.write(f"- **Oracle**: Sharpe={or_s:.4f}, Return={or_r:.2f}%\n")
+            else:
+                f.write("- **Oracle**: N/A\n")
+            d_bh = va.get('delta_sharpe_vs_bh')
+            d_or = va.get('delta_sharpe_vs_oracle')
+            if d_bh is not None:
+                f.write(f"- **Delta Sharpe vs B&H**: {d_bh:+.4f}\n")
+            if d_or is not None:
+                f.write(f"- **Delta Sharpe vs Oracle**: {d_or:+.4f}\n")
+            if d_bh is not None and d_bh < 0:
+                f.write("\n⚠️ **WARNING**: TQC underperforms B&H (Delta Sharpe < 0).\n")
+            f.write("\n")
             if 'regime_metrics' in va and va['regime_metrics']:
-                f.write("**Regime-Specific Performance**:\n\n")
+                f.write("**C.2 Regime-Specific Performance**:\n\n")
                 for state, metrics in va['regime_metrics'].items():
                     f.write(f"- **{state}**: Sharpe={metrics['sharpe']:.4f}, WinRate={metrics['win_rate']:.1f}%\n")
                 f.write("\n")
@@ -5045,8 +5157,10 @@ def audit_film_mechanics(
     model = TQC.load(tqc_path, device=device)
     print(f"  Model loaded from: {tqc_path}")
     
-    # Extract FoundationFeatureExtractor
-    feature_extractor = model.policy.features_extractor
+    # Extract FoundationFeatureExtractor (on actor, not policy root)
+    feature_extractor = getattr(model.policy.actor, 'features_extractor', None)
+    if feature_extractor is None:
+        feature_extractor = getattr(model.policy, 'features_extractor', None)
     if not isinstance(feature_extractor, FoundationFeatureExtractor):
         raise TypeError(f"Expected FoundationFeatureExtractor, got {type(feature_extractor)}")
     
