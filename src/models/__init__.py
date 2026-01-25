@@ -23,6 +23,7 @@ try:
         DropoutCritic,
         create_mlp_with_dropout,
     )
+    from src.models.robust_actor import RobustDropoutActor
 
     __all__.extend([
         'create_tqc_agent',
@@ -34,6 +35,7 @@ try:
         'DropoutActor',
         'DropoutCritic',
         'create_mlp_with_dropout',
+        'RobustDropoutActor',
     ])
 except ImportError:
     pass  # sb3_contrib not installed

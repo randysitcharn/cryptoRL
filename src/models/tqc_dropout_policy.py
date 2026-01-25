@@ -63,7 +63,8 @@ def create_mlp_with_dropout(
     
     Args:
         input_dim: Dimension d'entrée
-        output_dim: Dimension de sortie  
+        output_dim: Dimension de sortie. Si <= 0 (ex. -1), mode trunk : pas de couche
+            finale (comme create_mlp(..., -1, ...) de SB3).
         net_arch: Liste des dimensions cachées [64, 64]
         activation_fn: Fonction d'activation (ReLU par défaut)
         dropout_rate: Taux de dropout (0.01 recommandé en finance)
@@ -98,8 +99,9 @@ def create_mlp_with_dropout(
         
         last_dim = hidden_dim
     
-    # Couche de sortie finale (Raw projection, sans dropout, LayerNorm, ni spectral norm)
-    layers.append(nn.Linear(last_dim, output_dim))
+    # Couche de sortie finale (sauf si output_dim <= 0 : mode trunk, pas de projection)
+    if output_dim > 0:
+        layers.append(nn.Linear(last_dim, output_dim))
     
     if squash_output:
         layers.append(nn.Tanh())
