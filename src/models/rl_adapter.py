@@ -24,12 +24,14 @@ from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from typing import Optional, Dict
 
-from src.config.constants import MAE_D_MODEL, MAE_N_HEADS, MAE_N_LAYERS
+from src.config.constants import (
+    DEFAULT_FOUNDATION_CONFIG,
+    FoundationFeatureExtractorConfig,
+    HMM_CONTEXT_SIZE,
+)
+from src.config.validators import ModelDimensionsValidator
 from src.models.foundation import CryptoMAE
 from src.models.layers import FiLMLayer
-
-# HMM context: 4 regime probabilities + 1 entropy (last 5 columns of market)
-HMM_CONTEXT_SIZE = 5
 
 
 class FoundationFeatureExtractor(BaseFeaturesExtractor):
@@ -56,13 +58,14 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self,
         observation_space: spaces.Dict,
         encoder_path: str = "weights/pretrained_encoder.pth",
-        d_model: int = MAE_D_MODEL,
-        n_heads: int = MAE_N_HEADS,
-        n_layers: int = MAE_N_LAYERS,
+        d_model: Optional[int] = None,
+        n_heads: Optional[int] = None,
+        n_layers: Optional[int] = None,
         dim_feedforward: Optional[int] = None,
-        dropout: float = 0.1,
+        dropout: Optional[float] = None,
         freeze_encoder: bool = True,
-        features_dim: int = 512
+        features_dim: Optional[int] = None,
+        config: Optional[FoundationFeatureExtractorConfig] = None
     ):
         """
         Initialize the Foundation Feature Extractor.
@@ -71,13 +74,28 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             observation_space: Dict observation space with "market", "position", and "w_cost".
             encoder_path: Path to pretrained encoder weights.
             d_model: Transformer model dimension (must match pretrained).
+                Defaults to config.mae_config.d_model.
             n_heads: Number of attention heads (must match pretrained).
+                Defaults to config.mae_config.n_heads.
             n_layers: Number of encoder layers (must match pretrained).
+                Defaults to config.mae_config.n_layers.
             dim_feedforward: FFN dimension (default: 4 * d_model).
-            dropout: Dropout rate.
+            dropout: Dropout rate. Defaults to config.mae_config.dropout.
             freeze_encoder: If True, freeze encoder weights.
-            features_dim: Output dimension (default: 512).
+            features_dim: Output dimension. Defaults to config.features_dim.
+            config: FoundationFeatureExtractorConfig to use (uses DEFAULT if None).
         """
+        # Use default config if not provided
+        if config is None:
+            config = DEFAULT_FOUNDATION_CONFIG
+        
+        # Use config values if not explicitly provided
+        d_model = d_model if d_model is not None else config.mae_config.d_model
+        n_heads = n_heads if n_heads is not None else config.mae_config.n_heads
+        n_layers = n_layers if n_layers is not None else config.mae_config.n_layers
+        dropout = dropout if dropout is not None else config.mae_config.dropout
+        features_dim = features_dim if features_dim is not None else config.features_dim
+        
         # Validate observation space type
         assert isinstance(observation_space, spaces.Dict), \
             f"Expected spaces.Dict, got {type(observation_space)}"
@@ -90,6 +108,34 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.window_size = market_space.shape[0]  # 64
         self.n_features = market_space.shape[1]   # 43
         self.d_model = d_model
+        
+        # Create actual config for validation
+        from src.config.constants import MAEConfig
+        actual_mae_config = MAEConfig(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dim_feedforward=dim_feedforward if dim_feedforward is not None else d_model * 4,
+            dropout=dropout
+        )
+        actual_config = FoundationFeatureExtractorConfig(
+            mae_config=actual_mae_config,
+            features_dim=features_dim
+        )
+        
+        # Validate configuration
+        ModelDimensionsValidator.validate_foundation_config(
+            actual_config,
+            n_features=self.n_features,
+            window_size=self.window_size
+        )
+        
+        # Validate observation space compatibility
+        ModelDimensionsValidator.validate_observation_space_compatibility(
+            observation_space_n_features=self.n_features,
+            expected_n_features=None,  # We don't enforce a specific count, just validate structure
+            use_film=self.n_features >= HMM_CONTEXT_SIZE
+        )
 
         # Position dimension
         position_space = observation_space["position"]
@@ -133,7 +179,8 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         )
 
         # Load pretrained weights (encoder only, strict=False)
-        self._load_pretrained_weights(encoder_path)
+        # Validation happens inside _load_pretrained_weights
+        self._load_pretrained_weights(encoder_path, expected_config=actual_config, expected_input_dim=self.mae_input_dim)
 
         # Freeze encoder if requested
         if freeze_encoder:
@@ -170,7 +217,12 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         )
         print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} → {features_dim} (LeakyReLU, position+w_cost aware)")
 
-    def _load_pretrained_weights(self, encoder_path: str) -> None:
+    def _load_pretrained_weights(
+        self,
+        encoder_path: str,
+        expected_config: Optional[FoundationFeatureExtractorConfig] = None,
+        expected_input_dim: Optional[int] = None
+    ) -> None:
         """
         Load pretrained encoder weights.
 
@@ -180,9 +232,25 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
 
         Args:
             encoder_path: Path to the pretrained weights file.
+            expected_config: Expected FoundationFeatureExtractorConfig for validation.
+            expected_input_dim: Expected input dimension for MAE (excludes HMM if FiLM used).
         """
         try:
             checkpoint = torch.load(encoder_path, map_location="cpu", weights_only=True)
+            
+            # Validate checkpoint compatibility using centralized validator
+            if expected_config is not None:
+                try:
+                    ModelDimensionsValidator.validate_checkpoint_compatibility(
+                        checkpoint,
+                        expected_config=expected_config,
+                        expected_input_dim=expected_input_dim
+                    )
+                except ValueError as e:
+                    # Re-raise with clear context
+                    raise ValueError(
+                        f"[FoundationFeatureExtractor] Checkpoint validation failed:\n{e}"
+                    ) from e
 
             # Check if checkpoint is in nested format (our custom encoder-only format)
             if isinstance(checkpoint, dict) and 'embedding' in checkpoint and 'encoder' in checkpoint:
@@ -203,7 +271,10 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                             f"    - Old checkpoint (pre-trained with HMM features included)\n"
                             f"    - OR new checkpoint (pre-trained without HMM features)\n"
                             f"  Solution: Re-pre-train the MAE with the current feature set\n"
-                            f"  (dataset.py now auto-excludes HMM features for MAE pre-training)"
+                            f"  (dataset.py now auto-excludes HMM features for MAE pre-training)\n"
+                            f"  Expected config: d_model={expected_config.mae_config.d_model if expected_config else 'N/A'}, "
+                            f"n_heads={expected_config.mae_config.n_heads if expected_config else 'N/A'}, "
+                            f"n_layers={expected_config.mae_config.n_layers if expected_config else 'N/A'}"
                         )
                 
                 # Nested format: load each component separately

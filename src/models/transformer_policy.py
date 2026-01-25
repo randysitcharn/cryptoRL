@@ -13,10 +13,14 @@ Architecture:
 """
 
 import math
+from typing import Optional
 import torch
 import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+from src.config.constants import DEFAULT_TRANSFORMER_CONFIG, TransformerFeatureExtractorConfig
+from src.config.validators import ModelDimensionsValidator
 
 
 class PositionalEncoding(nn.Module):
@@ -87,23 +91,54 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
     def __init__(
         self,
         observation_space: spaces.Box,
-        features_dim: int = 256,
-        d_model: int = 32,
-        nhead: int = 2,
-        num_layers: int = 1,
-        dim_feedforward: int = 64,
-        dropout: float = 0.1
+        features_dim: Optional[int] = None,
+        d_model: Optional[int] = None,
+        nhead: Optional[int] = None,
+        num_layers: Optional[int] = None,
+        dim_feedforward: Optional[int] = None,
+        dropout: Optional[float] = None
     ):
         """
         Args:
             observation_space (spaces.Box): Observation space from env.
-            features_dim (int): Output dimension for policy network.
-            d_model (int): Transformer model dimension.
-            nhead (int): Number of attention heads.
-            num_layers (int): Number of encoder layers.
-            dim_feedforward (int): Feedforward network dimension.
-            dropout (float): Dropout rate (regularization).
+            features_dim (int, optional): Output dimension for policy network.
+                Defaults to DEFAULT_TRANSFORMER_CONFIG.features_dim.
+            d_model (int, optional): Transformer model dimension.
+                Defaults to DEFAULT_TRANSFORMER_CONFIG.d_model.
+            nhead (int, optional): Number of attention heads.
+                Defaults to DEFAULT_TRANSFORMER_CONFIG.n_heads.
+            num_layers (int, optional): Number of encoder layers.
+                Defaults to DEFAULT_TRANSFORMER_CONFIG.n_layers.
+            dim_feedforward (int, optional): Feedforward network dimension.
+                Defaults to DEFAULT_TRANSFORMER_CONFIG.dim_feedforward.
+            dropout (float, optional): Dropout rate (regularization).
+                Defaults to DEFAULT_TRANSFORMER_CONFIG.dropout.
         """
+        # Use default config values if not provided
+        config = DEFAULT_TRANSFORMER_CONFIG
+        features_dim = features_dim if features_dim is not None else config.features_dim
+        d_model = d_model if d_model is not None else config.d_model
+        nhead = nhead if nhead is not None else config.n_heads
+        num_layers = num_layers if num_layers is not None else config.n_layers
+        dim_feedforward = dim_feedforward if dim_feedforward is not None else config.dim_feedforward
+        dropout = dropout if dropout is not None else config.dropout
+        
+        # Create config object for validation
+        actual_config = TransformerFeatureExtractorConfig(
+            d_model=d_model,
+            n_heads=nhead,
+            n_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            features_dim=features_dim,
+            dropout=dropout
+        )
+        
+        # Validate configuration
+        ModelDimensionsValidator.validate_transformer_config(
+            actual_config,
+            n_features=observation_space.shape[1] if len(observation_space.shape) > 1 else None
+        )
+        
         super().__init__(observation_space, features_dim)
 
         # Extract dimensions from observation space

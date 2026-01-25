@@ -12,12 +12,14 @@ TQC ameliorations vs SAC:
 - Plus robuste a l'overestimation bias
 """
 
+from dataclasses import asdict
 from typing import Callable
 
 from sb3_contrib import TQC
 from torch.optim import AdamW
 
 from src.config import DEVICE, SEED
+from src.config.constants import DEFAULT_TRANSFORMER_CONFIG
 from src.models.transformer_policy import TransformerFeatureExtractor
 
 
@@ -51,15 +53,17 @@ def create_tqc_agent(env, hyperparams=None, tensorboard_log=None):
         TQC: Agent TQC instancie avec Transformer feature extractor.
     """
     # Policy kwargs avec Transformer extractor (Architecture Nano pour stabilité)
+    # Use centralized configuration from constants.py
+    config = DEFAULT_TRANSFORMER_CONFIG
     policy_kwargs = dict(
         features_extractor_class=TransformerFeatureExtractor,
         features_extractor_kwargs=dict(
-            features_dim=256,
-            d_model=32,       # Réduit de 64 (moins de variance)
-            nhead=2,          # Réduit de 4
-            num_layers=1,     # Réduit de 2
-            dim_feedforward=64,  # Réduit de 128
-            dropout=0.1       # Réduit de 0.2
+            features_dim=config.features_dim,
+            d_model=config.d_model,
+            nhead=config.n_heads,  # Note: transformer_policy uses 'nhead' not 'n_heads'
+            num_layers=config.n_layers,  # Note: transformer_policy uses 'num_layers' not 'n_layers'
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout
         ),
         net_arch=[256, 256],
         n_critics=2,

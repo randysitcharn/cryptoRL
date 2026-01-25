@@ -24,6 +24,11 @@ import torch
 import numpy as np
 
 from src.config import DEVICE, SEED
+from src.config.constants import (
+    DEFAULT_FOUNDATION_CONFIG,
+    FoundationFeatureExtractorConfig,
+)
+from src.config.validators import ModelDimensionsValidator
 from src.models.tqc_dropout_policy import TQCDropoutPolicy
 from src.utils.hardware import HardwareManager
 from src.models.rl_adapter import FoundationFeatureExtractor
@@ -248,27 +253,60 @@ def _validate_spectral_norm_compatibility(model: TQC, config: TrainingConfig) ->
         )
 
 
-def create_policy_kwargs(config: TrainingConfig) -> dict:
+def create_policy_kwargs(
+    config: TrainingConfig,
+    foundation_config: Optional[FoundationFeatureExtractorConfig] = None,
+) -> dict:
     """
     Create policy kwargs with FoundationFeatureExtractor.
 
+    This function builds the policy_kwargs dict for TQC model creation.
+    It handles the integration between TrainingConfig and FoundationFeatureExtractorConfig:
+    - Uses foundation_config.features_dim for the feature extractor output dimension
+    - Uses config.d_model/n_heads/n_layers if present (for backward compatibility)
+    - Falls back to foundation_config.mae_config values if config values not present
+
+    Priority order for MAE dimensions:
+    1. config.d_model/n_heads/n_layers (if present in TrainingConfig)
+    2. foundation_config.mae_config.d_model/n_heads/n_layers
+    3. DEFAULT_FOUNDATION_CONFIG.mae_config (if foundation_config is None)
+
     Args:
         config: Training configuration.
+        foundation_config: Optional FoundationFeatureExtractorConfig.
+                         Controls features_dim and MAE architecture.
+                         If None, uses DEFAULT_FOUNDATION_CONFIG.
 
     Returns:
-        Dict of policy keyword arguments.
+        Dict of policy keyword arguments for TQC model creation.
+
+    Note:
+        The features_dim always comes from foundation_config (or default),
+        not from config, to ensure consistency with the feature extractor architecture.
     """
     # Default to tiny architecture if not specified
     net_arch = config.net_arch if config.net_arch else dict(pi=[64, 64], qf=[64, 64])
 
+    # Use provided foundation_config or fallback to default
+    if foundation_config is None:
+        foundation_config = DEFAULT_FOUNDATION_CONFIG
+    
+    # Build MAE config from foundation_config (explicit composition)
+    # Override with config values if they differ (for backward compatibility)
+    mae_config = foundation_config.mae_config
+    d_model = config.d_model if hasattr(config, 'd_model') else mae_config.d_model
+    n_heads = config.n_heads if hasattr(config, 'n_heads') else mae_config.n_heads
+    n_layers = config.n_layers if hasattr(config, 'n_layers') else mae_config.n_layers
+    
     policy_kwargs = dict(
         features_extractor_class=FoundationFeatureExtractor,
         features_extractor_kwargs=dict(
             encoder_path=config.encoder_path,
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_layers=config.n_layers,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
             freeze_encoder=config.freeze_encoder,
+            features_dim=foundation_config.features_dim,  # From foundation_config
         ),
         net_arch=net_arch,
         n_critics=config.n_critics,
@@ -522,7 +560,8 @@ def train(
     config: TrainingConfig = None,
     hw_overrides: dict = None,
     use_batch_env: bool = False,
-    resume_path: str = None
+    resume_path: str = None,
+    foundation_config: Optional[FoundationFeatureExtractorConfig] = None,
 ) -> tuple[TQC, dict]:
     """
     Train TQC agent with Foundation Model feature extractor.
@@ -535,6 +574,8 @@ def train(
                        This runs all envs in a single process using GPU tensors (10-50x speedup).
         resume_path: Path to checkpoint to resume from (e.g., tqc_last.zip).
                      If provided, loads model and continues TensorBoard steps.
+        foundation_config: Optional FoundationFeatureExtractorConfig.
+                          If None, uses DEFAULT_FOUNDATION_CONFIG.
 
     Returns:
         Tuple of (Trained TQC model, training metrics dict).
@@ -603,9 +644,35 @@ def train(
     print(f"      Device: {DEVICE}")
     print(f"      Volatility Scaling Active: Target={config.target_volatility}, Window={config.vol_window}")
 
+    # ==================== Determine Resume Mode ====================
+    # Determine resume path: explicit resume_path takes precedence
+    effective_resume_path = resume_path if resume_path and os.path.exists(resume_path) else config.load_model_path
+    is_resume = effective_resume_path is not None
+
     # ==================== Policy Setup ====================
     print("\n[2/4] Configuring policy with FoundationFeatureExtractor...")
-    policy_kwargs = create_policy_kwargs(config)
+    
+    # Use provided foundation_config or fallback to default
+    if foundation_config is None:
+        foundation_config = DEFAULT_FOUNDATION_CONFIG
+    
+    # Validate configuration before model creation (only for new training)
+    if not is_resume:
+        # Validate foundation_config
+        ModelDimensionsValidator.validate_foundation_config(
+            foundation_config,
+            n_features=obs_space['market'].shape[1] if hasattr(obs_space, 'spaces') and 'market' in obs_space.spaces else None,
+            window_size=config.window_size,
+        )
+        
+        # Validate observation space compatibility
+        if hasattr(obs_space, 'spaces') and 'market' in obs_space.spaces:
+            market_n_features = obs_space['market'].shape[1]
+            ModelDimensionsValidator.validate_observation_space_compatibility(
+                observation_space_n_features=market_n_features,
+                expected_n_features=None,
+                use_film=market_n_features >= 5  # HMM_CONTEXT_SIZE
+            )
 
     print(f"      Encoder: {config.encoder_path}")
     print(f"      Frozen: {config.freeze_encoder}")
@@ -628,13 +695,12 @@ def train(
     else:
         print("      Action Noise: N/A (gSDE active)")
 
+    # ==================== Policy Setup (needed for resume validation) ====================
+    policy_kwargs = create_policy_kwargs(config, foundation_config=foundation_config)
+    
     # ==================== Model Creation ====================
     # Use custom name for TensorBoard if provided
     tb_log_name = config.name if config.name else "TQC"
-
-    # Determine resume path: explicit resume_path takes precedence
-    effective_resume_path = resume_path if resume_path and os.path.exists(resume_path) else config.load_model_path
-    is_resume = effective_resume_path is not None
 
     if effective_resume_path:
         # ========== RESUME MODE ==========
@@ -647,6 +713,29 @@ def train(
             device=DEVICE,
             tensorboard_log=config.tensorboard_log,
         )
+        
+        # Validate model dimensions compatibility
+        # Check if feature extractor has expected dimensions
+        if hasattr(model.policy, 'features_extractor'):
+            extractor = model.policy.features_extractor
+            if hasattr(extractor, 'mae') and hasattr(extractor, 'mae_input_dim'):
+                # Validate MAE dimensions match expected config
+                # Use provided foundation_config or fallback to default
+                if foundation_config is None:
+                    foundation_config = DEFAULT_FOUNDATION_CONFIG
+                expected_config = foundation_config
+                
+                # Validate observation space matches
+                if hasattr(train_env, 'observation_space') and hasattr(train_env.observation_space, 'spaces'):
+                    market_n_features = train_env.observation_space['market'].shape[1]
+                    ModelDimensionsValidator.validate_observation_space_compatibility(
+                        observation_space_n_features=market_n_features,
+                        expected_n_features=None,
+                        use_film=market_n_features >= 5
+                    )
+                
+                print(f"      ✓ Model dimensions validated: d_model={extractor.d_model}, "
+                      f"features_dim={extractor.features_dim}")
         
         # Validate spectral normalization compatibility (if model loaded successfully)
         # Note: If SN config mismatch, TQC.load() may fail with state_dict error before this point

@@ -29,7 +29,7 @@ import shutil
 import argparse
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, List, Dict, Any, Union, Tuple
 
 import numpy as np
@@ -45,6 +45,11 @@ from src.data_engineering.manager import RegimeDetector
 from src.data_engineering.splitter import validate_purge_window
 from src.data_engineering.processor import DataProcessor
 from src.config import WFOTrainingConfig
+from src.config.constants import (
+    DEFAULT_FOUNDATION_CONFIG,
+    FoundationFeatureExtractorConfig,
+    MAEConfig,
+)
 
 
 # =============================================================================
@@ -59,7 +64,38 @@ DEFAULT_EVAL_W_COST = 0.5  # Balanced mode for standard evaluation
 
 @dataclass
 class WFOConfig:
-    """Walk-Forward Optimization configuration."""
+    """
+    Walk-Forward Optimization configuration.
+    
+    Centralizes all configuration for the WFO pipeline including:
+    - Data paths and window sizes
+    - TQC training hyperparameters (via training_config)
+    - Foundation model architecture (via foundation_config)
+    
+    The foundation_config controls the feature extractor architecture:
+    - MAE encoder dimensions (d_model, n_heads, n_layers)
+    - Output features dimension (features_dim)
+    
+    This config flows through the pipeline:
+    1. WFOConfig.foundation_config → train_tqc()
+    2. train_tqc() → train(foundation_config=...)
+    3. train() → create_policy_kwargs(foundation_config=...)
+    4. create_policy_kwargs() → FoundationFeatureExtractor
+    
+    Override via CLI:
+    - --features-dim: Override features_dim (default: 512)
+    - --mae-d-model: Override MAE d_model (default: 256, must match encoder checkpoint)
+    - --mae-n-heads: Override MAE n_heads (default: 4, must match encoder checkpoint)
+    - --mae-n-layers: Override MAE n_layers (default: 2, must match encoder checkpoint)
+    
+    Example:
+        config = WFOConfig()
+        # Override features_dim
+        config.foundation_config = replace(
+            config.foundation_config,
+            features_dim=1024
+        )
+    """
 
     # Data
     raw_data_path: str = "data/raw_historical/multi_asset_historical.csv"
@@ -92,6 +128,13 @@ class WFOConfig:
     # This ensures single source of truth and eliminates config divergence.
     # See docs/design/WFO_CONFIG_RATIONALE.md for parameter rationale.
     training_config: WFOTrainingConfig = field(default_factory=WFOTrainingConfig)
+    
+    # === Foundation Model Architecture Configuration ===
+    # Centralizes feature extractor configs (MAE + features_dim) to prevent mismatches.
+    # This ensures encoder compatibility and allows CLI overrides (e.g., --features-dim).
+    foundation_config: FoundationFeatureExtractorConfig = field(
+        default_factory=lambda: DEFAULT_FOUNDATION_CONFIG
+    )
 
     # Columns to exclude from scaling
     exclude_from_scaling: List[str] = field(default_factory=lambda: [
@@ -597,9 +640,20 @@ class WFOPipeline:
         """
         Train TQC agent on segment train data with optional in-train evaluation.
 
+        This method orchestrates TQC training for a single WFO segment:
+        1. Validates encoder compatibility with foundation_config
+        2. Creates training config with segment-specific paths
+        3. Calls train() with foundation_config from WFOConfig
+        4. Handles resume/warm-start logic
+
+        The foundation_config from self.config.foundation_config is passed to train(),
+        ensuring that the feature extractor architecture matches the WFO configuration.
+        This allows CLI overrides (--features-dim, --mae-d-model, etc.) to propagate
+        through the entire training pipeline.
+
         Args:
             train_path: Path to train data parquet.
-            encoder_path: Path to encoder weights.
+            encoder_path: Path to encoder weights (MAE checkpoint).
             segment_id: Segment identifier.
             use_batch_env: If True, use GPU-accelerated BatchCryptoEnv.
             resume: If True, resume from tqc_last.zip (continues TensorBoard steps).
@@ -609,6 +663,12 @@ class WFOPipeline:
 
         Returns:
             Tuple of (path to saved agent, training metrics dict).
+
+        Note:
+            The encoder_path checkpoint must match foundation_config.mae_config dimensions
+            (d_model, n_heads, n_layers). This is validated before training starts.
+            If validation fails, a warning is printed but training continues (validation
+            may be conservative and miss some edge cases).
         """
         env_type = "BatchCryptoEnv (GPU)" if use_batch_env else "SubprocVecEnv (CPU)"
         print(f"\n[Segment {segment_id}] Training TQC with {env_type}...")
@@ -616,7 +676,6 @@ class WFOPipeline:
         # Import here to avoid circular imports
         import torch
         from src.training.train_agent import train
-        from dataclasses import replace
 
         # Use WFOTrainingConfig from centralized config (no hardcodes!)
         # This ensures single source of truth for all TQC hyperparameters.
@@ -678,13 +737,26 @@ class WFOPipeline:
             resume_path = init_model_path
             print(f"  🔗 WARM START: Inheriting from {os.path.basename(init_model_path)}")
 
+        # Validate encoder compatibility with foundation_config before training
+        from src.config.validators import ModelDimensionsValidator
+        try:
+            ModelDimensionsValidator.validate_encoder_compatibility(
+                encoder_path=encoder_path,
+                foundation_config=self.config.foundation_config,
+            )
+            print(f"  ✓ Encoder compatibility validated")
+        except Exception as e:
+            print(f"  ⚠️ Encoder validation warning: {e}")
+            print(f"  Continuing anyway (validation may be conservative)...")
+
         model = None
         try:
             model, train_metrics = train(
                 config,
                 hw_overrides=hw_overrides,
                 use_batch_env=use_batch_env,
-                resume_path=resume_path
+                resume_path=resume_path,
+                foundation_config=self.config.foundation_config,  # Pass foundation config
             )
             print(f"  TQC trained. Saved: {config.save_path}")
 
@@ -2410,6 +2482,24 @@ def main():
                         help="OOS test window in months (default: 3)")
     parser.add_argument("--step-months", type=int, default=WFOConfig.step_months,
                         help="Rolling step in months (default: 3)")
+    
+    # === Foundation Model Architecture Overrides ===
+    # These arguments allow overriding the foundation model architecture.
+    # WARNING: MAE parameters (d_model, n_heads, n_layers) MUST match the encoder checkpoint
+    # or training will fail with dimension mismatch errors.
+    # The encoder compatibility is validated before training starts.
+    parser.add_argument("--features-dim", type=int, default=None,
+                        help="Override features_dim for FoundationFeatureExtractor (default: 512). "
+                             "This controls the output dimension of the feature extractor.")
+    parser.add_argument("--mae-d-model", type=int, default=None,
+                        help="Override MAE d_model (default: 256, must match encoder checkpoint). "
+                             "WARNING: Must match the encoder checkpoint or validation will fail.")
+    parser.add_argument("--mae-n-heads", type=int, default=None,
+                        help="Override MAE n_heads (default: 4, must match encoder checkpoint). "
+                             "WARNING: Must match the encoder checkpoint or validation will fail.")
+    parser.add_argument("--mae-n-layers", type=int, default=None,
+                        help="Override MAE n_layers (default: 2, must match encoder checkpoint). "
+                             "WARNING: Must match the encoder checkpoint or validation will fail.")
     parser.add_argument("--eval-only", action="store_true",
                         help="Re-run evaluation only (skip MAE/TQC training)")
     parser.add_argument("--eval-segments", type=str, default=None,
@@ -2472,6 +2562,31 @@ def main():
     config.eval_months = args.eval_months
     config.test_months = args.test_months
     config.step_months = args.step_months
+    
+    # === Foundation Model Architecture Overrides ===
+    if args.features_dim is not None:
+        from dataclasses import replace
+        config.foundation_config = replace(
+            config.foundation_config,
+            features_dim=args.features_dim
+        )
+        print(f"[INFO] Foundation features_dim: {args.features_dim}")
+    
+    if args.mae_d_model is not None or args.mae_n_heads is not None or args.mae_n_layers is not None:
+        from dataclasses import replace
+        mae_config = config.foundation_config.mae_config
+        new_mae_config = replace(
+            mae_config,
+            d_model=args.mae_d_model if args.mae_d_model is not None else mae_config.d_model,
+            n_heads=args.mae_n_heads if args.mae_n_heads is not None else mae_config.n_heads,
+            n_layers=args.mae_n_layers if args.mae_n_layers is not None else mae_config.n_layers,
+        )
+        config.foundation_config = replace(
+            config.foundation_config,
+            mae_config=new_mae_config
+        )
+        print(f"[INFO] MAE config: d_model={new_mae_config.d_model}, "
+              f"n_heads={new_mae_config.n_heads}, n_layers={new_mae_config.n_layers}")
     # Default to GPU (True) unless explicitly disabled via CLI
     # This prevents accidental CPU runs which are 100x slower
     if args.no_batch_env:

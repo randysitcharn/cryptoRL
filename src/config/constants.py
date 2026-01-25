@@ -5,6 +5,7 @@ constants.py - Shared constants for cryptoRL.
 Centralizes column definitions to ensure consistency across modules.
 """
 
+from dataclasses import dataclass, field
 from typing import List
 
 # =============================================================================
@@ -103,6 +104,7 @@ HMM_CONTEXT_COLS: List[str] = [
     'HMM_Prob_0', 'HMM_Prob_1', 'HMM_Prob_2',
     'HMM_Prob_3', 'HMM_Entropy',
 ]
+HMM_CONTEXT_SIZE: int = len(HMM_CONTEXT_COLS)  # 5 (4 probabilities + 1 entropy)
 
 # =============================================================================
 # MAE Architecture (Single Source of Truth)
@@ -122,3 +124,58 @@ MAE_DROPOUT: float = 0.1
 # 0.0 gives std=1.0 (Shock Therapy: exploration maximale de l'espace [-1, 1])
 # Previous: -1.0 gave std≈0.37 (vs SB3 default -3 giving std≈0.05)
 DEFAULT_LOG_STD_INIT: float = 0.0
+
+# =============================================================================
+# Model Architecture Configurations (Dataclasses)
+# =============================================================================
+# These dataclasses centralize all model dimensions to prevent mismatches.
+# All model components should use these configurations instead of hardcoded values.
+
+
+@dataclass(frozen=True)
+class MAEConfig:
+    """
+    Configuration for the MAE (Masked Auto-Encoder) model.
+    
+    These values MUST match the pre-trained checkpoint.
+    Changing these = re-pre-train the MAE.
+    """
+    d_model: int = MAE_D_MODEL  # 256
+    n_heads: int = MAE_N_HEADS  # 4
+    n_layers: int = MAE_N_LAYERS  # 2
+    dim_feedforward: int = MAE_DIM_FEEDFORWARD  # 1024 (4 * d_model)
+    dropout: float = MAE_DROPOUT  # 0.1
+
+
+@dataclass(frozen=True)
+class TransformerFeatureExtractorConfig:
+    """
+    Configuration for TransformerFeatureExtractor (standalone, without MAE).
+    
+    Used when training RL agents without a pre-trained foundation model.
+    Smaller dimensions (d_model=32) to prevent overfitting in low data regime.
+    """
+    d_model: int = 32
+    n_heads: int = 2
+    n_layers: int = 1
+    dim_feedforward: int = 64
+    features_dim: int = 256
+    dropout: float = 0.1
+
+
+@dataclass(frozen=True)
+class FoundationFeatureExtractorConfig:
+    """
+    Configuration for FoundationFeatureExtractor (with pre-trained MAE).
+    
+    Uses MAE encoder as feature extractor, with FiLM modulation for HMM context.
+    The MAE dimensions are explicitly composed via mae_config (no implicit inheritance).
+    """
+    mae_config: MAEConfig = field(default_factory=MAEConfig)  # Explicit composition
+    features_dim: int = 512
+
+
+# Default configuration instances (single source of truth)
+DEFAULT_MAE_CONFIG: MAEConfig = MAEConfig()
+DEFAULT_TRANSFORMER_CONFIG: TransformerFeatureExtractorConfig = TransformerFeatureExtractorConfig()
+DEFAULT_FOUNDATION_CONFIG: FoundationFeatureExtractorConfig = FoundationFeatureExtractorConfig()
