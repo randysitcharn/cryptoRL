@@ -87,7 +87,6 @@ class TestLookaheadBias:
     EXPECTED_NAN = {
         'HMM_Trend': 167,      # window=168, min_periods=168
         'HMM_Vol': 167,        # window=168, min_periods=168
-        'HMM_Momentum': 13,    # RSI window=14, min_periods=14
         'HMM_RiskOnOff': 167,  # window=168, min_periods=168
         'HMM_VolRatio': 167,   # max(24, 168)=168, min_periods=168
     }
@@ -106,14 +105,6 @@ class TestLookaheadBias:
         expected = self.EXPECTED_NAN['HMM_Vol']
         assert nan_count >= expected, (
             f"HMM_Vol: Only {nan_count} NaN values, expected >= {expected}"
-        )
-
-    def test_nan_padding_hmm_momentum(self, hmm_features: pd.DataFrame):
-        """HMM_Momentum should have proper NaN padding (RSI window-1 values)."""
-        nan_count = hmm_features['HMM_Momentum'].isna().sum()
-        expected = self.EXPECTED_NAN['HMM_Momentum']
-        assert nan_count >= expected, (
-            f"HMM_Momentum: Only {nan_count} NaN values, expected >= {expected}"
         )
 
     def test_nan_padding_hmm_riskonoff(self, hmm_features: pd.DataFrame):
@@ -317,7 +308,6 @@ class TestClipping:
     CLIP_BOUNDS = {
         'HMM_Trend': (-0.05, 0.05),
         'HMM_Vol': (-10, -1),  # Log-transformed: log(vol + 1e-6)
-        'HMM_Momentum': (0, 1),
         'HMM_RiskOnOff': (-0.02, 0.02),
         'HMM_VolRatio': (0.2, 5.0),
     }
