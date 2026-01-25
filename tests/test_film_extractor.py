@@ -55,6 +55,7 @@ def test_foundation_feature_extractor_film_dry_run() -> None:
             dtype=np.float32,
         ),
         "position": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        "w_cost": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
     })
 
     extractor = FoundationFeatureExtractor(
@@ -71,6 +72,7 @@ def test_foundation_feature_extractor_film_dry_run() -> None:
     dummy_obs = {
         "market": torch.randn(batch_size, seq_len, n_features, dtype=torch.float32),
         "position": torch.randn(batch_size, 1, dtype=torch.float32).clamp(-1.0, 1.0),
+        "w_cost": torch.rand(batch_size, 1, dtype=torch.float32),
     }
     out = extractor(dummy_obs)
 
@@ -92,6 +94,7 @@ def test_foundation_feature_extractor_film_sensitivity() -> None:
             dtype=np.float32,
         ),
         "position": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        "w_cost": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
     })
 
     extractor = FoundationFeatureExtractor(
@@ -105,12 +108,14 @@ def test_foundation_feature_extractor_film_sensitivity() -> None:
     base_obs = {
         "market": torch.randn(batch_size, seq_len, n_features, dtype=torch.float32),
         "position": torch.randn(batch_size, 1, dtype=torch.float32).clamp(-1.0, 1.0),
+        "w_cost": torch.rand(batch_size, 1, dtype=torch.float32),
     }
     out1 = extractor(base_obs)
 
     pert_obs = {
         "market": base_obs["market"].clone(),
         "position": base_obs["position"].clone(),
+        "w_cost": base_obs["w_cost"].clone(),
     }
     pert_obs["market"][:, -1, -HMM_CONTEXT_SIZE:] += 1.0
     out2 = extractor(pert_obs)
@@ -133,6 +138,7 @@ def test_foundation_feature_extractor_no_film_when_few_features() -> None:
             dtype=np.float32,
         ),
         "position": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        "w_cost": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
     })
 
     extractor = FoundationFeatureExtractor(
@@ -149,6 +155,7 @@ def test_foundation_feature_extractor_no_film_when_few_features() -> None:
     dummy_obs = {
         "market": torch.randn(batch_size, seq_len, n_features, dtype=torch.float32),
         "position": torch.randn(batch_size, 1, dtype=torch.float32).clamp(-1.0, 1.0),
+        "w_cost": torch.rand(batch_size, 1, dtype=torch.float32),
     }
     out = extractor(dummy_obs)
     assert out.shape == (batch_size, features_dim)

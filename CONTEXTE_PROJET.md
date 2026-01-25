@@ -137,18 +137,18 @@ WFO Pipeline (run_full_wfo.py)
 
 | Propriété | Valeur |
 |-----------|--------|
-| Host | `158.51.110.52` |
-| Port | `20941` |
+| Host | `86.127.245.129` |
+| Port | `25083` |
 | User | `root` |
 | Provider | vast.ai |
 | TensorBoard | Port 8081 |
 
 **Connexion:**
 ```bash
-ssh -p 20941 root@158.51.110.52
+ssh -p 25083 root@86.127.245.129
 
 # Tunnel TensorBoard
-ssh -p 20941 -L 8081:localhost:8081 root@158.51.110.52
+ssh -p 25083 -L 8081:localhost:8081 root@86.127.245.129
 ```
 
 ---

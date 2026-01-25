@@ -46,6 +46,7 @@ def main() -> None:
             shape=(1,),
             dtype=np.float32,
         ),
+        "w_cost": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
     })
 
     print("[1/3] Instantiating FoundationFeatureExtractor (with FiLM)...")
@@ -64,6 +65,7 @@ def main() -> None:
     dummy_obs = {
         "market": torch.randn(batch_size, seq_len, n_features, dtype=torch.float32),
         "position": torch.randn(batch_size, 1, dtype=torch.float32).clamp(-1.0, 1.0),
+        "w_cost": torch.rand(batch_size, 1, dtype=torch.float32),
     }
     out = extractor(dummy_obs)
 
@@ -82,6 +84,7 @@ def main() -> None:
     obs2 = {
         "market": dummy_obs["market"].clone(),
         "position": dummy_obs["position"].clone(),
+        "w_cost": dummy_obs["w_cost"].clone(),
     }
     # Perturb last 5 columns (HMM context) at last timestep
     obs2["market"][:, -1, -HMM_CONTEXT_SIZE:] += 1.0

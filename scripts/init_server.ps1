@@ -8,8 +8,8 @@ param(
     [switch]$SkipData,
     [switch]$SkipTensorBoard,
     [switch]$OnlyTensorBoard,
-    [string]$ServerHost = "212.93.107.107",
-    [string]$ServerPort = "40075",
+    [string]$ServerHost = "172.219.157.164",
+    [string]$ServerPort = "21130",
     [string]$ServerUser = "root"
 )
 
@@ -25,6 +25,7 @@ if ($OnlyTensorBoard) {
 $SSH_HOST = $ServerHost
 $SSH_PORT = $ServerPort
 $SSH_USER = $ServerUser
+$SSH_KEY = "$env:USERPROFILE\.ssh\id_ed25519"
 $WORKSPACE = "/workspace"
 $KNOWN_HOSTS = "$env:USERPROFILE\.ssh\known_hosts"
 $SSH_CONFIG = "$env:USERPROFILE\.ssh\config"
@@ -41,9 +42,11 @@ Write-Host "User: $SSH_USER"
 Write-Host ""
 
 # Fonction pour executer une commande sur le serveur
+# Utilise directement ssh avec les parametres du serveur
+# -o LogLevel=ERROR supprime le banner "Welcome to vast.ai"
 function Invoke-SSHCommand {
     param([string]$Command)
-    ssh -p $SSH_PORT "$SSH_USER@$SSH_HOST" $Command
+    ssh -o LogLevel=ERROR -p $SSH_PORT "${SSH_USER}@${SSH_HOST}" $Command
 }
 
 # ============================================================================
@@ -62,25 +65,48 @@ if (-not $SkipSSHSetup) {
             $_ -notmatch "^\[?185\.203\." -and
             $_ -notmatch "^\[?64\.71\." -and
             $_ -notmatch "^\[?216\.73\." -and
+            $_ -notmatch "^\[?86\.127\." -and
+            $_ -notmatch "^\[?74\.48\." -and
             $_ -notmatch "vast"
         }
         $content | Set-Content $KNOWN_HOSTS
         Write-Host "  [OK] Anciens serveurs Vast supprimes" -ForegroundColor Green
     }
 
-    # 0b. Scanner et ajouter la cle du nouveau serveur
+    # 0b. Scanner et ajouter la cle du nouveau serveur (avec retry)
     Write-Host "  -> Ajout de la cle SSH du serveur..." -ForegroundColor Gray
-    $keyScan = ssh-keyscan -p $SSH_PORT $SSH_HOST 2>$null
-    if ($keyScan) {
-        $keyScan | Add-Content $KNOWN_HOSTS
-        Write-Host "  [OK] Cle SSH ajoutee au known_hosts" -ForegroundColor Green
-    } else {
-        Write-Host "  [ERREUR] Impossible de scanner la cle SSH" -ForegroundColor Red
-        exit 1
+    $maxRetries = 5
+    $retryDelay = 3  # secondes
+    $keyScan = $null
+    
+    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+        if ($attempt -gt 1) {
+            Write-Host "  -> Tentative $attempt/$maxRetries..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $retryDelay
+        }
+        
+        $keyScan = ssh-keyscan -p $SSH_PORT $SSH_HOST 2>$null
+        if ($keyScan) {
+            $keyScan | Add-Content $KNOWN_HOSTS
+            Write-Host "  [OK] Cle SSH ajoutee au known_hosts" -ForegroundColor Green
+            break
+        }
+    }
+    
+    if (-not $keyScan) {
+        Write-Host "  [WARN] Impossible de scanner la cle SSH apres $maxRetries tentatives" -ForegroundColor Yellow
+        Write-Host "  -> Le script continue, la cle sera ajoutee lors de la premiere connexion" -ForegroundColor Cyan
     }
 
     # 0c. Creer/Mettre a jour le raccourci "vast" dans ~/.ssh/config
     Write-Host "  -> Configuration du raccourci 'vast'..." -ForegroundColor Gray
+
+    # Creer le dossier controlmasters pour SSH multiplexing
+    $controlMastersDir = "$env:USERPROFILE\.ssh\controlmasters"
+    if (-not (Test-Path $controlMastersDir)) {
+        New-Item -Path $controlMastersDir -ItemType Directory -Force | Out-Null
+        Write-Host "  -> Dossier controlmasters cree" -ForegroundColor Gray
+    }
 
     # S'assurer que le fichier config existe
     if (-not (Test-Path $SSH_CONFIG)) {
@@ -95,21 +121,54 @@ if (-not $SkipSSHSetup) {
     $configContent = $configContent -replace "(?ms)Host vast\r?\n.*?(?=\r?\nHost |\z)", ""
     $configContent = $configContent.Trim()
 
-    # Ajouter le nouveau bloc
+    # Ajouter le nouveau bloc avec options SSH multiplexing
     $vastConfig = @"
 
 Host vast
     HostName $SSH_HOST
     Port $SSH_PORT
     User $SSH_USER
+    IdentityFile ~/.ssh/id_ed25519
     StrictHostKeyChecking no
     UserKnownHostsFile ~/.ssh/known_hosts
+    ControlMaster auto
+    ControlPath ~/.ssh/controlmasters/%r@%h:%p
+    ControlPersist 10m
 "@
 
     $configContent = $configContent + "`n" + $vastConfig
     $configContent | Set-Content $SSH_CONFIG
 
-    Write-Host "  [OK] Raccourci 'vast' configure (ssh vast)" -ForegroundColor Green
+    Write-Host "  [OK] Raccourci 'vast' configure pour Windows (ssh vast)" -ForegroundColor Green
+
+    # 0d. Configurer aussi WSL si disponible
+    Write-Host "  -> Configuration du raccourci 'vast' pour WSL..." -ForegroundColor Gray
+    $wslConfigCmd = @"
+mkdir -p ~/.ssh/controlmasters 2>/dev/null
+if [ -f ~/.ssh/config ]; then
+    # Supprimer l'ancien bloc Host vast
+    sed -i '/^Host vast$/,/^$/d' ~/.ssh/config
+fi
+cat >> ~/.ssh/config << 'VAST_CONFIG_EOF'
+
+Host vast
+    HostName $SSH_HOST
+    Port $SSH_PORT
+    User $SSH_USER
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/controlmasters/%r@%h:%p
+    ControlPersist 10m
+VAST_CONFIG_EOF
+"@
+    
+    $wslResult = wsl bash -c $wslConfigCmd 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  [OK] Raccourci 'vast' configure pour WSL" -ForegroundColor Green
+    } else {
+        Write-Host "  [INFO] WSL non disponible ou erreur de configuration (non critique)" -ForegroundColor Yellow
+    }
+    
     Write-Host ""
 } else {
     Write-Host "[0/10] Configuration SSH... SKIP" -ForegroundColor DarkGray
@@ -124,8 +183,42 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "[OK] Connexion reussie" -ForegroundColor Green
 } else {
     Write-Host "[ERREUR] Echec de connexion" -ForegroundColor Red
+    Write-Host "  -> Verifiez que le serveur est accessible et que le port $SSH_PORT est ouvert" -ForegroundColor Yellow
     exit 1
 }
+
+# ============================================================================
+# ETAPE 1b: Configuration GitHub SSH sur le serveur
+# ============================================================================
+Write-Host ""
+Write-Host "[1b/10] Configuration GitHub SSH sur le serveur..." -ForegroundColor Yellow
+$GITHUB_KEY = "$env:USERPROFILE\.ssh\id_github"
+$GITHUB_KEY_PUB = "$env:USERPROFILE\.ssh\id_github.pub"
+
+# Verifier si la cle GitHub existe deja sur le serveur
+Invoke-SSHCommand 'test -f ~/.ssh/id_github'
+$keyExistsOnServer = ($LASTEXITCODE -eq 0)
+
+if ($keyExistsOnServer) {
+    Write-Host "  [OK] Cle GitHub deja presente sur le serveur" -ForegroundColor Green
+} elseif ((Test-Path $GITHUB_KEY) -and (Test-Path $GITHUB_KEY_PUB)) {
+    # Copier les cles GitHub sur le serveur
+    Write-Host "  -> Copie de la cle GitHub..." -ForegroundColor Gray
+    scp -o LogLevel=ERROR -P $SSH_PORT $GITHUB_KEY "${SSH_USER}@${SSH_HOST}:~/.ssh/id_github"
+    scp -o LogLevel=ERROR -P $SSH_PORT $GITHUB_KEY_PUB "${SSH_USER}@${SSH_HOST}:~/.ssh/id_github.pub"
+    Invoke-SSHCommand "chmod 600 ~/.ssh/id_github && chmod 644 ~/.ssh/id_github.pub"
+    Write-Host "  [OK] Cle GitHub copiee" -ForegroundColor Green
+} else {
+    Write-Host "  [WARN] Cle GitHub locale non trouvee ($GITHUB_KEY)" -ForegroundColor Yellow
+    Write-Host "  -> Le clone via SSH GitHub peut echouer" -ForegroundColor Yellow
+}
+
+# Configurer SSH pour GitHub (toujours verifier)
+Write-Host "  -> Configuration SSH pour GitHub..." -ForegroundColor Gray
+Invoke-SSHCommand "grep -q 'Host github.com' ~/.ssh/config 2>/dev/null || echo -e 'Host github.com\n    HostName github.com\n    User git\n    IdentityFile ~/.ssh/id_github\n    StrictHostKeyChecking no' >> ~/.ssh/config"
+Invoke-SSHCommand "chmod 600 ~/.ssh/config 2>/dev/null"
+Invoke-SSHCommand "grep -q github.com ~/.ssh/known_hosts 2>/dev/null || ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null"
+Write-Host "  [OK] GitHub SSH configure" -ForegroundColor Green
 
 # ============================================================================
 # ETAPE 2: Verifier Python
@@ -157,11 +250,13 @@ Write-Host "[OK] Workspace pret" -ForegroundColor Green
 if (-not $SkipClone) {
     Write-Host ""
     Write-Host "[5/10] Verification du repository..." -ForegroundColor Yellow
-    $repoExists = Invoke-SSHCommand 'test -d /workspace/cryptoRL && echo exists || echo not_exists'
+    # Verifier si .git existe (pas juste le dossier) - utiliser exit code
+    Invoke-SSHCommand 'test -d /workspace/cryptoRL/.git'
+    $repoIsGit = ($LASTEXITCODE -eq 0)
     $skipCloneStep = $false
 
-    if ($repoExists -match "exists") {
-        Write-Host "[ATTENTION] Le repository existe deja" -ForegroundColor Yellow
+    if ($repoIsGit) {
+        Write-Host "[INFO] Le repository existe deja" -ForegroundColor Cyan
         $response = Read-Host "Voulez-vous le supprimer et le cloner a nouveau? (y/N)"
         if ($response -eq "y" -or $response -eq "Y") {
             Invoke-SSHCommand "rm -rf $WORKSPACE/cryptoRL"
@@ -179,7 +274,14 @@ if (-not $SkipClone) {
     if (-not $skipCloneStep) {
         Write-Host ""
         Write-Host "[6/10] Clone du repository GitHub..." -ForegroundColor Yellow
-        Write-Host "[ATTENTION] Assurez-vous que SSH est configure pour GitHub sur le serveur" -ForegroundColor Yellow
+
+        # Nettoyer le dossier s'il existe mais n'est pas un repo git
+        Invoke-SSHCommand 'test -d /workspace/cryptoRL'
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  -> Nettoyage du dossier existant (pas un repo git)..." -ForegroundColor Gray
+            Invoke-SSHCommand "rm -rf $WORKSPACE/cryptoRL"
+        }
+
         Invoke-SSHCommand "cd $WORKSPACE; git clone git@github.com:randysitcharn/cryptoRL.git"
         if ($LASTEXITCODE -eq 0) {
             Write-Host "[OK] Repository clone" -ForegroundColor Green
@@ -242,7 +344,7 @@ if (-not $SkipData) {
             Invoke-SSHCommand "mkdir -p $REMOTE_DATA"
             # Copier les donnees
             # Copier tout le contenu du dossier
-            scp -P $SSH_PORT -r "${LOCAL_DATA}/" "${SSH_USER}@${SSH_HOST}:${REMOTE_DATA}/"
+            scp -i $SSH_KEY -P $SSH_PORT -r "${LOCAL_DATA}/" "${SSH_USER}@${SSH_HOST}:${REMOTE_DATA}/"
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  [OK] Donnees uploadees" -ForegroundColor Green
             } else {

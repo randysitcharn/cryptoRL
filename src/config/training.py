@@ -76,7 +76,8 @@ class TQCTrainingConfig:
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
     gamma: float = 0.95  # Shorter horizon for faster learning
     tau: float = 0.005
-    ent_coef: Union[str, float] = 0.5  # FIXED entropy to prevent collapse (was "auto_1.0")
+    ent_coef: Union[str, float] = "auto_0.1"  # FIX: Auto-tuning with target 0.1
+                                               # Fixed 0.5 caused exploration issues
     train_freq: int = 1
     gradient_steps: int = 1  # GS=1 with 1024 envs for max diversity
     top_quantiles_to_drop: int = 2
@@ -88,7 +89,9 @@ class TQCTrainingConfig:
 
     # gSDE (State-Dependent Exploration)
     use_sde: bool = True
-    sde_sample_freq: int = -1  # -1 = resample once per episode
+    sde_sample_freq: int = 64  # FIX: Resample every 64 steps (was -1 = once per episode)
+                               # -1 with episode_length=2048 caused policy collapse
+                               # 64 gives fresh exploration noise ~32x per episode
     use_sde_at_warmup: bool = True
     log_std_init: float = DEFAULT_LOG_STD_INIT  # Single source of truth (constants.py)
 
@@ -218,7 +221,8 @@ class WFOTrainingConfig(TQCTrainingConfig):
     buffer_size: int = 2_500_000          # 2.5M replay buffer
     n_envs: int = 1024                    # GPU-optimized (power of 2)
     batch_size: int = 512                 # Smaller batch for more updates
-    ent_coef: Union[str, float] = 0.5  # FIXED entropy to prevent collapse (was "auto_1.0")
+    ent_coef: Union[str, float] = "auto_0.1"  # FIX: Auto-tuning (fixed 0.5 caused collapse)
+    sde_sample_freq: int = 64             # FIX: More frequent resampling
     
     # --- Regularization (aggressive for OOS generalization) ---
     critic_dropout: float = 0.1           # 10% dropout (DroQ max)

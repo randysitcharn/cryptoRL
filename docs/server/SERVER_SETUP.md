@@ -43,8 +43,8 @@ Host vast
 Exemple pour le serveur actuel :
 ```
 Host vast
-    HostName 212.93.107.107
-    Port 40075
+    HostName 86.127.245.129
+    Port 25083
     User root
     IdentityFile ~/.ssh/id_ed25519
     ControlMaster auto

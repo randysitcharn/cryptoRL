@@ -9,11 +9,13 @@ The encoder weights are frozen by default to preserve the learned
 market representations during initial RL training.
 
 Architecture (FiLM + Dict observation space):
-- Input: Dict {"market": (B, 64, 43), "position": (B, 1)}
+- Input: Dict {"market": (B, 64, 43), "position": (B, 1), "w_cost": (B, 1)}
 - Market → MAE Encoder (frozen) → (B, 64, 128)
 - HMM context = last 5 cols of market (4 probs + entropy) → FiLM modulation
-- Modulated embed → Flatten (8192) → Concat(position) → Linear → LeakyReLU
+- Modulated embed → Flatten (8192) → Concat(position, w_cost) → Linear → LeakyReLU
 - Output: (B, features_dim)
+
+FIX 2026-01-25: Added w_cost to forward() to enable MORL conditioning.
 """
 
 import torch
@@ -31,17 +33,18 @@ HMM_CONTEXT_SIZE = 5
 
 class FoundationFeatureExtractor(BaseFeaturesExtractor):
     """
-    Feature extractor using a pre-trained CryptoMAE encoder with FiLM + position.
+    Feature extractor using a pre-trained CryptoMAE encoder with FiLM + position + w_cost.
 
     Accepts Dict observation space with:
     - "market": (seq_len, n_features) market data (last 5 cols = HMM context)
     - "position": (1,) current position
+    - "w_cost": (1,) MORL cost preference parameter
 
     Architecture (Split Input):
     - Technical features (cols 0 to N-5) → MAE Encoder (frozen) → embeddings (B, 64, 128)
     - HMM context = market[:, -1, -5:] (4 probs + entropy) → FiLM modulation
     - FiLM(embeddings, HMM context) → modulated embeddings
-    - Flatten → LayerNorm → Concat(position) → Linear → LeakyReLU
+    - Flatten → LayerNorm → Concat(position, w_cost) → Linear → LeakyReLU
 
     Critical: The MAE receives ONLY technical features (excludes HMM columns) to match
     the pre-trained weights. HMM features are injected via FiLM modulation only.
@@ -64,7 +67,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         Initialize the Foundation Feature Extractor.
 
         Args:
-            observation_space: Dict observation space with "market" and "position".
+            observation_space: Dict observation space with "market", "position", and "w_cost".
             encoder_path: Path to pretrained encoder weights.
             d_model: Transformer model dimension (must match pretrained).
             n_heads: Number of attention heads (must match pretrained).
@@ -79,6 +82,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             f"Expected spaces.Dict, got {type(observation_space)}"
         assert "market" in observation_space.spaces, "Missing 'market' in observation space"
         assert "position" in observation_space.spaces, "Missing 'position' in observation space"
+        assert "w_cost" in observation_space.spaces, "Missing 'w_cost' in observation space"
 
         # Extract dimensions from market observation
         market_space = observation_space["market"]
@@ -90,9 +94,13 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         position_space = observation_space["position"]
         self.position_dim = position_space.shape[0]  # 1
 
-        # Flatten dimension from encoder output + position
+        # w_cost dimension (MORL preference parameter)
+        w_cost_space = observation_space["w_cost"]
+        self.w_cost_dim = w_cost_space.shape[0]  # 1
+
+        # Flatten dimension from encoder output + position + w_cost
         self.market_flatten_dim = self.window_size * d_model  # 64 * 128 = 8192
-        self.total_input_dim = self.market_flatten_dim + self.position_dim  # 8193
+        self.total_input_dim = self.market_flatten_dim + self.position_dim + self.w_cost_dim  # 8194
 
         # FiLM: use HMM context only if we have enough feature columns
         self.use_film = self.n_features >= HMM_CONTEXT_SIZE
@@ -148,18 +156,18 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             )
             print(f"[FoundationFeatureExtractor] FiLM: context_dim={HMM_CONTEXT_SIZE}, feature_dim={d_model} (HMM modulates MAE)")
 
-        # Fusion Projector: market features + position → features_dim
-        # Architecture: Concat(market_flat, position) → Linear → LayerNorm → LeakyReLU
+        # Fusion Projector: market features + position + w_cost → features_dim
+        # Architecture: Concat(market_flat, position, w_cost) → Linear → LayerNorm → LeakyReLU
         # NO TANH to avoid vanishing gradient with TQC's internal Tanh
         self.market_flatten = nn.Flatten()  # (B, 64, 128) → (B, 8192)
         self.market_layernorm = nn.LayerNorm(self.market_flatten_dim)
 
         self.fusion_projection = nn.Sequential(
-            nn.Linear(self.total_input_dim, features_dim),  # 8193 → 512
+            nn.Linear(self.total_input_dim, features_dim),  # 8194 → 512
             nn.LayerNorm(features_dim),
             nn.LeakyReLU(negative_slope=0.01)  # LeakyReLU instead of Tanh
         )
-        print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} → {features_dim} (LeakyReLU, position-aware)")
+        print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} → {features_dim} (LeakyReLU, position+w_cost aware)")
 
     def _load_pretrained_weights(self, encoder_path: str) -> None:
         """
@@ -300,7 +308,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass through the pretrained encoder with position fusion.
+        Forward pass through the pretrained encoder with position and w_cost fusion.
 
         Args:
             observations: Dict with:
@@ -309,13 +317,15 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                     cols N-5 to N are HMM context (→ FiLM)
                   - If use_film=False: all cols go to MAE
                 - "position": (batch, 1) current position
+                - "w_cost": (batch, 1) MORL cost preference parameter
 
         Returns:
             Feature tensor of shape (batch, features_dim).
         """
-        # Extract market data and position from dict
+        # Extract market data, position, and w_cost from dict
         market_obs = observations["market"]    # (B, 64, n_features)
         position = observations["position"]    # (B, 1)
+        w_cost = observations["w_cost"]        # (B, 1) - MORL preference parameter
 
         # 1. SPLIT INPUT: Tech features -> MAE, HMM features -> FiLM
         if self.use_film:
@@ -348,12 +358,12 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         else:
             modulated = encoded
 
-        # 3. Flatten and normalize
+        # 4. Flatten and normalize
         market_flat = self.market_flatten(modulated)  # (B, 8192)
         market_flat = self.market_layernorm(market_flat)
 
-        # 4. Concat with position and project
-        combined = torch.cat([market_flat, position], dim=1)  # (B, 8193)
+        # 5. Concat with position AND w_cost, then project
+        combined = torch.cat([market_flat, position, w_cost], dim=1)  # (B, 8194)
         features = self.fusion_projection(combined)  # (B, 512)
 
         return features
@@ -380,6 +390,12 @@ if __name__ == "__main__":
             high=1.0,
             shape=(1,),
             dtype=np.float32
+        ),
+        "w_cost": spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(1,),
+            dtype=np.float32
         )
     })
 
@@ -394,17 +410,19 @@ if __name__ == "__main__":
     batch_size = 4
     dummy_obs = {
         "market": torch.randn(batch_size, seq_len, n_features),
-        "position": torch.randn(batch_size, 1).clamp(-1, 1)  # Position in [-1, 1]
+        "position": torch.randn(batch_size, 1).clamp(-1, 1),
+        "w_cost": torch.rand(batch_size, 1)  # w_cost in [0, 1]
     }
 
     features = extractor(dummy_obs)
 
     print(f"\nMarket input shape:  {dummy_obs['market'].shape}")
     print(f"Position input shape: {dummy_obs['position'].shape}")
+    print(f"w_cost input shape: {dummy_obs['w_cost'].shape}")
     print(f"Output shape: {features.shape}")
     print(f"features_dim: {extractor.features_dim}")
     print(f"Encoder frozen: {extractor.is_frozen}")
-    print(f"Total input dim (market+position): {extractor.total_input_dim}")
+    print(f"Total input dim (market+position+w_cost): {extractor.total_input_dim}")
 
     # Verify output dimension
     expected_dim = 512
@@ -413,10 +431,21 @@ if __name__ == "__main__":
     # Verify position is being used (sanity check)
     dummy_obs2 = {
         "market": dummy_obs["market"].clone(),
-        "position": torch.ones(batch_size, 1)  # Different position
+        "position": torch.ones(batch_size, 1),  # Different position
+        "w_cost": dummy_obs["w_cost"].clone()
     }
     features2 = extractor(dummy_obs2)
     assert not torch.allclose(features, features2), "Position should affect output!"
 
+    # Verify w_cost is being used (sanity check)
+    dummy_obs3 = {
+        "market": dummy_obs["market"].clone(),
+        "position": dummy_obs["position"].clone(),
+        "w_cost": torch.ones(batch_size, 1)  # Different w_cost
+    }
+    features3 = extractor(dummy_obs3)
+    assert not torch.allclose(features, features3), "w_cost should affect output!"
+
     print("\n[OK] FoundationFeatureExtractor test passed!")
     print("[OK] Position injection verified (different position = different output)")
+    print("[OK] w_cost injection verified (different w_cost = different output)")
