@@ -214,7 +214,7 @@ class WFOTrainingConfig(TQCTrainingConfig):
     """
     
     # --- TQC Hyperparameters (WFO-optimized) ---
-    learning_rate: float = 1e-4           # Slow & stable (vs 3e-4 default)
+    learning_rate: float = 3e-4           # Standard TQC (was 1e-4)
     buffer_size: int = 2_500_000          # 2.5M replay buffer
     n_envs: int = 1024                    # GPU-optimized (power of 2)
     batch_size: int = 512                 # Smaller batch for more updates

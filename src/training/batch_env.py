@@ -184,8 +184,8 @@ class BatchCryptoEnv(VecEnv):
         final_order = tech_cols + HMM_CONTEXT_COLS
         feature_cols = final_order
 
-        print(f"[BatchEnv] 🔒 Features Aligned: {len(tech_cols)} Tech + {len(HMM_CONTEXT_COLS)} HMM")
-        print(f"[BatchEnv] 🔍 Last 5 columns (Must be HMM): {feature_cols[-5:]}")
+        print(f"[BatchEnv] Features Aligned: {len(tech_cols)} Tech + {len(HMM_CONTEXT_COLS)} HMM")
+        print(f"[BatchEnv] Last 5 columns (Must be HMM): {feature_cols[-5:]}")
         # --- ALIGNMENT FIX END ---
 
         self.feature_names = feature_cols
