@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 
+from src.config.constants import MAE_D_MODEL, MAE_N_HEADS, MAE_N_LAYERS, MAE_DROPOUT
+
 
 class SinusoidalPositionalEncoding(nn.Module):
     """
@@ -80,11 +82,11 @@ class CryptoMAE(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        d_model: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 2,
+        d_model: int = MAE_D_MODEL,
+        n_heads: int = MAE_N_HEADS,
+        n_layers: int = MAE_N_LAYERS,
         dim_feedforward: Optional[int] = None,
-        dropout: float = 0.1,
+        dropout: float = MAE_DROPOUT,
         max_len: int = 512
     ):
         """

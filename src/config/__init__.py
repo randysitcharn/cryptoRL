@@ -30,6 +30,11 @@ from src.config.constants import (
     DEFAULT_PURGE_WINDOW,
     HMM_FEATURE_PREFIXES,
     HMM_CONTEXT_COLS,
+    MAE_D_MODEL,
+    MAE_N_HEADS,
+    MAE_N_LAYERS,
+    MAE_DIM_FEEDFORWARD,
+    MAE_DROPOUT,
 )
 
 # Training configurations
@@ -58,6 +63,11 @@ __all__ = [
     "DEFAULT_PURGE_WINDOW",
     "HMM_FEATURE_PREFIXES",
     "HMM_CONTEXT_COLS",
+    "MAE_D_MODEL",
+    "MAE_N_HEADS",
+    "MAE_N_LAYERS",
+    "MAE_DIM_FEEDFORWARD",
+    "MAE_DROPOUT",
     # Base configs
     "PathConfig",
     "EnvConfig",

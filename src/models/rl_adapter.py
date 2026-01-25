@@ -24,6 +24,7 @@ from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from typing import Optional, Dict
 
+from src.config.constants import MAE_D_MODEL, MAE_N_HEADS, MAE_N_LAYERS
 from src.models.foundation import CryptoMAE
 from src.models.layers import FiLMLayer
 
@@ -55,9 +56,9 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self,
         observation_space: spaces.Dict,
         encoder_path: str = "weights/pretrained_encoder.pth",
-        d_model: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 2,
+        d_model: int = MAE_D_MODEL,
+        n_heads: int = MAE_N_HEADS,
+        n_layers: int = MAE_N_LAYERS,
         dim_feedforward: Optional[int] = None,
         dropout: float = 0.1,
         freeze_encoder: bool = True,
@@ -99,8 +100,8 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.w_cost_dim = w_cost_space.shape[0]  # 1
 
         # Flatten dimension from encoder output + position + w_cost
-        self.market_flatten_dim = self.window_size * d_model  # 64 * 128 = 8192
-        self.total_input_dim = self.market_flatten_dim + self.position_dim + self.w_cost_dim  # 8194
+        self.market_flatten_dim = self.window_size * d_model
+        self.total_input_dim = self.market_flatten_dim + self.position_dim + self.w_cost_dim
 
         # FiLM: use HMM context only if we have enough feature columns
         self.use_film = self.n_features >= HMM_CONTEXT_SIZE
@@ -163,7 +164,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.market_layernorm = nn.LayerNorm(self.market_flatten_dim)
 
         self.fusion_projection = nn.Sequential(
-            nn.Linear(self.total_input_dim, features_dim),  # 8194 → 512
+            nn.Linear(self.total_input_dim, features_dim),
             nn.LayerNorm(features_dim),
             nn.LeakyReLU(negative_slope=0.01)  # LeakyReLU instead of Tanh
         )

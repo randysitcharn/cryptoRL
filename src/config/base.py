@@ -8,6 +8,8 @@ Provides common settings used across training, tuning, and evaluation.
 from dataclasses import dataclass
 import torch
 
+from src.config.constants import MAE_D_MODEL, MAE_N_HEADS, MAE_N_LAYERS, MAE_DROPOUT
+
 
 # =============================================================================
 # Global Settings
@@ -83,8 +85,8 @@ class EnvConfig:
 class FoundationModelConfig:
     """Foundation model (Transformer encoder) architecture."""
 
-    d_model: int = 128
-    n_heads: int = 4
-    n_layers: int = 2
-    dropout: float = 0.1
+    d_model: int = MAE_D_MODEL
+    n_heads: int = MAE_N_HEADS
+    n_layers: int = MAE_N_LAYERS
+    dropout: float = MAE_DROPOUT
     freeze_encoder: bool = True

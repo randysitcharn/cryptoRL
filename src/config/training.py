@@ -8,7 +8,13 @@ Centralizes all training-related settings for consistency across the codebase.
 from dataclasses import dataclass, field
 from typing import Optional, Union, List, Dict, Callable
 
-from src.config.constants import DEFAULT_LOG_STD_INIT
+from src.config.constants import (
+    DEFAULT_LOG_STD_INIT,
+    MAE_D_MODEL,
+    MAE_N_HEADS,
+    MAE_N_LAYERS,
+    MAE_DROPOUT,
+)
 
 
 
@@ -64,9 +70,9 @@ class TQCTrainingConfig:
     use_spectral_norm_actor: bool = False    # Default False (conservative)
 
     # --- Foundation Model ---
-    d_model: int = 256  # Increased capacity for complex patterns
-    n_heads: int = 4
-    n_layers: int = 2
+    d_model: int = MAE_D_MODEL
+    n_heads: int = MAE_N_HEADS
+    n_layers: int = MAE_N_LAYERS
     freeze_encoder: bool = False  # Shock Therapy: dégel pour fine-tuning end-to-end
 
     # --- TQC Hyperparameters ---
@@ -173,10 +179,10 @@ class FoundationTrainingConfig:
     train_ratio: float = 0.8
 
     # --- Model Architecture ---
-    d_model: int = 256  # Updated to match TQC d_model
-    n_heads: int = 4
-    n_layers: int = 2
-    dropout: float = 0.1
+    d_model: int = MAE_D_MODEL
+    n_heads: int = MAE_N_HEADS
+    n_layers: int = MAE_N_LAYERS
+    dropout: float = MAE_DROPOUT
     mask_ratio: float = 0.15
 
     # --- Training ---

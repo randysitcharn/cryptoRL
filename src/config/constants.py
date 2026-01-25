@@ -105,6 +105,17 @@ HMM_CONTEXT_COLS: List[str] = [
 ]
 
 # =============================================================================
+# MAE Architecture (Single Source of Truth)
+# =============================================================================
+# Ces valeurs DOIVENT correspondre au checkpoint pré-entraîné.
+# Modifier ici = re-pré-entraîner le MAE.
+MAE_D_MODEL: int = 256
+MAE_N_HEADS: int = 4
+MAE_N_LAYERS: int = 2
+MAE_DIM_FEEDFORWARD: int = MAE_D_MODEL * 4  # Standard transformer (1024)
+MAE_DROPOUT: float = 0.1
+
+# =============================================================================
 # RL Training Constants (Single Source of Truth)
 # =============================================================================
 # Default log_std_init for gSDE exploration
