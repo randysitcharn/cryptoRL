@@ -402,19 +402,32 @@ class TQCDropoutPolicy(TQCPolicy):
             **kwargs
         )
 
-    def make_actor(self, features_extractor: Optional[nn.Module] = None) -> DropoutActor:
+    def make_actor(self, features_extractor: Optional[nn.Module] = None):
         """
-        Crée l'actor avec Dropout + LayerNorm.
-        
-        Override de TQCPolicy.make_actor() pour utiliser DropoutActor.
+        Crée l'actor avec Dropout + LayerNorm (version corrigée gSDE).
+
+        Override de TQCPolicy.make_actor() pour utiliser RobustDropoutActor.
         """
+        from src.models.robust_actor import RobustDropoutActor
+
         actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
-        
-        return DropoutActor(
+
+        return RobustDropoutActor(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            net_arch=actor_kwargs['net_arch'],
+            features_dim=actor_kwargs['features_dim'],
+            features_extractor=actor_kwargs['features_extractor'],
+            activation_fn=self.activation_fn,
+            use_sde=actor_kwargs['use_sde'],
+            log_std_init=actor_kwargs['log_std_init'],
+            full_std=actor_kwargs.get('full_std', True),
+            use_expln=actor_kwargs.get('use_expln', False),
+            clip_mean=actor_kwargs.get('clip_mean', 2.0),
+            normalize_images=actor_kwargs.get('normalize_images', True),
             dropout_rate=self.actor_dropout,
             use_layer_norm=self.use_layer_norm,
             use_spectral_norm=self.use_spectral_norm_actor,
-            **actor_kwargs
         ).to(self.device)
 
     def make_critic(self, features_extractor: Optional[nn.Module] = None) -> DropoutCritic:
