@@ -685,7 +685,7 @@ class MORLCurriculumCallback(BaseCallback):
     def __init__(
         self,
         start_cost: float = 0.0,
-        end_cost: float = 0.1,
+        end_cost: float = 0.0,  # DISABLED: No cost penalty (was 0.1)
         progress_ratio: float = 0.5,
         total_timesteps: int = 30_000_000,
         verbose: int = 0
