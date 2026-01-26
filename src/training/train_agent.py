@@ -27,6 +27,7 @@ from src.config import DEVICE, SEED
 from src.config.constants import (
     DEFAULT_FOUNDATION_CONFIG,
     FoundationFeatureExtractorConfig,
+    DEFAULT_MIN_ENT_COEF,
 )
 from src.config.validators import ModelDimensionsValidator
 from src.models.tqc_dropout_policy import TQCDropoutPolicy
@@ -40,6 +41,7 @@ from src.training.callbacks import (
     OverfittingGuardCallback,
     OverfittingGuardCallbackV2,
     ModelEMACallback,
+    EntropyFloorCallback,
 )
 
 
@@ -505,6 +507,18 @@ def create_callbacks(
             verbose=1
         )
         callbacks.append(curriculum_callback)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Entropy Floor Callback (Prevents Entropy Collapse)
+    # Ensures ent_coef stays above minimum threshold during auto-tuning
+    # ═══════════════════════════════════════════════════════════════════════
+    entropy_floor = EntropyFloorCallback(
+        min_ent_coef=DEFAULT_MIN_ENT_COEF,
+        check_freq=5000,
+        verbose=config.verbose
+    )
+    callbacks.append(entropy_floor)
+    print(f"  [Entropy] EntropyFloorCallback enabled (min={DEFAULT_MIN_ENT_COEF})")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Model EMA Callback (Polyak Averaging for Policy Weights)

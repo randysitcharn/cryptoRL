@@ -125,6 +125,10 @@ MAE_DROPOUT: float = 0.1
 # Previous: -1.0 gave std≈0.37 (vs SB3 default -3 giving std≈0.05)
 DEFAULT_LOG_STD_INIT: float = 0.0
 
+# Default minimum entropy coefficient for EntropyFloorCallback
+# Prevents entropy collapse in SAC/TQC auto-tuning
+DEFAULT_MIN_ENT_COEF: float = 0.01
+
 # =============================================================================
 # Model Architecture Configurations (Dataclasses)
 # =============================================================================

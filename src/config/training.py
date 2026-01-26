@@ -82,8 +82,9 @@ class TQCTrainingConfig:
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
     gamma: float = 0.95  # Shorter horizon for faster learning
     tau: float = 0.005
-    ent_coef: Union[str, float] = "auto_0.1"  # FIX: Auto-tuning with target 0.1
-                                               # Fixed 0.5 caused exploration issues
+    ent_coef: Union[str, float] = "auto_0.5"  # FIX: Auto-tuning with target 0.5
+                                               # Increased from 0.1 to prevent entropy collapse
+                                               # EntropyFloorCallback ensures floor at 0.01
     train_freq: int = 1
     gradient_steps: int = 1  # GS=1 with 1024 envs for max diversity
     top_quantiles_to_drop: int = 2
@@ -227,7 +228,9 @@ class WFOTrainingConfig(TQCTrainingConfig):
     buffer_size: int = 2_500_000          # 2.5M replay buffer
     n_envs: int = 1024                    # GPU-optimized (power of 2)
     batch_size: int = 512                 # Smaller batch for more updates
-    ent_coef: Union[str, float] = "auto_0.1"  # FIX: Auto-tuning (fixed 0.5 caused collapse)
+    ent_coef: Union[str, float] = "auto_0.5"  # FIX: Auto-tuning with target 0.5
+                                               # Increased from 0.1 to prevent entropy collapse
+                                               # EntropyFloorCallback ensures floor at 0.01
     sde_sample_freq: int = 64             # FIX: More frequent resampling
     
     # --- Regularization (aggressive for OOS generalization) ---

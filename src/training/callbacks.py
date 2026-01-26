@@ -1397,6 +1397,61 @@ class OverfittingGuardCallbackV2(BaseCallback):
 
 
 # ============================================================================
+# Entropy Floor Callback (Prevents Entropy Collapse)
+# ============================================================================
+
+class EntropyFloorCallback(BaseCallback):
+    """
+    Empêche ent_coef de descendre sous un seuil minimum.
+    
+    Résout le problème d'entropy collapse dans SAC/TQC où l'auto-tuning
+    réduit l'entropie trop agressivement, causant une policy déterministe.
+    
+    Args:
+        min_ent_coef: Valeur minimale de ent_coef (default: 0.01)
+        check_freq: Fréquence de vérification en steps (default: 1000)
+        verbose: Niveau de verbosité (default: 1)
+    """
+    
+    def __init__(self, min_ent_coef: float = 0.01, check_freq: int = 1000, verbose: int = 1):
+        super().__init__(verbose)
+        self.min_ent_coef = min_ent_coef
+        self.check_freq = check_freq
+        self.floor_count = 0
+        self._last_ent_coef = None
+    
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+        
+        # SAC/TQC stocke log(ent_coef) pour la stabilité numérique
+        if not hasattr(self.model, 'log_ent_coef'):
+            return True
+        
+        current_log = self.model.log_ent_coef.item()
+        current_ent = np.exp(current_log)
+        self._last_ent_coef = current_ent
+        
+        # Appliquer le floor si nécessaire
+        if current_ent < self.min_ent_coef:
+            new_log = np.log(self.min_ent_coef)
+            with torch.no_grad():
+                self.model.log_ent_coef.fill_(new_log)
+            
+            self.floor_count += 1
+            if self.verbose > 0:
+                print(f"[EntropyFloor] ent_coef {current_ent:.4f} → {self.min_ent_coef} (floor #{self.floor_count})")
+        
+        # Log pour TensorBoard
+        if self.logger is not None:
+            self.logger.record("entropy/ent_coef_raw", current_ent)
+            self.logger.record("entropy/floor_applied_count", self.floor_count)
+            self.logger.record("entropy/min_ent_coef", self.min_ent_coef)
+        
+        return True
+
+
+# ============================================================================
 # Model EMA Callback (Polyak Averaging)
 # ============================================================================
 
