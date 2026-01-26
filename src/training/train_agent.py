@@ -627,6 +627,111 @@ def create_callbacks(
     return callbacks, unified_callback
 
 
+def ensure_mae_frozen(model: TQC, freeze_encoder: bool = True) -> None:
+    """
+    Ensure MAE encoder is frozen in all networks (actor, critic, critic_target, policy direct).
+    
+    TQC.load() recreates FoundationFeatureExtractor but doesn't restore requires_grad=False
+    state. This function manually re-freezes the encoder to prevent representation degradation.
+    
+    Args:
+        model: TQC model instance
+        freeze_encoder: Whether encoder should be frozen (default: True)
+    """
+    if not freeze_encoder:
+        return
+    
+    seen: set = set()
+    networks_checked = []
+    params_before = 0
+    params_after = 0
+    
+    # Check all possible locations of feature extractors
+    for attr_name in ("features_extractor", "actor", "critic", "critic_target"):
+        sub = getattr(model.policy, attr_name, None)
+        if sub is None:
+            continue
+        
+        # Get the feature extractor (may be nested)
+        extractor = getattr(sub, "features_extractor", sub) if hasattr(sub, "features_extractor") else sub
+        
+        # Check if this is a FoundationFeatureExtractor with MAE encoder
+        if hasattr(extractor, "mae") and hasattr(extractor, "_freeze_encoder"):
+            extractor_id = id(extractor)
+            if extractor_id not in seen:
+                seen.add(extractor_id)
+                networks_checked.append(attr_name)
+                
+                # Count trainable params before freeze
+                if hasattr(extractor, "mae"):
+                    for param in extractor.mae.parameters():
+                        if param.requires_grad:
+                            params_before += param.numel()
+                
+                # Freeze the encoder
+                extractor._freeze_encoder()
+                
+                # Count trainable params after freeze (should be 0)
+                if hasattr(extractor, "mae"):
+                    for param in extractor.mae.parameters():
+                        if param.requires_grad:
+                            params_after += param.numel()
+    
+    if networks_checked:
+        print(f"      [MAE] Re-froze encoder in {len(networks_checked)} network(s): {', '.join(networks_checked)}")
+        if params_before > 0:
+            print(f"      [MAE] Frozen {params_before:,} trainable parameters")
+        if params_after > 0:
+            print(f"      [MAE] WARNING: {params_after:,} parameters still trainable after freeze!")
+    else:
+        print("      [MAE] No FoundationFeatureExtractor found with MAE encoder")
+
+
+def verify_mae_frozen(model: TQC) -> bool:
+    """
+    Verify that no MAE encoder parameters have requires_grad=True.
+    
+    Args:
+        model: TQC model instance
+        
+    Returns:
+        True if all MAE parameters are frozen, False otherwise
+    """
+    seen: set = set()
+    trainable_params = []
+    
+    # Check all possible locations of feature extractors
+    for attr_name in ("features_extractor", "actor", "critic", "critic_target"):
+        sub = getattr(model.policy, attr_name, None)
+        if sub is None:
+            continue
+        
+        # Get the feature extractor (may be nested)
+        extractor = getattr(sub, "features_extractor", sub) if hasattr(sub, "features_extractor") else sub
+        
+        # Check if this is a FoundationFeatureExtractor with MAE encoder
+        if hasattr(extractor, "mae") and hasattr(extractor, "_freeze_encoder"):
+            extractor_id = id(extractor)
+            if extractor_id not in seen:
+                seen.add(extractor_id)
+                
+                # Check all MAE parameters
+                if hasattr(extractor, "mae"):
+                    for name, param in extractor.mae.named_parameters():
+                        if param.requires_grad:
+                            trainable_params.append(f"{attr_name}.{name}")
+    
+    if trainable_params:
+        print(f"      [MAE] WARNING: Found {len(trainable_params)} trainable MAE parameters:")
+        for param_name in trainable_params[:10]:  # Show first 10
+            print(f"        - {param_name}")
+        if len(trainable_params) > 10:
+            print(f"        ... and {len(trainable_params) - 10} more")
+        return False
+    
+    return True
+
+
 def train(
     config: TrainingConfig = None,
     hw_overrides: dict = None,
@@ -816,9 +921,18 @@ def train(
             print(f"\n[ERROR] {e}")
             raise
 
-        # Re-freeze MAE on all feature extractors (DSR triptyque; checkpoint may not persist requires_grad)
+        # PATCH: Re-freeze MAE encoder (SB3 doesn't persist requires_grad state)
         if config.freeze_encoder:
-            _refreeze_mae_extractors(model)
+            print("      [MAE] Re-applying encoder freeze after model load...")
+            ensure_mae_frozen(model, freeze_encoder=config.freeze_encoder)
+            
+            # Verify freeze worked
+            if not verify_mae_frozen(model):
+                raise RuntimeError(
+                    "Failed to freeze MAE encoder after model load. "
+                    "This will cause representation degradation during training."
+                )
+            print("      [MAE] Encoder freeze verified ✓")
 
         # CRITICAL: Cold Start Warmup - fill buffer before training
         model.learning_starts = config.resume_learning_starts

@@ -6,6 +6,11 @@ SSH_PORT=21130
 SSH_USER=root
 ```
 
+**Connexion rapide :**
+```powershell
+ssh -p 21130 root@172.219.157.164
+```
+
 ## IMPORTANT: Convention des logs
 
 **Tous les fichiers de logs doivent être créés dans le dossier `logs/` du projet.**
@@ -40,14 +45,14 @@ L'environnement local peut être :
 2. **Utiliser directement** la commande ssh (la clé est déjà configurée dans l'agent Windows) :
    ```powershell
    # ✅ FONCTIONNE sur Windows/PowerShell
-   ssh -p 25083 root@86.127.245.129 "commande"
+   ssh -p 21130 root@172.219.157.164 "commande"
    ```
 
 3. **Chemin des clés SSH Windows** : `~/.ssh/` se traduit en `C:\Users\<user>\.ssh\`
 
 4. **Guillemets** : Utiliser des guillemets doubles pour les commandes distantes
    ```powershell
-   ssh -p 25083 root@86.127.245.129 "cd /workspace/cryptoRL && python3 script.py"
+   ssh -p 21130 root@172.219.157.164 "cd /workspace/cryptoRL && python3 script.py"
    ```
 
 5. **Pas de `&&` entre commandes locales PowerShell** - utiliser `;` ou des commandes séparées
@@ -56,12 +61,12 @@ L'environnement local peut être :
 
 Si l'agent SSH n'est pas démarré, utiliser :
 ```bash
-eval $(ssh-agent -s) && ssh-add ~/.ssh/id_ed25519 && ssh -p 25083 root@86.127.245.129 "commande"
+eval $(ssh-agent -s) && ssh-add ~/.ssh/id_ed25519 && ssh -p 21130 root@172.219.157.164 "commande"
 ```
 
 Sinon, directement :
 ```bash
-ssh -p 25083 root@86.127.245.129 "commande"
+ssh -p 21130 root@172.219.157.164 "commande"
 ```
 
 ## IMPORTANT: Rate Limiting & SSH Multiplexing (WSL)
@@ -75,8 +80,8 @@ Le multiplexing permet de réutiliser une connexion SSH existante → **pas de r
 **Configuration (déjà faite dans WSL ~/.ssh/config) :**
 ```
 Host vast
-    HostName 86.127.245.129
-    Port 25083
+    HostName 172.219.157.164
+    Port 21130
     User root
     IdentityFile ~/.ssh/id_ed25519
     ControlMaster auto
@@ -110,7 +115,7 @@ wsl bash -c "ssh vast 'cd /workspace/cryptoRL && python3 script.py'"
 
 Pour du travail interactif prolongé :
 ```powershell
-ssh -p 25083 root@86.127.245.129 -t "tmux attach -t ssh_tmux"
+ssh -p 21130 root@172.219.157.164 -t "tmux attach -t ssh_tmux"
 ```
 
 **Raccourcis tmux :**
@@ -134,26 +139,26 @@ ssh host "nohup cmd </dev/null >logs/fichier.log 2>&1 &"
 
 ```powershell
 # Session tmux (recommandé)
-ssh -p 25083 root@86.127.245.129 -t "tmux attach -t ssh_tmux"
+ssh -p 21130 root@172.219.157.164 -t "tmux attach -t ssh_tmux"
 
 # Shell simple
-ssh -p 25083 root@86.127.245.129
+ssh -p 21130 root@172.219.157.164
 ```
 
 ## SCP (copier données)
 
 ```powershell
 # Copier vers le serveur
-scp -P 25083 -r data/raw_historical/ root@86.127.245.129:/workspace/cryptoRL/data/
+scp -P 21130 -r data/raw_historical/ root@172.219.157.164:/workspace/cryptoRL/data/
 
 # Copier depuis le serveur
-scp -P 25083 root@86.127.245.129:/workspace/cryptoRL/results/wfo_results.csv ./
+scp -P 21130 root@172.219.157.164:/workspace/cryptoRL/results/wfo_results.csv ./
 ```
 
 ## Tunnel TensorBoard
 
 ```powershell
-ssh -p 25083 -L 8081:localhost:8081 root@86.127.245.129
+ssh -p 21130 -L 8081:localhost:8081 root@172.219.157.164
 # Ouvrir http://localhost:8081 dans le navigateur
 ```
 

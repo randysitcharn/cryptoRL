@@ -1,42 +1,69 @@
 # CONTEXTE PROJET - CryptoRL
 
-> **Projet:** Reinforcement Learning pour trading de cryptomonnaies  
-> **Dernière mise à jour:** 2026-01-17
+> **Projet:** Reinforcement Learning pour trading de cryptomonnaies
+> **Dernière mise à jour:** 2026-01-26
 
 ---
 
-## 🚀 Démarrage rapide
+## 🚨 Problème actuel: Policy Collapse
 
-### Environnement virtuel
+### Symptômes
+- **Actions fixes:** Le TQC converge vers une position constante (ex: +85% LONG ou -1.4% SHORT)
+- **Action Entropy = 0:** Aucune exploration
+- **Feature Attribution ≈ 0:** Le modèle ignore les inputs (amélioration récente: attribution > 0)
 
-Le projet utilise un environnement virtuel Python. Par défaut, il se trouve dans `venv/` à la racine du projet.
+### Historique des audits
 
-**Créer l'environnement virtuel (si nécessaire):**
-```bash
-python -m venv venv
+| Date | Steps | Position | Attribution | Sharpe | Status |
+|------|-------|----------|-------------|--------|--------|
+| 25/01 | 30M | +85% LONG | 0 | +1.15 | ❌ Collapse |
+| 26/01 | 1M | +4% neutre | 0 | +1.10 | ❌ Collapse |
+| 26/01 | 25M | -1.4% SHORT | **>0** | -2.68 | ⚠️ Attribution OK, collapse |
+
+### Corrections appliquées
+1. **ent_coef:** `auto_0.1` → `auto_0.5` (target entropy plus élevé)
+2. **EntropyFloorCallback:** `min_ent_coef=0.01` (empêche collapse total)
+3. **Commit:** `56fee93`, `3c36fbc`
+
+### Diagnostic gSDE
+```
+log_std mean: -0.039 → std ≈ 0.96 ✅
+Actions std (stochastique): 0.798 ✅
+Actions range: [-0.999, +0.999] ✅
+```
+Le gSDE fonctionne, mais la policy converge vers une action fixe.
+
+---
+
+## 🏗️ Architecture (Split Input + FiLM)
+
+```
+Observation Dict:
+├── market: (B, 64, 55)     # 50 Tech + 5 HMM
+├── position: (B, 1)
+└── w_cost: (B, 1)
+
+FoundationFeatureExtractor:
+├── Split Input:
+│   ├── Tech Features (cols 0-49) → MAE Encoder (frozen, d_model=256)
+│   └── HMM Context (cols 50-54) → FiLM modulation
+├── FiLM: γ, β from HMM context modulate MAE embeddings
+├── Flatten: (B, 64, 256) → (B, 16384)
+├── Concat: [market_flat, position, w_cost] → (B, 16386)
+└── Fusion Projector: Linear(16386 → 512) + LayerNorm + LeakyReLU
 ```
 
-**Activer l'environnement virtuel:**
-
-- **Windows (PowerShell):**
-  ```powershell
-  venv\Scripts\activate
-  ```
-
-- **Windows (CMD):**
-  ```cmd
-  venv\Scripts\activate.bat
-  ```
-
-- **Linux/Mac:**
-  ```bash
-  source venv/bin/activate
-  ```
-
-**Installer les dépendances:**
-```bash
-pip install -r requirements.txt
+### Dimensions MAE (constants.py)
+```python
+MAE_D_MODEL = 256      # DOIT correspondre au checkpoint
+MAE_N_HEADS = 4
+MAE_N_LAYERS = 2
+MAE_DIM_FEEDFORWARD = 1024  # 4 * d_model
 ```
+
+### Validation (validators.py)
+- `ModelDimensionsValidator`: Détecte les mismatches d_model/n_heads/input_dim
+- Erreur claire si checkpoint incompatible avec config
 
 ---
 
@@ -45,91 +72,63 @@ pip install -r requirements.txt
 ```
 cryptoRL/
 ├── data/
-│   ├── processed/              # Données traitées (parquet)
-│   ├── raw/                   # Données brutes
-│   └── raw_historical/         # Données historiques OHLCV
-├── docs/                      # Documentation
-├── logs/                      # Logs d'entraînement
-├── results/                    # Résultats et visualisations
-├── scripts/                   # Scripts d'exécution
-│   └── run_full_wfo.py        # Script principal WFO
+│   ├── wfo/segment_X/         # Données WFO (train/eval/test.parquet)
+│   └── raw_historical/        # Données historiques OHLCV
+├── logs/
+│   └── wfo/segment_X/         # TensorBoard logs
+├── weights/
+│   └── wfo/segment_X/         # Checkpoints (encoder.pth, tqc.zip)
+├── results/
+│   └── tqc_audit/             # Rapports d'audit
+├── scripts/
+│   ├── run_full_wfo.py        # Pipeline WFO principal
+│   └── audit_pipeline.py      # Audits (HMM, MAE, TQC, FiLM)
 ├── src/
-│   ├── config/                # Configuration
-│   ├── data/                   # Chargement des données
-│   ├── data_engineering/      # Feature engineering (FFD, HMM, etc.)
-│   ├── evaluation/            # Évaluation et backtesting
-│   ├── models/                # Modèles (MAE, TQC)
-│   ├── training/              # Infrastructure d'entraînement
-│   └── utils/                 # Utilitaires
-└── tests/                     # Tests unitaires
+│   ├── config/
+│   │   ├── constants.py       # MAE dimensions, HMM_CONTEXT_SIZE
+│   │   ├── training.py        # TQCTrainingConfig, WFOTrainingConfig
+│   │   └── validators.py      # ModelDimensionsValidator
+│   ├── models/
+│   │   ├── foundation.py      # CryptoMAE
+│   │   ├── rl_adapter.py      # FoundationFeatureExtractor + FiLM
+│   │   └── layers.py          # FiLMLayer
+│   └── training/
+│       ├── train_agent.py     # Entraînement TQC
+│       ├── batch_env.py       # BatchCryptoEnv (GPU)
+│       └── callbacks.py       # EntropyFloorCallback, etc.
+└── tests/
+    ├── test_film_extractor.py # Tests FiLM
+    └── test_hmm_features.py   # Tests HMM (look-ahead bias)
 ```
 
 ---
 
-## 🔑 Fichiers principaux
+## ⚙️ Configuration actuelle
 
-| Fichier | Description |
-|---------|-------------|
-| `scripts/run_full_wfo.py` | Orchestration WFO complète (HMM → MAE → TQC → Évaluation) |
-| `src/training/train_agent.py` | Entraînement TQC avec modèle Foundation |
-| `src/training/batch_env.py` | Environnement vectorisé GPU/CPU |
-| `src/models/foundation.py` | Modèle MAE (autoencodeur) |
-| `src/models/rl_adapter.py` | Adaptateur Foundation → TQC |
-
----
-
-## 🏗️ Architecture
-
-```
-WFO Pipeline (run_full_wfo.py)
-├── [1] Chargement données (CSV/Parquet)
-├── [2] Feature engineering (FFD, Z-Score, Parkinson, Garman-Klass)
-├── [3] Détection régimes HMM (4 états)
-├── [4] Pre-training MAE (90 epochs)
-├── [5] Entraînement TQC (BatchCryptoEnv, 54M steps)
-└── [6] Évaluation OOS (backtest fenêtre test)
-```
-
-**Environnement d'entraînement:**
-- `BatchCryptoEnv` (batch_env.py) - GPU/CPU, supporte n_envs=1 pour évaluation
-
-**Callbacks:**
-- `MORLCurriculumCallback` - Curriculum learning progressif (modulation w_cost)
-- `ThreePhaseCurriculumCallback` - ⚠️ OBSOLETE (remplacé par MORLCurriculumCallback)
-- `RotatingCheckpointCallback` - Optimisation disque
-- `UnifiedMetricsCallback` - Logging TensorBoard unifié
-
----
-
-## ⚙️ Configuration
-
-### Paramètres WFO
-
+### WFO Training (WFOTrainingConfig)
 | Paramètre | Valeur |
 |-----------|--------|
-| train_months | 12 (8,640 lignes) |
-| test_months | 3 (2,160 lignes) |
-| step_months | 3 (2,160 lignes) |
-
-### Entraînement
-
-| Paramètre | Valeur |
-|-----------|--------|
-| tqc_timesteps | 30,000,000 |
-| mae_epochs | 90 |
+| timesteps | 25,000,000 |
 | n_envs | 1024 |
-| batch_size | 2048 |
-| learning_rate | 1e-4 |
+| batch_size | 512 |
+| learning_rate | 3e-4 → decay |
 | gamma | 0.95 |
+| ent_coef | `auto_0.5` |
+| sde_sample_freq | 64 |
+| log_std_init | 0.0 (Shock Therapy) |
 
-### Curriculum (MORL)
+### Reward (batch_env.py)
+```
+Mean:   -0.033
+Std:    0.059
+Range:  [-0.39, +0.24]
+```
 
-| Phase | Progression | w_cost | Description |
-|-------|-------------|--------|-------------|
-| Rampe | 0-50% | 0.0 → 0.1 | Introduction progressive des coûts |
-| Plateau | 50-100% | 0.1 (fixe) | Stabilisation |
-
-**Note:** L'ancien système `ThreePhaseCurriculumCallback` (curriculum_lambda) est obsolète. Le nouveau système `MORLCurriculumCallback` module directement `w_cost` dans l'observation (architecture MORL).
+### Callbacks
+- `EntropyFloorCallback`: min_ent_coef=0.01
+- `MORLCurriculumCallback`: w_cost curriculum
+- `RotatingCheckpointCallback`: Optimisation disque
+- `UnifiedMetricsCallback`: TensorBoard logging
 
 ---
 
@@ -137,39 +136,88 @@ WFO Pipeline (run_full_wfo.py)
 
 | Propriété | Valeur |
 |-----------|--------|
-| Host | `86.127.245.129` |
-| Port | `25083` |
+| Host | `172.219.157.164` |
+| Port | `21130` |
 | User | `root` |
 | Provider | vast.ai |
-| TensorBoard | Port 8081 |
 
 **Connexion:**
 ```bash
-ssh -p 25083 root@86.127.245.129
+ssh -p 21130 root@172.219.157.164
 
 # Tunnel TensorBoard
-ssh -p 25083 -L 8081:localhost:8081 root@86.127.245.129
+ssh -p 21130 -L 8081:localhost:8081 root@172.219.157.164
+```
+
+**Script init serveur:** `scripts/init_server.ps1`
+
+---
+
+## 🔧 Commandes utiles
+
+### WFO
+```bash
+# Clean + Launch
+python scripts/run_full_wfo.py --clean
+python scripts/run_full_wfo.py --segment 0 --timesteps 25000000
+
+# Sur serveur (background)
+nohup python3 scripts/run_full_wfo.py --segment 0 --timesteps 25000000 </dev/null >logs/wfo_segment0.log 2>&1 &
+```
+
+### Audit TQC
+```bash
+python -m scripts.audit_pipeline --mode tqc --tqc-segment 0
+```
+
+### Tests
+```bash
+pytest tests/ -v
+python -m scripts.test_film_extractor  # Test FiLM
 ```
 
 ---
 
-## 📊 Architecture MORL
+## 📊 Tests de diagnostic
 
-Le projet utilise une architecture MORL (Multi-Objective Reinforcement Learning) pour gérer l'équilibre entre performance et coûts:
-
+### Test gSDE (exploration)
 ```python
-reward = r_perf + w_cost * r_cost * MAX_PENALTY_SCALE
+# Sur serveur
+python3 -c "
+import torch
+from sb3_contrib import TQC
+model = TQC.load('weights/wfo/segment_0/tqc.zip')
+actor = model.policy.actor
+print(f'log_std mean: {actor.log_std.mean().item():.4f}')
+print(f'std mean: {torch.exp(actor.log_std).mean().item():.4f}')
+"
 ```
 
-où:
-- `r_perf`: Log-returns (objectif performance)
-- `w_cost ∈ [0, 1]`: Paramètre MORL dans l'observation (modulé par `MORLCurriculumCallback`)
-- `MAX_PENALTY_SCALE = 0.4`: Facteur d'échelle des pénalités
+### Test Feature Extractor
+```python
+# Vérifie que MAE, FiLM, position, w_cost fonctionnent
+python -m tests.test_film_extractor
+```
 
-**Curriculum Learning:**
-- `MORLCurriculumCallback` module progressivement `w_cost` de 0.0 (performance pure) à 0.1 (équilibré) sur 50% du training
-- L'agent apprend d'abord à maximiser la performance, puis à équilibrer avec les coûts
+### Test Reward Amplitude
+```python
+# Voir amplitude des rewards après normalisation
+python3 -c "
+from src.training.batch_env import BatchCryptoEnv
+env = BatchCryptoEnv('data/wfo/segment_0/train.parquet', ...)
+# Collecter rewards et afficher stats
+"
+```
 
 ---
 
-*Document simplifié - Pour plus de détails, voir la documentation dans `docs/`*
+## 🎯 Prochaines étapes
+
+1. **Investiguer policy collapse** malgré attribution > 0
+2. **Vérifier critic loss** - Q-values plates?
+3. **Tester reward scaling** - amplitude trop faible?
+4. **Explorer target_entropy** - valeur optimale?
+
+---
+
+*Document mis à jour après audits TQC du 26/01/2026*
