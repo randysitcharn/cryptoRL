@@ -346,21 +346,10 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             print("[FoundationFeatureExtractor] Using randomly initialized encoder")
 
     def _freeze_encoder(self) -> None:
-        """Freeze all encoder parameters (embedding, pos_encoder, encoder)."""
-        # Freeze embedding layer
-        for param in self.mae.embedding.parameters():
+        """Freeze ALL MAE parameters to preserve pretrained representations."""
+        # Freeze ALL MAE parameters (simpler and more robust)
+        for param in self.mae.parameters():
             param.requires_grad = False
-
-        # Freeze positional encoding (already a buffer, but just in case)
-        for param in self.mae.pos_encoder.parameters():
-            param.requires_grad = False
-
-        # Freeze transformer encoder
-        for param in self.mae.encoder.parameters():
-            param.requires_grad = False
-
-        # Freeze mask token (not used in encode, but for consistency)
-        self.mae.mask_token.requires_grad = False
 
         self._is_frozen = True
         print("[FoundationFeatureExtractor] Encoder weights frozen")
@@ -372,16 +361,9 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         Call this after initial RL training to enable end-to-end
         fine-tuning of the entire model.
         """
-        for param in self.mae.embedding.parameters():
+        # Unfreeze ALL MAE parameters
+        for param in self.mae.parameters():
             param.requires_grad = True
-
-        for param in self.mae.pos_encoder.parameters():
-            param.requires_grad = True
-
-        for param in self.mae.encoder.parameters():
-            param.requires_grad = True
-
-        self.mae.mask_token.requires_grad = True
 
         self._is_frozen = False
         print("[FoundationFeatureExtractor] Encoder weights unfrozen for fine-tuning")
