@@ -452,15 +452,16 @@ class BatchCryptoEnv(VecEnv):
         SCALE = 10.0  # Reduced from 100.0 to prevent gradient saturation (Reward Downscaling)
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL CALIBRATION: MAX_PENALTY_SCALE (Reward Rescue - FiLM audit)
-        # Audit: Policy Paralysis — agent stuck in Cash (92%) when penalty too high.
-        # Original 2.0 was too punitive; divide by 5 so agent learns Alpha before Cost.
+        # MORL CALIBRATION: CORRECTIF PENALTY TRAP (26/01/2026)
+        # Avant: MAX_PENALTY_SCALE=0.4, COST_PENALTY_CAP=0.1 (Ratio 80:1 -> Inviable)
+        # Après: MAX_PENALTY_SCALE=0.05, COST_PENALTY_CAP=0.01 (Ratio ~4:1 -> Viable)
+        # Le coût ne doit jamais excéder le bruit de fond du marché pour que l'agent
+        # puisse apprendre l'alpha avant d'optimiser les coûts.
         # ═══════════════════════════════════════════════════════════════════
-        MAX_PENALTY_SCALE = 0.4  # Unchanged (relative): penalty weight in MORL scalarization
+        MAX_PENALTY_SCALE = 0.05  # Réduit de 8x (était 0.4)
 
         # Safety caps to prevent NaN/explosion. Scaled down with SCALE (absolute magnitude).
-        COST_PENALTY_CAP = 0.1  # REDUCED from 2.0 to fix "Cash Trap" (Audit 2026-01-24)
-                                # Ratio Pénalité/Gain: 80:1 → 4:1 (viable pour trading)
+        COST_PENALTY_CAP = 0.01   # Réduit de 10x (était 0.1)
 
         # ═══════════════════════════════════════════════════════════════════
         # 1. OBJECTIVE 1: Performance (Log Returns)

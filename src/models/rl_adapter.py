@@ -210,12 +210,18 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.market_flatten = nn.Flatten()  # (B, 64, 128) → (B, 8192)
         self.market_layernorm = nn.LayerNorm(self.market_flatten_dim)
 
+        # CORRECTIF ARCHITECTURE: MLP plus profond pour éviter que la position n'écrase le market signal
+        # Architecture: 16386 -> 2048 -> 512
         self.fusion_projection = nn.Sequential(
-            nn.Linear(self.total_input_dim, features_dim),
+            nn.Linear(self.total_input_dim, 2048),  # Step intermédiaire
+            nn.LayerNorm(2048),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Dropout(0.1),                        # Légère régularisation
+            nn.Linear(2048, features_dim),          # Projection finale
             nn.LayerNorm(features_dim),
-            nn.LeakyReLU(negative_slope=0.01)  # LeakyReLU instead of Tanh
+            nn.LeakyReLU(negative_slope=0.01)
         )
-        print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} → {features_dim} (LeakyReLU, position+w_cost aware)")
+        print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} -> 2048 -> {features_dim} (Deep Fusion + Dropout)")
 
     def _load_pretrained_weights(
         self,
