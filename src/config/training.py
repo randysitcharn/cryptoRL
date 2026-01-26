@@ -75,7 +75,7 @@ class TQCTrainingConfig:
     d_model: int = MAE_D_MODEL
     n_heads: int = MAE_N_HEADS
     n_layers: int = MAE_N_LAYERS
-    freeze_encoder: bool = False  # Shock Therapy: dégel pour fine-tuning end-to-end
+    freeze_encoder: bool = True  # CRITICAL: MAE must be frozen to preserve pretrained representations
 
     # --- TQC Hyperparameters ---
     total_timesteps: int = 90_000_000  # 90M steps
