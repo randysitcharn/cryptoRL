@@ -14,7 +14,7 @@ import re
 import glob
 import zipfile
 import io
-from typing import Optional, Tuple
+from typing import Optional
 
 from sb3_contrib import TQC
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
@@ -39,7 +39,6 @@ from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
     UnifiedMetricsCallback,
     MORLCurriculumCallback,
-    OverfittingGuardCallback,
     OverfittingGuardCallbackV2,
     ModelEMACallback,
     EntropyFloorCallback,
@@ -233,19 +232,19 @@ def _validate_spectral_norm_compatibility(model: TQC, config: TrainingConfig) ->
     # Only validate if using TQCDropoutPolicy
     if not config.use_dropout_policy:
         return
-    
+
     # Check if policy has SN attributes
     if not hasattr(model.policy, 'use_spectral_norm_critic'):
         return  # Not using TQCDropoutPolicy or old version
-    
+
     # Extract SN config from loaded model
     loaded_sn_critic = getattr(model.policy, 'use_spectral_norm_critic', False)
     loaded_sn_actor = getattr(model.policy, 'use_spectral_norm_actor', False)
-    
+
     # Compare with current config
     config_sn_critic = config.use_spectral_norm_critic
     config_sn_actor = config.use_spectral_norm_actor
-    
+
     if loaded_sn_critic != config_sn_critic or loaded_sn_actor != config_sn_actor:
         raise ValueError(
             f"Checkpoint SN mismatch detected!\n"
@@ -254,6 +253,26 @@ def _validate_spectral_norm_compatibility(model: TQC, config: TrainingConfig) ->
             f"  Checkpoints are NOT compatible if `use_spectral_norm_*` flags change.\n"
             f"  Solution: Re-train with matching SN configuration or use a compatible checkpoint."
         )
+
+
+def _refreeze_mae_extractors(model: TQC) -> None:
+    """
+    Re-freeze MAE on all FoundationFeatureExtractor instances (DSR triptyque).
+
+    TQC.load() does not persist requires_grad; without re-freeze the encoder
+    may be trained when we intend to keep it frozen. Call after resume.
+    """
+    seen: set = set()
+    for attr in ("features_extractor", "actor", "critic", "critic_target"):
+        sub = getattr(model.policy, attr, None)
+        if sub is None:
+            continue
+        ex = getattr(sub, "features_extractor", sub) if hasattr(sub, "features_extractor") else sub
+        if hasattr(ex, "_freeze_encoder") and id(ex) not in seen:
+            seen.add(id(ex))
+            ex._freeze_encoder()
+    if seen:
+        print("      [Re-freeze] MAE encoder frozen on all feature extractors")
 
 
 def create_policy_kwargs(
@@ -293,14 +312,14 @@ def create_policy_kwargs(
     # Use provided foundation_config or fallback to default
     if foundation_config is None:
         foundation_config = DEFAULT_FOUNDATION_CONFIG
-    
+
     # Build MAE config from foundation_config (explicit composition)
     # Override with config values if they differ (for backward compatibility)
     mae_config = foundation_config.mae_config
     d_model = config.d_model if hasattr(config, 'd_model') else mae_config.d_model
     n_heads = config.n_heads if hasattr(config, 'n_heads') else mae_config.n_heads
     n_layers = config.n_layers if hasattr(config, 'n_layers') else mae_config.n_layers
-    
+
     policy_kwargs = dict(
         features_extractor_class=FoundationFeatureExtractor,
         features_extractor_kwargs=dict(
@@ -385,6 +404,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         max_leverage=config.max_leverage,
         price_column='BTC_Close',
         observation_noise=config.observation_noise,  # Anti-overfitting
+        dsr_eta=config.dsr_eta,
+        dsr_warmup_steps=config.dsr_warmup_steps,
     )
 
     # FIX 2026-01-26: VecNormalize pour reward scaling
@@ -427,6 +448,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
             price_column='BTC_Close',
             random_start=False,  # Sequential for evaluation
             observation_noise=0.0,  # No noise for evaluation
+            dsr_eta=config.dsr_eta,
+            dsr_warmup_steps=config.dsr_warmup_steps,
         )
         # Eval: même normalisation reward mais frozen (pas d'update des stats)
         eval_vec_env = VecNormalize(
@@ -699,11 +722,11 @@ def train(
 
     # ==================== Policy Setup ====================
     print("\n[2/4] Configuring policy with FoundationFeatureExtractor...")
-    
+
     # Use provided foundation_config or fallback to default
     if foundation_config is None:
         foundation_config = DEFAULT_FOUNDATION_CONFIG
-    
+
     # Validate configuration before model creation (only for new training)
     if not is_resume:
         # Validate foundation_config
@@ -712,7 +735,7 @@ def train(
             n_features=obs_space['market'].shape[1] if hasattr(obs_space, 'spaces') and 'market' in obs_space.spaces else None,
             window_size=config.window_size,
         )
-        
+
         # Validate observation space compatibility
         if hasattr(obs_space, 'spaces') and 'market' in obs_space.spaces:
             market_n_features = obs_space['market'].shape[1]
@@ -745,7 +768,7 @@ def train(
 
     # ==================== Policy Setup (needed for resume validation) ====================
     policy_kwargs = create_policy_kwargs(config, foundation_config=foundation_config)
-    
+
     # ==================== Model Creation ====================
     # Use custom name for TensorBoard if provided
     tb_log_name = config.name if config.name else "TQC"
@@ -761,7 +784,7 @@ def train(
             device=DEVICE,
             tensorboard_log=config.tensorboard_log,
         )
-        
+
         # Validate model dimensions compatibility
         # Check if feature extractor has expected dimensions
         if hasattr(model.policy, 'features_extractor'):
@@ -772,7 +795,7 @@ def train(
                 if foundation_config is None:
                     foundation_config = DEFAULT_FOUNDATION_CONFIG
                 expected_config = foundation_config
-                
+
                 # Validate observation space matches
                 if hasattr(train_env, 'observation_space') and hasattr(train_env.observation_space, 'spaces'):
                     market_n_features = train_env.observation_space['market'].shape[1]
@@ -781,10 +804,10 @@ def train(
                         expected_n_features=None,
                         use_film=market_n_features >= 5
                     )
-                
+
                 print(f"      ✓ Model dimensions validated: d_model={extractor.d_model}, "
                       f"features_dim={extractor.features_dim}")
-        
+
         # Validate spectral normalization compatibility (if model loaded successfully)
         # Note: If SN config mismatch, TQC.load() may fail with state_dict error before this point
         try:
@@ -792,6 +815,10 @@ def train(
         except ValueError as e:
             print(f"\n[ERROR] {e}")
             raise
+
+        # Re-freeze MAE on all feature extractors (DSR triptyque; checkpoint may not persist requires_grad)
+        if config.freeze_encoder:
+            _refreeze_mae_extractors(model)
 
         # CRITICAL: Cold Start Warmup - fill buffer before training
         model.learning_starts = config.resume_learning_starts

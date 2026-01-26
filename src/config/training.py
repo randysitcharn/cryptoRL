@@ -42,11 +42,13 @@ class TQCTrainingConfig:
     episode_length: int = 2048
     eval_episode_length: int = 600  # Safe value < (720 - window_size - 1)
 
-    # Reward function (x100 SCALE applied in env.py)
-    reward_scaling: float = 1.0   # Keep at 1.0 (SCALE=100 in env)
-    downside_coef: float = 1.0    # Asymmetric penalty for losses (1.0 = symmetric)
+    # Reward function (DSR + MORL in env)
+    reward_scaling: float = 1.0   # Keep at 1.0
+    downside_coef: float = 1.0    # Legacy, unused with DSR
     upside_coef: float = 0.0
     action_discretization: float = 0.1
+    dsr_eta: float = 0.005       # DSR EMA decay (Moody & Saffell 1998)
+    dsr_warmup_steps: int = 50   # Steps before DSR activates (warmup = log-return)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol
@@ -62,7 +64,7 @@ class TQCTrainingConfig:
     critic_dropout: float = 0.01      # DroQ recommends 0.01-0.1 (conservative)
     actor_dropout: float = 0.0        # Phase 1: critics only (0.005 for Phase 2)
     use_layer_norm: bool = True       # CRITICAL for stability with dropout
-    
+
     # --- Spectral Normalization (Stability) ---
     # See audit: Spectral norm crucial for Critic (Lipschitz constraint),
     # more debatable for Actor (may constrain policy too much)
@@ -227,7 +229,7 @@ class WFOTrainingConfig(TQCTrainingConfig):
     
     Rationale documented in: docs/design/WFO_CONFIG_RATIONALE.md
     """
-    
+
     # --- TQC Hyperparameters (WFO-optimized) ---
     learning_rate: float = 3e-4           # Standard TQC (was 1e-4)
     buffer_size: int = 2_500_000          # 2.5M replay buffer
@@ -237,20 +239,20 @@ class WFOTrainingConfig(TQCTrainingConfig):
                                                # Increased from 0.1 to prevent entropy collapse
                                                # EntropyFloorCallback ensures floor at 0.01
     sde_sample_freq: int = 64             # FIX: More frequent resampling
-    
+
     # --- Regularization (aggressive for OOS generalization) ---
     critic_dropout: float = 0.1           # 10% dropout (DroQ max)
-    
+
     # --- Overfitting Guard (enabled for WFO) ---
     use_overfitting_guard: bool = True
     guard_nav_threshold: float = 10.0     # 10x (permissive for long WFO)
     guard_patience: int = 5               # Increased patience
     guard_check_freq: int = 25_000        # ~6 weeks of data
     guard_reward_variance: float = 1e-5   # Lower threshold
-    
+
     # --- WFO-specific timesteps ---
     total_timesteps: int = 30_000_000     # 30M (vs 90M default)
-    
+
     # --- Evaluation commission (lower for realistic backtesting) ---
     eval_commission: float = 0.0004       # 0.04% for test evaluation
 

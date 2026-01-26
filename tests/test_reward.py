@@ -47,24 +47,35 @@ def create_price_series(prices: list) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def create_test_env_with_prices(prices: list, window_size: int = 10):
+def create_test_env_with_prices(prices: list, window_size: int = 10, episode_length=None, **kwargs):
     """Create BatchCryptoEnv with specific price series."""
     df = create_price_series(prices)
-    
     tmp_file = tempfile.NamedTemporaryFile(suffix='.parquet', delete=False)
     df.to_parquet(tmp_file.name)
-    
+    ep_len = episode_length if episode_length is not None else (len(prices) - window_size - 1)
     env = BatchCryptoEnv(
         parquet_path=tmp_file.name,
         n_envs=1,
         device='cpu',
         window_size=window_size,
-        episode_length=len(prices) - window_size - 1,
+        episode_length=ep_len,
         price_column='close',
         random_start=False,
+        **kwargs,
     )
-    
     return env, tmp_file.name
+
+
+def run_policy(env, position: float, steps: int) -> np.ndarray:
+    """Run env for `steps` steps with constant action [position], return rewards array."""
+    env.gym_reset()
+    rewards = []
+    for _ in range(steps):
+        obs, reward, term, trunc, _ = env.gym_step(np.array([position], dtype=np.float32))
+        rewards.append(reward)
+        if term or trunc:
+            break
+    return np.array(rewards)
 
 
 def cleanup_env(parquet_path: str):
@@ -82,7 +93,7 @@ def test_reward_positive_return():
     # Price goes up: 100 -> 110 (10% increase)
     prices = [100.0] * 15 + [110.0] * 10
     env, tmp_path = create_test_env_with_prices(prices)
-    
+
     try:
         obs, info = env.gym_reset()
 
@@ -113,7 +124,7 @@ def test_reward_negative_return():
     # Price goes down: 100 -> 90 (10% decrease)
     prices = [100.0] * 15 + [90.0] * 10
     env, tmp_path = create_test_env_with_prices(prices)
-    
+
     try:
         obs, info = env.gym_reset()
 
@@ -144,7 +155,7 @@ def test_nav_tracking():
     # Price: 100 -> 120 (increase) -> 100 (decrease back)
     prices = [100.0] * 12 + [120.0] * 8 + [100.0] * 8
     env, tmp_path = create_test_env_with_prices(prices)
-    
+
     try:
         obs, info = env.gym_reset()
         initial_nav = info['nav']
@@ -180,13 +191,70 @@ def test_nav_tracking():
         cleanup_env(tmp_path)
 
 
+def test_dsr_policy_discrimination():
+    """DSR must discriminate between policies (fixed +0.05 vs B&H +1.0); difference > 0.1.
+    TDD: run before DSR impl → fail with log-return; after DSR → pass."""
+    print("\nTest: DSR Policy Discrimination...")
+    # Mild upward drift + noise so both policies get returns but B&H gets more
+    np.random.seed(42)
+    n = 200
+    prices = 100.0 + np.cumsum(np.random.randn(n) * 0.5 + 0.05).astype(float)
+    prices = np.clip(prices, 80.0, 150.0)
+    prices = prices.tolist()
+    window_size = 10
+    episode_length = 150
+    steps = 100
+    env, tmp_path = create_test_env_with_prices(
+        prices,
+        window_size=window_size,
+        episode_length=episode_length,
+        dsr_eta=0.005,
+        dsr_warmup_steps=10,
+    )
+    try:
+        env.set_eval_w_cost(0.0)
+        rewards_fixed = run_policy(env, 0.05, steps)
+        env.gym_reset()
+        rewards_bh = run_policy(env, 1.0, steps)
+        diff = abs(rewards_fixed.mean() - rewards_bh.mean())
+        assert diff > 0.1, (
+            f"DSR should discriminate policies: |mean(+0.05)-mean(+1.0)|={diff:.4f} <= 0.1"
+        )
+        print(f"  |mean(+0.05)-mean(+1.0)|={diff:.4f} > 0.1  PASSED")
+    finally:
+        cleanup_env(tmp_path)
+
+
+def test_dsr_global_metrics():
+    """Test: get_global_metrics() contains DSR keys after reset and steps."""
+    print("\nTest: DSR get_global_metrics...")
+    prices = [100.0] * 80
+    env, tmp_path = create_test_env_with_prices(
+        prices,
+        window_size=10,
+        episode_length=60,
+        dsr_eta=0.01,
+        dsr_warmup_steps=5,
+    )
+    try:
+        env.gym_reset()
+        for _ in range(10):
+            env.gym_step(np.array([0.5], dtype=np.float32))
+        m = env.get_global_metrics()
+        for key in ("reward/dsr_raw", "reward/dsr_A", "reward/dsr_B"):
+            assert key in m, f"Missing DSR key {key} in get_global_metrics"
+        print(f"  {list(m.keys())} includes DSR keys  PASSED")
+    finally:
+        cleanup_env(tmp_path)
+
+
 def test_info_contains_metrics():
     """Test: Info dict should contain monitoring metrics."""
     print("\nTest 4: Info Contains Metrics...")
 
     prices = [100.0] * 30
     env, tmp_path = create_test_env_with_prices(prices)
-    
+
     try:
         obs, info_reset = env.gym_reset()
 
@@ -219,6 +287,8 @@ if __name__ == "__main__":
     test_reward_positive_return()
     test_reward_negative_return()
     test_nav_tracking()
+    test_dsr_policy_discrimination()
+    test_dsr_global_metrics()
     test_info_contains_metrics()
 
     print("\n" + "=" * 50)

@@ -957,6 +957,8 @@ class WFOPipeline:
             max_leverage=self.config.training_config.max_leverage,
             price_column='BTC_Close',
             random_start=False,
+            dsr_eta=self.config.training_config.dsr_eta,
+            dsr_warmup_steps=self.config.training_config.dsr_warmup_steps,
         )
         
         # MORL: Fix w_cost for evaluation (Audit 2026-01-22)
@@ -1153,6 +1155,8 @@ class WFOPipeline:
             max_leverage=self.config.training_config.max_leverage,  # MORL: Cohérence train/eval (fix Distributional Shift)
             price_column='BTC_Close',
             random_start=False,  # Sequential start for evaluation
+            dsr_eta=self.config.training_config.dsr_eta,
+            dsr_warmup_steps=self.config.training_config.dsr_warmup_steps,
         )
         
         # MORL: Fix w_cost for evaluation (Audit 2026-01-22)

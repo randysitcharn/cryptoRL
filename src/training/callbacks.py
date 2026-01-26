@@ -15,13 +15,10 @@ import numpy as np
 import torch
 from collections import deque, defaultdict
 from typing import TYPE_CHECKING, Optional
-from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 from stable_baselines3.common.utils import polyak_update
-from stable_baselines3.common.vec_env import VecEnv
 
 if TYPE_CHECKING:
-    from multiprocessing.sharedctypes import Synchronized
     from typing import TYPE_CHECKING as _TYPE_CHECKING
 else:
     _TYPE_CHECKING = False
@@ -151,7 +148,7 @@ class UnifiedMetricsCallback(BaseCallback):
     - strategy/: churn_ratio
     - debug/: q_values_mean, q_values_std, grad_actor_norm, grad_critic_norm
     """
-    
+
     def __init__(self, log_freq: int = 100, verbose: int = 0):
         """
         Args:
@@ -160,18 +157,18 @@ class UnifiedMetricsCallback(BaseCallback):
         """
         super().__init__(verbose)
         self.log_freq = log_freq
-        
+
         # Buffer pour métriques légères (lissage)
         self.metrics_buffer = defaultdict(list)
-        
+
         # Episode accumulators
         self.episode_churn_penalties = []
         self.episode_log_returns = []
-        
+
         # FPS tracking (pour console logging)
         self.last_time = None
         self.last_step = 0
-        
+
         # Diagnostic metrics (pour get_training_metrics)
         self.all_actions = deque(maxlen=100_000)
         self.entropy_values = deque(maxlen=100_000)
@@ -180,12 +177,12 @@ class UnifiedMetricsCallback(BaseCallback):
         self.churn_ratios = deque(maxlen=100_000)
         self.actor_grad_norms = deque(maxlen=100_000)
         self.critic_grad_norms = deque(maxlen=100_000)
-    
+
     def _init_callback(self) -> None:
         """Initialize FPS tracking at callback start."""
         self.last_time = time.time()
         self.last_step = 0
-    
+
     def _on_step(self) -> bool:
         """Log metrics at each step (light metrics buffered, heavy metrics at log_freq)."""
         should_log = (self.n_calls % self.log_freq == 0)
@@ -255,7 +252,7 @@ class UnifiedMetricsCallback(BaseCallback):
                 self.entropy_values.append(float(ent_coef))
         except Exception:
             pass  # Silently fail if entropy not accessible
-    
+
     def _collect_light_metrics(self):
         """Collect light metrics from infos dict (fast, no GPU call)."""
         infos = self.locals.get("infos", [{}])
@@ -267,42 +264,42 @@ class UnifiedMetricsCallback(BaseCallback):
                     self.metrics_buffer["portfolio/nav"].append(info["portfolio_value"])
                 if "position_pct" in info:
                     self.metrics_buffer["portfolio/position_pct"].append(info["position_pct"])
-                
+
                 # Risk metrics
                 if "max_drawdown" in info:
                     self.metrics_buffer["risk/max_drawdown"].append(info["max_drawdown"] * 100)  # Convert to %
-    
+
     def _log_buffered_metrics(self):
         """Log buffered metrics (mean for smoothing)."""
         for key, values in self.metrics_buffer.items():
             if values:
                 self.logger.record_mean(key, np.mean(values))
         self.metrics_buffer.clear()
-    
+
     def _log_global_metrics(self):
         """Log heavy GPU metrics from get_global_metrics() (only at log_freq)."""
         try:
             # Unwrap to find BatchCryptoEnv under SB3 wrappers
             real_env = get_underlying_batch_env(self.model.env)
-            
+
             if real_env is not None and hasattr(real_env, "get_global_metrics"):
                 metrics = real_env.get_global_metrics()
-                
+
                 # Portfolio (vitales)
                 if "portfolio_value" in metrics:
                     self.logger.record("portfolio/nav", metrics["portfolio_value"])
                 if "position_pct" in metrics:
                     self.logger.record("portfolio/position_pct", metrics["position_pct"])
-                
+
                 # Risk (vitales)
                 if "max_drawdown" in metrics:
                     self.logger.record("risk/max_drawdown", metrics["max_drawdown"] * 100)
-                
+
                 # Rewards (agrégées)
                 if "reward/pnl_component" in metrics:
                     self.logger.record("rewards/pnl_component", metrics["reward/pnl_component"])
                     self.episode_log_returns.append(metrics["reward/pnl_component"])
-                
+
                 # Agréger les pénalités en total_penalties (suppression des composantes individuelles)
                 total_penalties = 0.0
                 if "reward/churn_cost" in metrics:
@@ -312,13 +309,23 @@ class UnifiedMetricsCallback(BaseCallback):
                     total_penalties += metrics["reward/smoothness"]
                 if "reward/downside_risk" in metrics:
                     total_penalties += metrics["reward/downside_risk"]
-                
+
                 # Log total_penalties (agrégé, pas les composantes individuelles)
                 self.logger.record("rewards/total_penalties", total_penalties)
+
+                # DSR metrics (optional debug)
+                if "reward/dsr_raw" in metrics:
+                    self.logger.record("rewards/dsr_raw", metrics["reward/dsr_raw"])
+                if "reward/dsr_variance" in metrics:
+                    self.logger.record("rewards/dsr_variance", metrics["reward/dsr_variance"])
+                if "reward/dsr_A" in metrics:
+                    self.logger.record("rewards/dsr_A", metrics["reward/dsr_A"])
+                if "reward/dsr_B" in metrics:
+                    self.logger.record("rewards/dsr_B", metrics["reward/dsr_B"])
         except Exception as e:
             if self.verbose > 0:
                 print(f"[UnifiedMetricsCallback] Error in _log_global_metrics: {e}")
-    
+
     def _log_gradients(self):
         """Log gradient norms (only at log_freq, expensive operation)."""
         try:
@@ -328,7 +335,7 @@ class UnifiedMetricsCallback(BaseCallback):
                 if actor_grad_norm is not None and actor_grad_norm > 0:
                     self.logger.record("debug/grad_actor_norm", actor_grad_norm)
                     self.actor_grad_norms.append(actor_grad_norm)
-            
+
             # Critic gradients
             if hasattr(self.model, 'policy') and hasattr(self.model.policy, 'critic'):
                 critic_grad_norm = self._compute_grad_norm(self.model.policy.critic)
@@ -338,24 +345,24 @@ class UnifiedMetricsCallback(BaseCallback):
         except Exception as e:
             if self.verbose > 0:
                 print(f"[UnifiedMetricsCallback] Error in _log_gradients: {e}")
-    
+
     def _log_tqc_stats(self):
         """Log TQC Q-values statistics (only at log_freq, for Gamma diagnosis)."""
         try:
             # Access TQC critic
             if not hasattr(self.model, 'policy') or not hasattr(self.model.policy, 'critic'):
                 return
-            
+
             critic = self.model.policy.critic
-            
+
             # Get a sample observation and action for Q-value computation
             # SB3 stores observations in 'new_obs' or 'observations', actions in 'actions'
             obs = self.locals.get('new_obs') or self.locals.get('observations')
             actions = self.locals.get('actions')
-            
+
             if obs is None or actions is None:
                 return
-            
+
             # Get device from model (handle different SB3 versions)
             device = None
             if hasattr(self.model, 'device'):
@@ -366,24 +373,24 @@ class UnifiedMetricsCallback(BaseCallback):
                 device = next(self.model.policy.parameters()).device
             else:
                 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            
+
             # Convert to tensor if needed
             if isinstance(obs, np.ndarray):
                 obs_tensor = torch.tensor(obs, device=device, dtype=torch.float32)
             elif isinstance(obs, dict):
                 obs_tensor = {
-                    k: torch.tensor(v, device=device, dtype=torch.float32) 
+                    k: torch.tensor(v, device=device, dtype=torch.float32)
                     if isinstance(v, np.ndarray) else v
                     for k, v in obs.items()
                 }
             else:
                 obs_tensor = obs
-            
+
             if isinstance(actions, np.ndarray):
                 actions_tensor = torch.tensor(actions, device=device, dtype=torch.float32)
             else:
                 actions_tensor = actions
-            
+
             # Extract features
             if hasattr(self.model.policy, 'extract_features'):
                 features = self.model.policy.extract_features(
@@ -393,7 +400,7 @@ class UnifiedMetricsCallback(BaseCallback):
             else:
                 # Fallback: use observation directly
                 features = obs_tensor if isinstance(obs_tensor, torch.Tensor) else obs_tensor['observation']
-            
+
             # Get Q-values from critic
             with torch.no_grad():
                 # Handle DropoutCritic (has critics ModuleList)
@@ -414,18 +421,18 @@ class UnifiedMetricsCallback(BaseCallback):
                 else:
                     # Direct critic call
                     q_values = critic(features, actions_tensor)
-                
+
                 # Flatten to get all Q-values
                 q_flat = q_values.flatten().cpu().numpy()
-                
+
                 # Log mean and std only (no min/max to avoid outliers)
                 self.logger.record("debug/q_values_mean", float(np.mean(q_flat)))
                 self.logger.record("debug/q_values_std", float(np.std(q_flat)))
-        except Exception as e:
+        except Exception:
             # Gracefully handle if Q-values are not accessible
             if self.verbose > 0:
                 pass  # Silent fail for Q-values (may not be accessible in all contexts)
-    
+
     def _handle_episode_end(self):
         """Handle episode end metrics (churn ratio)."""
         if self.locals.get("infos"):
@@ -434,23 +441,23 @@ class UnifiedMetricsCallback(BaseCallback):
                 if self.episode_churn_penalties and self.episode_log_returns:
                     total_churn = sum(self.episode_churn_penalties)
                     total_log_ret = sum(self.episode_log_returns)
-                    
+
                     if abs(total_log_ret) > 1e-8:
                         ratio = abs(total_churn / total_log_ret)
                         self.logger.record("strategy/churn_ratio", ratio)
                         self.churn_ratios.append(ratio)
-                
+
                 # Reset episode accumulators
                 self.episode_churn_penalties = []
                 self.episode_log_returns = []
-    
+
     def _log_console(self):
         """Console logging (if verbose)."""
         # Try to get metrics from get_global_metrics first (most accurate)
         nav = 0
         pos = 0
         max_dd = 0
-        
+
         try:
             real_env = get_underlying_batch_env(self.model.env)
             if real_env is not None and hasattr(real_env, "get_global_metrics"):
@@ -466,7 +473,7 @@ class UnifiedMetricsCallback(BaseCallback):
                 pos = np.mean(self.metrics_buffer["portfolio/position_pct"])
             if self.metrics_buffer.get("risk/max_drawdown"):
                 max_dd = np.mean(self.metrics_buffer["risk/max_drawdown"])
-        
+
         # Calculate FPS manually (fixes FPS=0 bug with BatchCryptoEnv)
         current_time = time.time()
         if self.last_time is not None:
@@ -479,7 +486,7 @@ class UnifiedMetricsCallback(BaseCallback):
             fps = 0
         self.last_time = current_time
         self.last_step = self.num_timesteps
-        
+
         # Get mean reward from episode info
         mean_reward = 0
         if self.locals.get("infos"):
@@ -487,14 +494,14 @@ class UnifiedMetricsCallback(BaseCallback):
                 if info and "episode" in info:
                     mean_reward = info["episode"].get("r", 0)
                     break
-        
+
         print(f"Step {self.num_timesteps:>7} | "
               f"Reward: {mean_reward:>8.2f} | "
               f"NAV: {nav:>10.2f} | "
               f"Pos: {pos:>+5.2f} | "
               f"DD: {max_dd:>5.1f}% | "
               f"FPS: {fps:>7.0f}")
-    
+
     def _compute_grad_norm(self, model) -> Optional[float]:
         """Compute the L2 norm of gradients for a model."""
         total_norm = 0.0
@@ -506,7 +513,7 @@ class UnifiedMetricsCallback(BaseCallback):
         if n_params == 0:
             return None
         return total_norm ** 0.5
-    
+
     def get_training_metrics(self) -> dict:
         """
         Return diagnostic metrics at end of training.
@@ -628,7 +635,7 @@ class ThreePhaseCurriculumCallback(BaseCallback):
         real_env = get_underlying_batch_env(self.model.env)
         if hasattr(real_env, 'curriculum_lambda'):
             self.logger.record("curriculum/lambda", real_env.curriculum_lambda)
-        
+
         # Log Dynamic Noise effective scale (Audit 2026-01-19)
         if hasattr(real_env, '_last_noise_scale'):
             self.logger.record("observation_noise/effective_scale", real_env._last_noise_scale)
@@ -681,7 +688,7 @@ class MORLCurriculumCallback(BaseCallback):
         total_timesteps: Total training timesteps for progress calculation
         verbose: Verbosity level
     """
-    
+
     def __init__(
         self,
         start_cost: float = 0.0,
@@ -695,15 +702,15 @@ class MORLCurriculumCallback(BaseCallback):
         self.end_cost = max(0.0, min(1.0, end_cost))
         self.progress_ratio = max(0.0, min(1.0, progress_ratio))
         self.total_timesteps = total_timesteps
-        
+
         if self.start_cost > self.end_cost:
             raise ValueError(f"start_cost ({start_cost}) must be <= end_cost ({end_cost})")
-    
+
     def _on_step(self) -> bool:
         """Update w_cost target based on training progress."""
         # 1. Calculate progress (0.0 to 1.0)
         progress = self.num_timesteps / self.total_timesteps
-        
+
         # 2. Calculate w_cost target (linear ramp then plateau)
         if progress < self.progress_ratio:
             # Linear ramp phase
@@ -712,7 +719,7 @@ class MORLCurriculumCallback(BaseCallback):
         else:
             # Plateau phase
             current_w = self.end_cost
-        
+
         # 3. Apply to environment via dedicated method
         # CRITICAL: Only apply to training environment, never to eval environment
         # self.model.env is the training environment (passed to model.learn())
@@ -723,13 +730,13 @@ class MORLCurriculumCallback(BaseCallback):
         else:
             if self.verbose > 0 and self.n_calls % 1000 == 0:
                 print(f"[MORLCurriculumCallback] Warning: BatchCryptoEnv.set_w_cost_target() not found")
-        
+
         # 4. Log to TensorBoard
         self.logger.record("curriculum/w_cost_target", current_w)
         self.logger.record("curriculum/w_cost_progress", progress)
-        
+
         return True
-    
+
     def _on_training_start(self) -> None:
         """
         Initialize curriculum target BEFORE first rollout begins.
@@ -850,10 +857,10 @@ class EvalCallbackWithNoiseControl(EvalCallback):
         Override to manage observation noise before/after evaluation.
         """
         # Check if evaluation will occur (EvalCallback logic)
-        will_eval = (self.eval_freq > 0 and 
-                     self.n_calls % self.eval_freq == 0 and 
+        will_eval = (self.eval_freq > 0 and
+                     self.n_calls % self.eval_freq == 0 and
                      self.n_calls != self._last_eval_step)
-        
+
         if will_eval:
             # Before evaluation: disable noise in training env if it's BatchCryptoEnv
             train_env = self._get_batch_env(self.training_env)
@@ -873,7 +880,7 @@ class EvalCallbackWithNoiseControl(EvalCallback):
 
             # 1. Sauvegarder les poids d'entraînement actuels (VITAL)
             training_params = [p.clone() for p in self.model.policy.parameters()]
-            
+
             # 2. Charger les poids EMA pour l'évaluation (si disponible)
             # Access callbacks via self.callback (CallbackList parent) instead of model._callbacks
             ema_callback = None
@@ -888,7 +895,7 @@ class EvalCallbackWithNoiseControl(EvalCallback):
                     callbacks_list = self.callback._callbacks
                 elif isinstance(self.callback, list):
                     callbacks_list = self.callback
-                
+
                 if callbacks_list is not None:
                     for callback in callbacks_list:
                         if isinstance(callback, ModelEMACallback):
@@ -922,7 +929,7 @@ class EvalCallbackWithNoiseControl(EvalCallback):
             eval_env = self._get_batch_env(self.eval_env)
             if eval_env is not None and hasattr(eval_env, 'set_training_mode'):
                 eval_env.set_training_mode(self._eval_env_has_noise)
-            
+
             self._last_eval_step = self.n_calls
 
         return result
@@ -1426,42 +1433,42 @@ class EntropyFloorCallback(BaseCallback):
         check_freq: Fréquence de vérification en steps (default: 1000)
         verbose: Niveau de verbosité (default: 1)
     """
-    
+
     def __init__(self, min_ent_coef: float = 0.01, check_freq: int = 1000, verbose: int = 1):
         super().__init__(verbose)
         self.min_ent_coef = min_ent_coef
         self.check_freq = check_freq
         self.floor_count = 0
         self._last_ent_coef = None
-    
+
     def _on_step(self) -> bool:
         if self.n_calls % self.check_freq != 0:
             return True
-        
+
         # SAC/TQC stocke log(ent_coef) pour la stabilité numérique
         if not hasattr(self.model, 'log_ent_coef'):
             return True
-        
+
         current_log = self.model.log_ent_coef.item()
         current_ent = np.exp(current_log)
         self._last_ent_coef = current_ent
-        
+
         # Appliquer le floor si nécessaire
         if current_ent < self.min_ent_coef:
             new_log = np.log(self.min_ent_coef)
             with torch.no_grad():
                 self.model.log_ent_coef.fill_(new_log)
-            
+
             self.floor_count += 1
             if self.verbose > 0:
                 print(f"[EntropyFloor] ent_coef {current_ent:.4f} → {self.min_ent_coef} (floor #{self.floor_count})")
-        
+
         # Log pour TensorBoard
         if self.logger is not None:
             self.logger.record("entropy/ent_coef_raw", current_ent)
             self.logger.record("entropy/floor_applied_count", self.floor_count)
             self.logger.record("entropy/min_ent_coef", self.min_ent_coef)
-        
+
         return True
 
 
@@ -1496,20 +1503,20 @@ class ModelEMACallback(BaseCallback):
         self.save_path = save_path
         self.ema_params = None  # List of cloned parameter tensors
         self.param_shapes = None  # Track parameter shapes for validation
-        
+
     def _on_training_start(self) -> None:
         """Initialize EMA weights from current policy weights."""
         if not hasattr(self.model, 'policy') or self.model.policy is None:
             if self.verbose > 0:
                 print("[ModelEMACallback] Warning: Policy not available yet")
             return
-        
+
         policy = self.model.policy
         if not hasattr(policy, 'actor'):
             if self.verbose > 0:
                 print("[ModelEMACallback] Warning: No actor found, skipping EMA")
             return
-        
+
         # Clone and detach parameters (on correct device)
         # Filter to only trainable parameters (same filter used in _on_step)
         policy_params = [param for param in policy.parameters() if param.requires_grad]
@@ -1517,26 +1524,26 @@ class ModelEMACallback(BaseCallback):
             param.clone().detach().to(param.device)
             for param in policy_params
         ]
-        
+
         # Store parameter shapes for validation
         self.param_shapes = [tuple(p.shape) for p in policy_params]
-        
+
         if self.verbose > 0:
             n_params = sum(p.numel() for p in self.ema_params)
             print(f"[ModelEMACallback] Initialized EMA with decay={self.decay} (τ={self.tau:.4f})")
             print(f"  Parameters: {n_params:,}")
-        
+
     def _on_step(self) -> bool:
         """Update EMA weights using SB3's polyak_update."""
         if self.ema_params is None:
             return True
-        
+
         if not hasattr(self.model, 'policy') or self.model.policy is None:
             return True
-        
+
         # Get current parameters with same filter as initialization
         policy_params = [param for param in self.model.policy.parameters() if param.requires_grad]
-        
+
         # Validate shapes match (safety check for model architecture changes)
         if len(policy_params) != len(self.ema_params):
             if self.verbose > 0:
@@ -1544,7 +1551,7 @@ class ModelEMACallback(BaseCallback):
                       f"({len(policy_params)} vs {len(self.ema_params)}). Reinitializing EMA.")
             self._on_training_start()  # Reinitialize
             return True
-        
+
         # Validate shapes match
         current_shapes = [tuple(p.shape) for p in policy_params]
         if current_shapes != self.param_shapes:
@@ -1552,7 +1559,7 @@ class ModelEMACallback(BaseCallback):
                 print(f"[ModelEMACallback] Warning: Parameter shape mismatch. Reinitializing EMA.")
             self._on_training_start()  # Reinitialize
             return True
-        
+
         # Use SB3's native polyak_update function with filtered parameters
         with torch.no_grad():
             polyak_update(
@@ -1560,7 +1567,7 @@ class ModelEMACallback(BaseCallback):
                 target_params=self.ema_params,
                 tau=self.tau
             )
-        
+
         # Optional logging (every 10k steps to reduce overhead)
         if self.num_timesteps % 10_000 == 0:
             total_diff = sum(
@@ -1571,7 +1578,7 @@ class ModelEMACallback(BaseCallback):
                 )
             )
             self.logger.record("ema/weight_diff_l2", total_diff)
-        
+
         return True
 
     def load_ema_weights(self) -> None:
@@ -1585,23 +1592,23 @@ class ModelEMACallback(BaseCallback):
             if self.verbose > 0:
                 print("[ModelEMACallback] Warning: EMA not initialized, cannot load")
             return
-        
+
         if not hasattr(self.model, 'policy') or self.model.policy is None:
             return
-        
+
         # Get parameters with same filter as initialization
         policy_params = [param for param in self.model.policy.parameters() if param.requires_grad]
-        
+
         # Validate shapes match
         if len(policy_params) != len(self.ema_params):
             if self.verbose > 0:
                 print(f"[ModelEMACallback] Warning: Cannot load EMA - parameter count mismatch")
             return
-        
+
         with torch.no_grad():
             for param, ema_param in zip(policy_params, self.ema_params):
                 param.data.copy_(ema_param.data)
-        
+
         if self.verbose > 0:
             print("[ModelEMACallback] Loaded EMA weights into policy")
 
@@ -1609,38 +1616,38 @@ class ModelEMACallback(BaseCallback):
         """Sauvegarde le modèle EMA à la fin de l'entraînement."""
         if self.save_path is None or self.ema_params is None:
             return
-        
+
         if not hasattr(self.model, 'policy') or self.model.policy is None:
             return
-        
+
         if self.verbose > 0:
             print(f"[ModelEMACallback] Saving EMA model with decay {self.decay}...")
-        
+
         # Get parameters with same filter as initialization
         policy_params = [param for param in self.model.policy.parameters() if param.requires_grad]
-        
+
         # Validate shapes match
         if len(policy_params) != len(self.ema_params):
             if self.verbose > 0:
                 print(f"[ModelEMACallback] Warning: Cannot save EMA - parameter count mismatch")
             return
-        
+
         # 1. Sauvegarde des poids actuels (overfittés ?)
         original_params = [p.clone() for p in policy_params]
-        
+
         # 2. Chargement des poids EMA (using filtered parameters)
         with torch.no_grad():
             for param, ema_param in zip(policy_params, self.ema_params):
                 param.data.copy_(ema_param.data)
-        
+
         # 3. Save
         os.makedirs(self.save_path, exist_ok=True)
         ema_path = os.path.join(self.save_path, "best_model_ema.zip")
         self.model.save(ema_path)
-        
+
         if self.verbose > 0:
             print(f"  Saved EMA model to {ema_path}")
-        
+
         # 4. Restauration des poids originaux (si training continue)
         with torch.no_grad():
             for param, orig_param in zip(policy_params, original_params):

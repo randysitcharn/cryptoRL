@@ -88,14 +88,14 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         # Use default config if not provided
         if config is None:
             config = DEFAULT_FOUNDATION_CONFIG
-        
+
         # Use config values if not explicitly provided
         d_model = d_model if d_model is not None else config.mae_config.d_model
         n_heads = n_heads if n_heads is not None else config.mae_config.n_heads
         n_layers = n_layers if n_layers is not None else config.mae_config.n_layers
         dropout = dropout if dropout is not None else config.mae_config.dropout
         features_dim = features_dim if features_dim is not None else config.features_dim
-        
+
         # Validate observation space type
         assert isinstance(observation_space, spaces.Dict), \
             f"Expected spaces.Dict, got {type(observation_space)}"
@@ -108,7 +108,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         self.window_size = market_space.shape[0]  # 64
         self.n_features = market_space.shape[1]   # 43
         self.d_model = d_model
-        
+
         # Create actual config for validation
         from src.config.constants import MAEConfig
         actual_mae_config = MAEConfig(
@@ -122,14 +122,14 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             mae_config=actual_mae_config,
             features_dim=features_dim
         )
-        
+
         # Validate configuration
         ModelDimensionsValidator.validate_foundation_config(
             actual_config,
             n_features=self.n_features,
             window_size=self.window_size
         )
-        
+
         # Validate observation space compatibility
         ModelDimensionsValidator.validate_observation_space_compatibility(
             observation_space_n_features=self.n_features,
@@ -222,6 +222,13 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
             nn.LeakyReLU(negative_slope=0.01)
         )
         print(f"[FoundationFeatureExtractor] Fusion Projector: {self.total_input_dim} -> 2048 -> {features_dim} (Deep Fusion + Dropout)")
+        self._register_fusion_gradient_hooks()
+
+    def _register_fusion_gradient_hooks(self) -> None:
+        """Clamp Fusion projection gradients to [-1, 1] to avoid explosion (DSR triptyque)."""
+        for p in self.fusion_projection.parameters():
+            if p.requires_grad:
+                p.register_hook(lambda g: g.clamp(-1.0, 1.0) if g is not None else None)
 
     def _load_pretrained_weights(
         self,
@@ -243,7 +250,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
         """
         try:
             checkpoint = torch.load(encoder_path, map_location="cpu", weights_only=True)
-            
+
             # Validate checkpoint compatibility using centralized validator
             if expected_config is not None:
                 try:
@@ -264,10 +271,10 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                 # This detects if checkpoint was trained with different number of features
                 checkpoint_embedding = checkpoint['embedding']
                 model_input_dim = self.mae.embedding.weight.shape[1]
-                
+
                 if 'weight' in checkpoint_embedding:
                     checkpoint_input_dim = checkpoint_embedding['weight'].shape[1]
-                    
+
                     if checkpoint_input_dim != model_input_dim:
                         raise ValueError(
                             f"[FoundationFeatureExtractor] CRITICAL: Input dimension mismatch!\n"
@@ -282,7 +289,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                             f"n_heads={expected_config.mae_config.n_heads if expected_config else 'N/A'}, "
                             f"n_layers={expected_config.mae_config.n_layers if expected_config else 'N/A'}"
                         )
-                
+
                 # Nested format: load each component separately
                 self.mae.embedding.load_state_dict(checkpoint['embedding'])
                 self.mae.encoder.load_state_dict(checkpoint['encoder'])
@@ -307,10 +314,10 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                 # Standard state_dict format (full model or partial)
                 # Check input_dim dimension mismatch before loading
                 model_input_dim = self.mae.embedding.weight.shape[1]
-                
+
                 if 'embedding.weight' in checkpoint:
                     checkpoint_input_dim = checkpoint['embedding.weight'].shape[1]
-                    
+
                     if checkpoint_input_dim != model_input_dim:
                         raise ValueError(
                             f"[FoundationFeatureExtractor] CRITICAL: Input dimension mismatch!\n"
@@ -322,7 +329,7 @@ class FoundationFeatureExtractor(BaseFeaturesExtractor):
                             f"  Solution: Re-pre-train the MAE with the current feature set\n"
                             f"  (dataset.py now auto-excludes HMM features for MAE pre-training)"
                         )
-                
+
                 missing, unexpected = self.mae.load_state_dict(checkpoint, strict=False)
 
                 if missing:
