@@ -91,6 +91,11 @@ class TQCTrainingConfig:
     n_critics: int = 2
     n_quantiles: int = 25
 
+    # Entropy tuning (FIX 2026-01-26)
+    # "auto" = -dim(action) = -1.0 (trop agressif pour trading)
+    # 0.0 = neutre, pas de pression vers entropy faible
+    target_entropy: Union[str, float] = 0.0
+
     # Policy network
     net_arch: Optional[Dict[str, List[int]]] = None  # Default: dict(pi=[64,64], qf=[64,64])
 

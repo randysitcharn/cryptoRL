@@ -33,6 +33,7 @@ from src.config.validators import ModelDimensionsValidator
 from src.models.tqc_dropout_policy import TQCDropoutPolicy
 from src.utils.hardware import HardwareManager
 from src.models.rl_adapter import FoundationFeatureExtractor
+from stable_baselines3.common.vec_env import VecNormalize
 from src.training.batch_env import BatchCryptoEnv
 from src.training.clipped_optimizer import ClippedAdamW
 from src.training.callbacks import (
@@ -381,6 +382,22 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         observation_noise=config.observation_noise,  # Anti-overfitting
     )
 
+    # FIX 2026-01-26: VecNormalize pour reward scaling
+    # Normalise les rewards avec running mean/std pour un signal stable.
+    # Critique pour que le Critic puisse apprendre sur des rewards faibles (~0.0005).
+    clip_reward = 10.0
+    train_vec_env = VecNormalize(
+        train_vec_env,
+        norm_obs=False,
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=clip_reward,
+        gamma=config.gamma,
+        epsilon=1e-8,
+        training=True,
+    )
+    print(f"      [VecNormalize] Reward normalization enabled (clip={clip_reward})")
+
     # ==================== Eval Environment (optional) ====================
     # Note: eval_data_path=None in WFO mode to prevent data leakage
     if config.eval_data_path is not None:
@@ -405,6 +422,17 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
             price_column='BTC_Close',
             random_start=False,  # Sequential for evaluation
             observation_noise=0.0,  # No noise for evaluation
+        )
+        # Eval: même normalisation reward mais frozen (pas d'update des stats)
+        eval_vec_env = VecNormalize(
+            eval_vec_env,
+            norm_obs=False,
+            norm_reward=True,
+            clip_obs=10.0,
+            clip_reward=clip_reward,
+            gamma=config.gamma,
+            epsilon=1e-8,
+            training=False,
         )
     else:
         # WFO mode: no eval env to prevent data leakage
@@ -511,6 +539,7 @@ def create_callbacks(
     # ═══════════════════════════════════════════════════════════════════════
     # Entropy Floor Callback (Prevents Entropy Collapse)
     # Ensures ent_coef stays above minimum threshold during auto-tuning
+    # Reference: Meta-SAC (ICML 2020) - "α almost converges to zero"
     # ═══════════════════════════════════════════════════════════════════════
     entropy_floor = EntropyFloorCallback(
         min_ent_coef=DEFAULT_MIN_ENT_COEF,
@@ -518,7 +547,7 @@ def create_callbacks(
         verbose=config.verbose
     )
     callbacks.append(entropy_floor)
-    print(f"  [Entropy] EntropyFloorCallback enabled (min={DEFAULT_MIN_ENT_COEF})")
+    print(f"  [Entropy] EntropyFloorCallback enabled (min={DEFAULT_MIN_ENT_COEF}, check_freq=5000)")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Model EMA Callback (Polyak Averaging for Policy Weights)
@@ -807,6 +836,7 @@ def train(
             gamma=config.gamma,
             tau=config.tau,
             ent_coef=config.ent_coef,
+            target_entropy=config.target_entropy,
             train_freq=config.train_freq,
             gradient_steps=config.gradient_steps,
             top_quantiles_to_drop_per_net=config.top_quantiles_to_drop,
@@ -968,6 +998,12 @@ def train(
     model.save(config.save_path)
     clean_compiled_checkpoint(config.save_path)
     print(f"\nModel saved to: {config.save_path}")
+
+    # FIX 2026-01-26: Sauvegarder les stats VecNormalize pour chargement à l'inférence
+    if isinstance(train_env, VecNormalize):
+        vec_normalize_path = config.save_path.replace(".zip", "_vecnormalize.pkl")
+        train_env.save(vec_normalize_path)
+        print(f"VecNormalize stats saved to: {vec_normalize_path}")
 
     print("\nArtifacts:")
     print(f"  - Final model: {config.save_path}")

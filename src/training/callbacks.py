@@ -1407,8 +1407,22 @@ class EntropyFloorCallback(BaseCallback):
     Résout le problème d'entropy collapse dans SAC/TQC où l'auto-tuning
     réduit l'entropie trop agressivement, causant une policy déterministe.
     
+    Références académiques:
+    - Meta-SAC (ICML 2020): "α almost converges to zero, which means almost
+      no entropy bonus is given and the SAC objective becomes almost equivalent
+      to the DDPG objective."
+    - TES-SAC (2021): "Setting a low constant target entropy restraint forces
+      SAC to quickly decrease α at early stage... this algorithm is prone to
+      early overfitting."
+    - SAC Original (Haarnoja 2018): "The policy then becomes nearly deterministic,
+      leading to poor local minima due to lack of adequate exploration."
+    
+    Solution: Empêcher α < min_threshold (Entropy Floor) plutôt que de laisser
+    l'auto-tuning converger vers zéro.
+    
     Args:
         min_ent_coef: Valeur minimale de ent_coef (default: 0.01)
+                      Basé sur littérature: α < 0.01 ≈ policy déterministe
         check_freq: Fréquence de vérification en steps (default: 1000)
         verbose: Niveau de verbosité (default: 1)
     """

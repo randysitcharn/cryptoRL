@@ -282,8 +282,10 @@ class DropoutCritic(nn.Module):
         """
         # Extract features if we have a features_extractor and obs is a dict
         if self.features_extractor is not None:
-            with torch.no_grad():
-                features = self.features_extractor(obs)
+            # FIX 2026-01-26: Retrait de torch.no_grad() pour permettre
+            # aux gradients du Critic de remonter au features_extractor.
+            # Sans cela, FiLM/fusion/MAE ne s'adaptent jamais au signal RL.
+            features = self.features_extractor(obs)
         else:
             features = obs
 
