@@ -180,6 +180,38 @@ class BestModelCleanerCallback(BaseCallback):
         return True
 
 
+class MAEFreezeVerificationCallback(BaseCallback):
+    """
+    Periodic verification that MAE encoder remains frozen during training.
+    
+    This is a safety net to detect any code that might accidentally unfreeze
+    the encoder during training, which would cause representation degradation.
+    """
+
+    def __init__(self, check_freq: int = 10000, verbose: int = 0):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+
+        # Verify MAE is still frozen
+        if not verify_mae_frozen(self.model):
+            print(f"\n[CRITICAL] MAE encoder was unfrozen during training at step {self.num_timesteps}!")
+            print("[CRITICAL] This will cause representation degradation.")
+            print("[CRITICAL] Re-freezing encoder now...")
+            ensure_mae_frozen(self.model, freeze_encoder=True)
+            if not verify_mae_frozen(self.model):
+                raise RuntimeError(
+                    "Failed to re-freeze MAE encoder during training. "
+                    "Training stopped to prevent representation degradation."
+                )
+            print("[CRITICAL] Encoder re-frozen successfully.")
+
+        return True
+
+
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
     """
     Find the latest checkpoint in the checkpoint directory.
@@ -623,6 +655,18 @@ def create_callbacks(
         callbacks.append(guard)
         signal3_status = 'ON' if eval_cb else 'OFF (WFO mode)'
         print(f"  [Guard] OverfittingGuardCallbackV2 enabled (Signal 3: {signal3_status})")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # MAE Freeze Verification Callback (Safety Net)
+    # Periodically verifies that MAE encoder remains frozen during training
+    # ═══════════════════════════════════════════════════════════════════════
+    if getattr(config, 'freeze_encoder', False):
+        mae_verification = MAEFreezeVerificationCallback(
+            check_freq=10000,  # Check every 10k steps
+            verbose=config.verbose
+        )
+        callbacks.append(mae_verification)
+        print("  [MAE] MAEFreezeVerificationCallback enabled (check_freq=10000)")
 
     return callbacks, unified_callback
 
