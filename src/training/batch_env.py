@@ -9,12 +9,6 @@ and achieves 10-50x speedup.
 Architecture:
     SubprocVecEnv: 31 processes × 1 env  → CPU bottleneck (IPC/pickling)
     BatchCryptoEnv: 1 process × 1024 envs → GPU saturated (tensor ops)
-
-CHANGELOG 2026-01-26:
-- Replaced log-return reward with Differential Sharpe Reward (DSR)
-- DSR creates meaningful reward differences between policies
-- Compatible with MORL scalarization (w_cost parameter)
-- Reference: Moody & Saffell (1998) "Learning to Trade via Direct RL"
 """
 
 import numpy as np
@@ -36,8 +30,7 @@ class BatchCryptoEnv(VecEnv):
 
     Features:
         - Continuous action space [-1, 1] for position sizing
-        - Differential Sharpe Reward (DSR) for meaningful policy discrimination
-        - MORL scalarization with w_cost preference parameter
+        - Hybrid Log-Sortino reward (log return + penalties)
         - Volatility scaling with EMA variance
         - Action discretization to reduce churn
         - Compatible with SB3's TQC via VecEnv interface
@@ -58,11 +51,8 @@ class BatchCryptoEnv(VecEnv):
         window_size: int = 64,
         episode_length: int = 2048,
         initial_balance: float = 10_000.0,
-        # Transaction costs (defaults from TQCTrainingConfig)
-        commission: float = 0.0,
-        slippage: float = 0.0,
-        funding_rate: float = 0.0,
-        w_cost_fixed: Optional[float] = 0.0,  # Fixed w_cost (0=no cost penalty, None=sample)
+        commission: float = 0.0006,
+        slippage: float = 0.0001,
         # Reward params
         reward_scaling: float = 1.0,
         downside_coef: float = 10.0,
@@ -79,6 +69,8 @@ class BatchCryptoEnv(VecEnv):
         observation_noise: float = 0.0,  # 0 = disabled by default
         # Episode start mode
         random_start: bool = True,  # If False, start at beginning (for evaluation)
+        # Short selling
+        funding_rate: float = 0.0001,  # 0.01% per step (~0.24%/day) for short positions
         # Domain Randomization (anti-overfitting)
         enable_domain_randomization: bool = True,
         commission_min: float = 0.0002,  # 0.02%
@@ -86,9 +78,6 @@ class BatchCryptoEnv(VecEnv):
         slippage_min: float = 0.00005,   # 0.005%
         slippage_max: float = 0.00015,   # 0.015%
         slippage_noise_std: float = 0.00002,  # Bruit additif pour market impact
-        # Differential Sharpe Reward (Moody & Saffell 1998)
-        dsr_eta: float = 0.005,  # EMA decay for DSR
-        dsr_warmup_steps: int = 50,  # Steps before DSR activates (warmup = log-return)
     ):
         """
         Initialize the batch environment.
@@ -121,8 +110,6 @@ class BatchCryptoEnv(VecEnv):
             slippage_min: Minimum slippage rate for randomization.
             slippage_max: Maximum slippage rate for randomization.
             slippage_noise_std: Standard deviation of execution slippage noise.
-            dsr_eta: EMA decay rate for Differential Sharpe Reward.
-            dsr_warmup_steps: Steps before DSR activates (warmup uses scaled log-returns).
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.num_envs = n_envs  # Store locally, VecEnv.__init__ will set self.num_envs
@@ -143,10 +130,9 @@ class BatchCryptoEnv(VecEnv):
         self.observation_noise = observation_noise
         self.random_start = random_start
         self.funding_rate = funding_rate
-        self.w_cost_fixed = w_cost_fixed  # Fixed w_cost for MORL (None=sample, 0=no penalty)
         self.training = True  # Flag for observation noise (disable during eval)
         self._last_noise_scale = 0.0  # For TensorBoard logging (Dynamic Noise)
-
+        
         # Domain Randomization params
         self.enable_domain_randomization = enable_domain_randomization
         self.commission_min = commission_min
@@ -154,9 +140,6 @@ class BatchCryptoEnv(VecEnv):
         self.slippage_min = slippage_min
         self.slippage_max = slippage_max
         self.slippage_noise_std = slippage_noise_std
-
-        self.dsr_eta = dsr_eta
-        self.dsr_warmup_steps = dsr_warmup_steps
 
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
         self.progress = 0.0           # Training progress [0, 1]
@@ -188,7 +171,7 @@ class BatchCryptoEnv(VecEnv):
         # Force HMM features to be the last 5 columns for FiLM compatibility
         # Uses centralized HMM_CONTEXT_COLS from constants.py
         from src.config import HMM_CONTEXT_COLS
-
+        
         available_cols = feature_cols
 
         missing_hmm = [c for c in HMM_CONTEXT_COLS if c not in available_cols]
@@ -258,7 +241,6 @@ class BatchCryptoEnv(VecEnv):
 
         print(f"[BatchCryptoEnv] Initialized: {n_envs} envs on {self.device}, "
               f"{self.n_steps} steps, {self.n_features} features")
-        print(f"[BatchCryptoEnv] Reward: Differential Sharpe (eta={dsr_eta}, warmup={dsr_warmup_steps})")
 
     def _allocate_state_tensors(self) -> None:
         """Allocate all state tensors on GPU."""
@@ -310,13 +292,14 @@ class BatchCryptoEnv(VecEnv):
         # ═══════════════════════════════════════════════════════════════════
         self.w_cost = torch.zeros(n, 1, device=device)
         self._eval_w_cost = None  # Fixed w_cost for evaluation mode (None = sample)
-
+        
         # Curriculum learning state
         self._w_cost_target = None  # Target w_cost for curriculum (None = disabled)
         self._use_curriculum_sampling = False  # Use curriculum sampling if True
 
         # Reward component buffers (pour observabilité)
         self._rew_pnl = torch.zeros(n, device=device)
+        self._rew_alpha = torch.zeros(n, device=device)
         self._rew_churn = torch.zeros(n, device=device)
         self._rew_smooth = torch.zeros(n, device=device)
         self._rew_downside = torch.zeros(n, device=device)  # Downside risk tracking
@@ -327,12 +310,6 @@ class BatchCryptoEnv(VecEnv):
 
         # OPTIMIZATION: Pre-allocate window offsets to avoid torch.arange in hot path
         self.window_offsets = torch.arange(self.window_size, device=device)
-
-        # DSR state (Moody & Saffell 1998)
-        self.dsr_A = torch.zeros(n, device=device)
-        self.dsr_B = torch.full((n,), 1e-6, device=device)
-        self._dsr_raw = torch.zeros(n, device=device)
-        self._dsr_variance = torch.zeros(n, device=device)
 
     def _sample_domain_params(self, env_indices: torch.Tensor) -> None:
         """
@@ -346,7 +323,7 @@ class BatchCryptoEnv(VecEnv):
             env_indices: Tensor of environment indices to sample for.
         """
         n = env_indices.shape[0]
-
+        
         if self.enable_domain_randomization and self.training:
             # Beta distribution for commission (skewed towards center)
             # α=2, β=2 gives bell curve centered at (α/(α+β)) = 0.5
@@ -355,10 +332,10 @@ class BatchCryptoEnv(VecEnv):
             beta_dist = Beta(alpha, beta)
             u = beta_dist.sample((n,)).to(self.device)
             self.commission_per_env[env_indices] = (
-                self.commission_min +
+                self.commission_min + 
                 (self.commission_max - self.commission_min) * u
             )
-
+            
             # Uniform for slippage
             self.slippage_per_env[env_indices] = torch.rand(
                 n, device=self.device
@@ -396,13 +373,10 @@ class BatchCryptoEnv(VecEnv):
             "nav_std": navs.std().item(),
             # Reward components (Direct GPU Polling)
             "reward/pnl_component": self._rew_pnl.mean().item(),
+            "reward/alpha_component": self._rew_alpha.mean().item(),
             "reward/churn_cost": self._rew_churn.mean().item(),
             "reward/downside_risk": self._rew_downside.mean().item(),
             "reward/smoothness": self._rew_smooth.mean().item(),
-            "reward/dsr_raw": self._dsr_raw.mean().item(),
-            "reward/dsr_variance": self._dsr_variance.mean().item(),
-            "reward/dsr_A": self.dsr_A.mean().item(),
-            "reward/dsr_B": self.dsr_B.mean().item(),
             # Curriculum state (AAAI 2024)
             "curriculum/lambda": self.curriculum_lambda,
             "curriculum/progress": self.progress,
@@ -452,55 +426,60 @@ class BatchCryptoEnv(VecEnv):
     def _calculate_rewards(
         self,
         step_returns: torch.Tensor,
+        asset_returns: torch.Tensor,
         position_deltas: torch.Tensor,
         dones: torch.Tensor,
     ) -> torch.Tensor:
         """
-        MORL reward with Differential Sharpe (DSR) as performance objective.
+        Reward Alpha vs B&H + MORL (Shock Therapy).
 
-        DSR rewards consistency (Sharpe improvement) rather than raw returns.
-        Order: (1) compute delta_A, delta_B; (2) compute reward DSR/warmup;
-        (3) update EMA (always, including during warmup).
+        L'agent est récompensé sur son Alpha (surperformance vs Buy & Hold), pas sur le PnL absolu.
+        Cela casse le "Cash Trap" en rendant l'inaction coûteuse durant les hausses.
 
-        Reference: Moody & Saffell (1998) "Learning to Trade via Direct RL".
+        Architecture:
+            - r_alpha = step_returns - asset_returns (Alpha = perf agent - perf marché)
+            - reward = (r_alpha * ALPHA_SCALE * reward_scaling) + w_cost * r_cost * MAX_PENALTY_SCALE
+            - Métriques séparées: _rew_pnl = step_returns (réalité), _rew_alpha = r_alpha (objectif)
+
+        Args:
+            step_returns: (new_nav - old_nav) / old_nav. Shape: (n_envs,)
+            asset_returns: (new_price - old_price) / old_price, benchmark B&H. Shape: (n_envs,)
+            position_deltas: |new_pos - old_pos|. Shape: (n_envs,)
+            dones: Episode termination flags. Shape: (n_envs,)
+
+        Returns:
+            Rewards for all envs. Shape: (n_envs,)
         """
-        DSR_SCALE = 3.0  # Reduced to avoid noise amplification
+        # ═══════════════════════════════════════════════════════════════════
+        # MORL calibration (coûts)
+        # ═══════════════════════════════════════════════════════════════════
+        SCALE = 10.0
         MAX_PENALTY_SCALE = 0.05
-        COST_PENALTY_CAP = 0.01
+        COST_PENALTY_CAP = 0.1  # Clamp sécurité (Shock Therapy)
 
-        R_t = step_returns
-        delta_A = R_t - self.dsr_A
-        delta_B = R_t ** 2 - self.dsr_B
+        # 1. Alpha (Performance relative au marché)
+        r_alpha = step_returns - asset_returns
 
-        variance = torch.clamp(self.dsr_B - self.dsr_A ** 2, min=1e-8)
-        denom = variance ** 1.5 + 1e-6  # Epsilon for numerical stability
-        numerator = self.dsr_B * delta_A - 0.5 * self.dsr_A * delta_B
-        r_dsr_raw = numerator / denom
-        self._dsr_raw = r_dsr_raw.clone()
-        self._dsr_variance = variance.clone()
-        r_dsr_raw = torch.clamp(r_dsr_raw, min=-10.0, max=10.0)  # Allow stronger signals
-
-        warmup_mask = self.episode_lengths < self.dsr_warmup_steps
-        r_simple = torch.log1p(torch.clamp(R_t, min=-0.99)) * DSR_SCALE
-        r_dsr = torch.where(warmup_mask, r_simple, r_dsr_raw * DSR_SCALE)
-
-        self.dsr_A = self.dsr_A + self.dsr_eta * delta_A
-        self.dsr_B = self.dsr_B + self.dsr_eta * delta_B
-
-        r_perf = r_dsr
-
-        r_cost = -position_deltas * 10.0
+        # 2. Coût churn (inchangé, clamp de sécurité)
+        r_cost = -position_deltas * SCALE
         r_cost = torch.clamp(r_cost, min=-COST_PENALTY_CAP, max=0.0)
-        w_cost_squeezed = self.w_cost.squeeze(-1)
-        reward = r_perf + (w_cost_squeezed * r_cost * MAX_PENALTY_SCALE)
 
-        self._rew_pnl = r_perf
-        self._rew_churn = w_cost_squeezed * r_cost * MAX_PENALTY_SCALE
-        self._rew_downside = torch.zeros_like(r_perf)
-        self._rew_smooth = torch.zeros_like(r_perf)
+        # 3. Métriques SÉPARÉES (monitoring)
+        self._rew_pnl = step_returns   # Réalité: est-ce qu'on gagne de l'argent ?
+        self._rew_alpha = r_alpha     # Objectif: est-ce qu'on bat le marché ?
+        self._rew_churn = r_cost      # Coût brut
+        self._rew_downside = torch.zeros_like(step_returns)
+        self._rew_smooth = torch.zeros_like(step_returns)
+
         self.last_gate_mean = 1.0
 
-        return reward * self.reward_scaling
+        # 4. Assemblage Final (Shock Therapy): ALPHA_SCALE=50 pour amplifier le signal ~0.001
+        ALPHA_SCALE = 50.0
+        w_cost_squeezed = self.w_cost.squeeze(-1)
+        reward = (r_alpha * ALPHA_SCALE * self.reward_scaling) + (
+            w_cost_squeezed * r_cost * MAX_PENALTY_SCALE
+        )
+        return reward
 
     def reset(self) -> Dict[str, np.ndarray]:
         """
@@ -548,31 +527,33 @@ class BatchCryptoEnv(VecEnv):
         self.peak_navs.fill_(self.initial_balance)
         self.current_drawdowns.zero_()
 
-        self.dsr_A.zero_()
-        self.dsr_B.fill_(1e-6)
-
         # Domain Randomization: sample fees for all envs
         if self.enable_domain_randomization:
             self._sample_domain_params(torch.arange(self.num_envs, device=self.device))
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL: Sample w_cost (priority: w_cost_fixed > eval > curriculum > sample)
+        # MORL: Sample w_cost (curriculum or biased distribution)
+        # Priority: eval_w_cost > curriculum > biased distribution
         # ═══════════════════════════════════════════════════════════════════
-        if self.w_cost_fixed is not None:
-            # Fixed w_cost from config (Single Source of Truth)
-            self.w_cost.fill_(self.w_cost_fixed)
-        elif self._eval_w_cost is not None:
-            # Evaluation mode: use fixed w_cost for reproducibility
+        if self._eval_w_cost is not None:
+            # Evaluation mode: use fixed w_cost for reproducibility (highest priority)
             self.w_cost.fill_(self._eval_w_cost)
         elif self._use_curriculum_sampling and self._w_cost_target is not None:
             # Curriculum mode: sample around target with truncated normal
+            # std=0.1 provides exploration while following curriculum
             target = self._w_cost_target
             std = 0.1
+            # Sample from normal distribution, then clip to [0, 1]
             samples = torch.normal(mean=target, std=std, size=(self.num_envs, 1), device=self.device)
             self.w_cost = torch.clamp(samples, min=0.0, max=1.0)
         else:
             # Training mode: sample with biased distribution (20%/60%/20%)
+            # 20% extremes (0 or 1) + 60% uniform to ensure agent explores
+            # both pure scalping and pure B&H strategies, not just the middle
             sample_type = torch.rand(self.num_envs, device=self.device)
+            # 20% chance: w_cost = 0 (scalping mode - ignore costs)
+            # 20% chance: w_cost = 1 (B&H mode - maximize cost avoidance)
+            # 60% chance: w_cost ~ Uniform[0, 1] (exploration)
             self.w_cost = torch.where(
                 sample_type.unsqueeze(1) < 0.2,
                 torch.zeros(self.num_envs, 1, device=self.device),
@@ -600,19 +581,19 @@ class BatchCryptoEnv(VecEnv):
             # Reduces noise progressively from 100% to 50% during training
             # Not going to 0% prevents "catastrophic forgetting" of robustness
             annealing_factor = 1.0 - 0.5 * self.progress
-
+            
             # 2. ADAPTIVE (Regime-based) - CryptoRL Innovation
             # If volatility doubles, noise is halved (and vice versa)
             # Clamped [0.5, 2.0] to prevent gradient explosion/collapse
             current_vol = torch.sqrt(self.ema_vars).clamp(min=1e-6)
             vol_factor = (self.target_volatility / current_vol).clamp(0.5, 2.0)
-
+            
             # 3. COMBINED INJECTION
             # final_scale shape: (n_envs,) -> broadcast to (n_envs, window, features)
             final_scale = self.observation_noise * annealing_factor * vol_factor
             noise = torch.randn_like(market) * final_scale.unsqueeze(1).unsqueeze(2)
             market = market + noise
-
+            
             # Store for TensorBoard logging (mean across envs)
             self._last_noise_scale = final_scale.mean().item()
 
@@ -644,7 +625,7 @@ class BatchCryptoEnv(VecEnv):
                    0 = Scalping (ignore costs), 1 = B&H (minimize costs)
         """
         self._eval_w_cost = w_cost
-
+    
     def set_w_cost_target(self, target_w_cost: float) -> None:
         """
         Set target w_cost for curriculum learning.
@@ -748,10 +729,10 @@ class BatchCryptoEnv(VecEnv):
         # Calculate trade costs with domain-randomized fees
         units_delta = target_units - self.positions
         trade_values = torch.abs(units_delta * old_prices)
-
+        
         # Base costs: commission + slippage (per-env randomized)
         base_cost_rate = self.commission_per_env + self.slippage_per_env
-
+        
         # Add execution slippage noise (market impact variability)
         if self.enable_domain_randomization and self.training:
             slippage_noise = torch.randn(self.num_envs, device=self.device) * self.slippage_noise_std
@@ -763,7 +744,7 @@ class BatchCryptoEnv(VecEnv):
             effective_cost_rate = base_cost_rate + slippage_noise
         else:
             effective_cost_rate = base_cost_rate
-
+        
         trade_costs = trade_values * effective_cost_rate
 
         # Apply trades where position changed
@@ -790,6 +771,11 @@ class BatchCryptoEnv(VecEnv):
         new_navs = self._get_navs()
         step_returns = (new_navs - old_navs) / old_navs
 
+        # 8a. [Alpha] Benchmark Buy & Hold (asset returns) + robustesse division
+        new_asset_prices = self._get_prices(self.current_steps)
+        denom = torch.clamp(old_prices, min=1e-8)
+        asset_returns = (new_asset_prices - old_prices) / denom
+
         # 8b. Update peak NAV and calculate drawdown (BEFORE checking dones)
         self.peak_navs = torch.max(self.peak_navs, new_navs)
         self.current_drawdowns = (self.peak_navs - new_navs) / self.peak_navs
@@ -802,8 +788,8 @@ class BatchCryptoEnv(VecEnv):
         bankrupt = new_navs <= 0
         dones = terminated | bankrupt
 
-        # 9. Calculate rewards (with Adaptive Profit-Gated Churn)
-        rewards = self._calculate_rewards(step_returns, position_deltas, dones)
+        # 9. Calculate rewards (Alpha vs B&H + MORL churn)
+        rewards = self._calculate_rewards(step_returns, asset_returns, position_deltas, dones)
 
         # 10. Update episode tracking (BEFORE checking dones)
         self.episode_rewards += rewards
@@ -897,9 +883,6 @@ class BatchCryptoEnv(VecEnv):
         self.peak_navs[dones] = self.initial_balance
         self.current_drawdowns[dones] = 0.0
 
-        self.dsr_A[dones] = 0.0
-        self.dsr_B[dones] = 1e-6
-
         # Domain Randomization: resample fees for done envs
         if self.enable_domain_randomization:
             done_indices = torch.nonzero(dones, as_tuple=True)[0]
@@ -907,19 +890,17 @@ class BatchCryptoEnv(VecEnv):
                 self._sample_domain_params(done_indices)
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL: Resample w_cost for done envs
-        # Priority: w_cost_fixed > eval > curriculum > sample
+        # MORL: Resample w_cost for done envs (curriculum or biased distribution)
+        # Priority: eval_w_cost > curriculum > biased distribution
         # ═══════════════════════════════════════════════════════════════════
-        if self.w_cost_fixed is not None:
-            # Fixed w_cost from config (Single Source of Truth)
-            self.w_cost[dones] = self.w_cost_fixed
-        elif self._eval_w_cost is not None:
-            # Evaluation mode: use fixed w_cost
+        if self._eval_w_cost is not None:
+            # Evaluation mode: use fixed w_cost (highest priority)
             self.w_cost[dones] = self._eval_w_cost
         elif self._use_curriculum_sampling and self._w_cost_target is not None:
             # Curriculum mode: sample around target with truncated normal
             target = self._w_cost_target
             std = 0.1
+            # Sample from normal distribution, then clip to [0, 1]
             samples = torch.normal(mean=target, std=std, size=(n_done, 1), device=self.device)
             new_w_cost = torch.clamp(samples, min=0.0, max=1.0)
             self.w_cost[dones] = new_w_cost
@@ -986,10 +967,10 @@ class BatchCryptoEnv(VecEnv):
         start = step - self.window_size + 1
         market = self.data[start:step+1].cpu().numpy()
         position = np.array([self.position_pcts[idx].item()], dtype=np.float32)
-
+        
         # MORL: w_cost preference parameter (MUST match _get_observations structure)
         w_cost = self.w_cost[idx].cpu().numpy()
-
+        
         return {
             "market": market,
             "position": position,
@@ -1107,8 +1088,6 @@ class BatchCryptoEnv(VecEnv):
             'vol/current_volatility': float(torch.sqrt(self.ema_vars[idx]).item()),
             'vol/vol_scalar': float(self.vol_scalars[idx].item()),
             'vol/target_volatility': self.target_volatility,
-            'dsr/A': float(self.dsr_A[idx].item()),
-            'dsr/B': float(self.dsr_B[idx].item()),
         }
 
     def close(self) -> None:
@@ -1216,16 +1195,16 @@ class BatchCryptoEnv(VecEnv):
 
 
 if __name__ == "__main__":
-    print("Testing BatchCryptoEnv with Differential Sharpe Reward...")
+    # Test the batch environment
+    print("Testing BatchCryptoEnv...")
 
+    # Create environment
     env = BatchCryptoEnv(
         parquet_path="data/processed_data.parquet",
-        n_envs=4,
+        n_envs=4,  # Small for testing
         device="cuda" if torch.cuda.is_available() else "cpu",
         window_size=64,
         episode_length=100,
-        dsr_eta=0.01,
-        dsr_warmup_steps=10,
     )
 
     print(f"\nNum envs: {env.num_envs}")
@@ -1233,6 +1212,7 @@ if __name__ == "__main__":
     print(f"Action space: {env.action_space}")
     print(f"Device: {env.device}")
 
+    # Reset and run a few steps
     obs = env.reset()
     print(f"\nObservation shapes: market={obs['market'].shape}, position={obs['position'].shape}")
 
@@ -1242,12 +1222,10 @@ if __name__ == "__main__":
         env.step_async(actions)
         obs, rewards, dones, infos = env.step_wait()
         total_rewards += rewards
+
         if i % 10 == 0:
-            m = env.get_global_metrics()
-            print(f"Step {i}: mean_reward={rewards.mean():.4f}, "
-                  f"dsr_raw={m['reward/dsr_raw']:.4f}, dsr_var={m['reward/dsr_variance']:.6f}, "
-                  f"dones={dones.sum()}")
+            print(f"Step {i}: mean_reward={rewards.mean():.4f}, dones={dones.sum()}")
 
     print(f"\nTotal rewards: {total_rewards}")
-    print(f"Final metrics: {env.get_global_metrics()}")
-    print("\n[OK] BatchCryptoEnv with DSR test passed!")
+    print(f"Final NAVs: {[info['nav'] for info in infos]}")
+    print("\n[OK] BatchCryptoEnv test passed!")
