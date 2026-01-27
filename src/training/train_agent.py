@@ -407,7 +407,7 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
     # All envs run in a single process using PyTorch tensors on GPU
     print(f"      [BatchEnv] Creating {n_envs} GPU-vectorized environments (BatchCryptoEnv)...")
     print(f"      [Costs] commission={config.commission}, slippage={config.slippage}, "
-          f"funding={config.funding_rate}, w_cost={config.w_cost_fixed}")
+          f"funding={config.funding_rate}")
 
     train_vec_env = BatchCryptoEnv(
         parquet_path=config.data_path,
@@ -416,12 +416,9 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         window_size=config.window_size,
         episode_length=config.episode_length,
         initial_balance=10_000.0,
-        # --- Transaction Costs (from config - Single Source of Truth) ---
         commission=config.commission,
         slippage=config.slippage,
         funding_rate=config.funding_rate,
-        w_cost_fixed=config.w_cost_fixed,
-        # -----------------------------------------------------------------
         reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
@@ -431,8 +428,6 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         max_leverage=config.max_leverage,
         price_column='BTC_Close',
         observation_noise=config.observation_noise,  # Anti-overfitting
-        dsr_eta=config.dsr_eta,
-        dsr_warmup_steps=config.dsr_warmup_steps,
     )
 
     # FIX 2026-01-26: VecNormalize pour reward scaling
@@ -475,8 +470,6 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
             price_column='BTC_Close',
             random_start=False,  # Sequential for evaluation
             observation_noise=0.0,  # No noise for evaluation
-            dsr_eta=config.dsr_eta,
-            dsr_warmup_steps=config.dsr_warmup_steps,
         )
         # Eval: même normalisation reward mais frozen (pas d'update des stats)
         eval_vec_env = VecNormalize(
