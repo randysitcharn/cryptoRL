@@ -5368,7 +5368,16 @@ def run_tqc_audit(
     if not os.path.exists(tensorboard_log):
         tensorboard_log_alt = f"logs/wfo/segment_{segment_id}"
         if os.path.exists(tensorboard_log_alt):
-            tensorboard_log = tensorboard_log_alt
+            # Find the latest run folder (e.g., WFO_seg0_4)
+            run_folders = [d for d in os.listdir(tensorboard_log_alt)
+                          if os.path.isdir(os.path.join(tensorboard_log_alt, d)) and d.startswith("WFO_")]
+            if run_folders:
+                # Sort by modification time (latest first)
+                run_folders.sort(key=lambda d: os.path.getmtime(os.path.join(tensorboard_log_alt, d)), reverse=True)
+                tensorboard_log = os.path.join(tensorboard_log_alt, run_folders[0])
+                print(f"  Using latest run: {run_folders[0]}")
+            else:
+                tensorboard_log = tensorboard_log_alt
     results['convergence'] = analyze_tqc_convergence(tensorboard_log, model=model)
     
     # Generate plots
