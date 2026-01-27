@@ -102,7 +102,7 @@ class TQCTrainingConfig:
     net_arch: Optional[Dict[str, List[int]]] = None  # Default: dict(pi=[64,64], qf=[64,64])
 
     # gSDE (State-Dependent Exploration)
-    use_sde: bool = True
+    use_sde: bool = False  # Disabled - using OU noise instead
     sde_sample_freq: int = 64  # FIX: Resample every 64 steps (was -1 = once per episode)
                                # -1 with episode_length=2048 caused policy collapse
                                # 64 gives fresh exploration noise ~32x per episode
