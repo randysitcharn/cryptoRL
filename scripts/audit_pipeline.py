@@ -5249,43 +5249,78 @@ def analyze_tqc_convergence(
     return results
 
 
+# =============================================================================
+# TQC AUDIT CONFIGURATION - Edit these variables to customize the audit
+# =============================================================================
+TQC_AUDIT_CONFIG = {
+    # --- Segment & Run Selection ---
+    "segment_id": 0,                          # WFO segment ID
+    "run_name": "WFO_seg0_4",                 # Specific run folder (e.g., "WFO_seg0_4") or None for latest
+
+    # --- Paths (None = auto-detect from segment_id) ---
+    "tqc_path": None,                         # e.g., "weights/wfo/segment_0/tqc.zip"
+    "test_data_path": "data/wfo/segment_0/test.parquet",  # e.g., "data/wfo/segment_0/test.parquet"
+    "encoder_path": None,                     # e.g., "weights/wfo/segment_0/encoder.pth"
+    "tensorboard_log": None,                  # e.g., "logs/wfo/segment_0/WFO_seg0_4" or None for auto
+
+    # --- Analysis Settings ---
+    "n_samples": 1000,                        # Number of samples for analysis
+    "device": "cuda",                         # "cuda" or "cpu"
+}
+# =============================================================================
+
+
 def run_tqc_audit(
-    segment_id: int = 0,
+    segment_id: int = None,
     tqc_path: Optional[str] = None,
     test_data_path: Optional[str] = None,
     encoder_path: Optional[str] = None,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    n_samples: int = 1000,
+    tensorboard_log: Optional[str] = None,
+    run_name: Optional[str] = None,
+    device: str = None,
+    n_samples: int = None,
     output_dir: Optional[str] = None
 ) -> Dict:
     """
     Run comprehensive TQC audit with all analyses (A-F).
-    
+
     Args:
         segment_id: WFO segment ID (used to auto-detect paths if not provided)
         tqc_path: Path to TQC model (auto-detected from segment if None)
         test_data_path: Path to test data parquet (auto-detected if None)
         encoder_path: Path to MAE encoder (auto-detected if None)
+        tensorboard_log: Path to TensorBoard log directory (auto-detected if None)
+        run_name: Specific run folder name (e.g., "WFO_seg0_4") or None for latest
         device: Device to use
         n_samples: Number of samples for attribution analysis
         output_dir: Output directory (auto-generated if None)
-    
+
     Returns:
         Dict with all audit results
     """
+    # Apply config defaults if not provided via function args
+    segment_id = segment_id if segment_id is not None else TQC_AUDIT_CONFIG["segment_id"]
+    tqc_path = tqc_path or TQC_AUDIT_CONFIG["tqc_path"]
+    test_data_path = test_data_path or TQC_AUDIT_CONFIG["test_data_path"]
+    encoder_path = encoder_path or TQC_AUDIT_CONFIG["encoder_path"]
+    tensorboard_log = tensorboard_log or TQC_AUDIT_CONFIG["tensorboard_log"]
+    run_name = run_name or TQC_AUDIT_CONFIG["run_name"]
+    device = device or TQC_AUDIT_CONFIG["device"]
+    n_samples = n_samples if n_samples is not None else TQC_AUDIT_CONFIG["n_samples"]
+
     if not HAS_TQC:
         raise ImportError("sb3_contrib not available. Cannot run TQC audit.")
-    
+
     print("=" * 70)
     print("TQC COMPREHENSIVE AUDIT")
     print("=" * 70)
-    print(f"Segment: {segment_id}, Device: {device}")
-    
+    print(f"Segment: {segment_id}, Run: {run_name or 'latest'}, Device: {device}")
+
     # Auto-detect paths from segment_id
     if tqc_path is None:
         tqc_path = f"weights/wfo/segment_{segment_id}/tqc.zip"
     if test_data_path is None:
-        test_data_path = f"data/processed/wfo/segment_{segment_id}/test.parquet"
+        test_data_path = f"data/wfo/segment_{segment_id}/test.parquet"
     if encoder_path is None:
         encoder_path = f"weights/wfo/segment_{segment_id}/encoder.pth"
     
@@ -5363,22 +5398,31 @@ def run_tqc_audit(
     results['attribution'] = analyze_tqc_attribution(model, test_env, n_samples=min(n_samples, 100))
     
     # Section E: Convergence (requires TensorBoard log)
-    tensorboard_log = f"logs/tensorboard_tqc/segment_{segment_id}"
-    # Essayer aussi logs/wfo/segment_X si le premier n'existe pas
-    if not os.path.exists(tensorboard_log):
-        tensorboard_log_alt = f"logs/wfo/segment_{segment_id}"
-        if os.path.exists(tensorboard_log_alt):
-            # Find the latest run folder (e.g., WFO_seg0_4)
-            run_folders = [d for d in os.listdir(tensorboard_log_alt)
-                          if os.path.isdir(os.path.join(tensorboard_log_alt, d)) and d.startswith("WFO_")]
-            if run_folders:
-                # Sort by modification time (latest first)
-                run_folders.sort(key=lambda d: os.path.getmtime(os.path.join(tensorboard_log_alt, d)), reverse=True)
-                tensorboard_log = os.path.join(tensorboard_log_alt, run_folders[0])
-                print(f"  Using latest run: {run_folders[0]}")
-            else:
-                tensorboard_log = tensorboard_log_alt
-    results['convergence'] = analyze_tqc_convergence(tensorboard_log, model=model)
+    # Use provided tensorboard_log or auto-detect
+    tb_log_path = tensorboard_log  # Use config/arg value if provided
+    if tb_log_path is None:
+        # Try logs/tensorboard_tqc/segment_X first
+        tb_log_path = f"logs/tensorboard_tqc/segment_{segment_id}"
+        if not os.path.exists(tb_log_path):
+            # Try logs/wfo/segment_X
+            tb_log_alt = f"logs/wfo/segment_{segment_id}"
+            if os.path.exists(tb_log_alt):
+                # Use specific run_name if provided, otherwise find latest
+                if run_name:
+                    tb_log_path = os.path.join(tb_log_alt, run_name)
+                    print(f"  Using specified run: {run_name}")
+                else:
+                    # Find the latest run folder (e.g., WFO_seg0_4)
+                    run_folders = [d for d in os.listdir(tb_log_alt)
+                                  if os.path.isdir(os.path.join(tb_log_alt, d)) and d.startswith("WFO_")]
+                    if run_folders:
+                        run_folders.sort(key=lambda d: os.path.getmtime(os.path.join(tb_log_alt, d)), reverse=True)
+                        tb_log_path = os.path.join(tb_log_alt, run_folders[0])
+                        print(f"  Using latest run: {run_folders[0]}")
+                    else:
+                        tb_log_path = tb_log_alt
+    print(f"  TensorBoard log: {tb_log_path}")
+    results['convergence'] = analyze_tqc_convergence(tb_log_path, model=model)
     
     # Generate plots
     print(f"\n[5/7] Generating plots...")
