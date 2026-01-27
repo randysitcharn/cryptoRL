@@ -402,19 +402,12 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         Tuple of (train_vec_env, eval_vec_env, None, None, None).
         Last three values are None (kept for backward compatibility).
     """
-    # Curriculum Learning: start with 0 fees if enabled
-    if config.use_curriculum:
-        initial_commission = 0.0
-    else:
-        initial_commission = config.commission
-
     # ==================== Training Environment ====================
     # GPU-Vectorized Batch Environment
     # All envs run in a single process using PyTorch tensors on GPU
     print(f"      [BatchEnv] Creating {n_envs} GPU-vectorized environments (BatchCryptoEnv)...")
-
-    # CORRECTIF SHOCK THERAPY: Force 0 fees pour débloquer l'apprentissage du signal
-    print("      [Shock Therapy] FORCING COMMISSIONS & SLIPPAGE TO 0.0")
+    print(f"      [Costs] commission={config.commission}, slippage={config.slippage}, "
+          f"funding={config.funding_rate}, w_cost={config.w_cost_fixed}")
 
     train_vec_env = BatchCryptoEnv(
         parquet_path=config.data_path,
@@ -423,10 +416,12 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         window_size=config.window_size,
         episode_length=config.episode_length,
         initial_balance=10_000.0,
-        # --- SHOCK THERAPY SETTINGS ---
-        commission=0.0,      # FORCE A ZERO (au lieu de initial_commission)
-        slippage=0.0,        # FORCE A ZERO (au lieu de 0.0001)
-        # ------------------------------
+        # --- Transaction Costs (from config - Single Source of Truth) ---
+        commission=config.commission,
+        slippage=config.slippage,
+        funding_rate=config.funding_rate,
+        w_cost_fixed=config.w_cost_fixed,
+        # -----------------------------------------------------------------
         reward_scaling=config.reward_scaling,
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,

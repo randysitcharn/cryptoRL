@@ -37,10 +37,16 @@ class TQCTrainingConfig:
 
     # --- Environment ---
     window_size: int = 64
-    commission: float = 0.0002  # 0.02% - Further reduced to encourage trading (was 0.05%)
     train_ratio: float = 0.8
     episode_length: int = 2048
     eval_episode_length: int = 600  # Safe value < (720 - window_size - 1)
+
+    # --- Transaction Costs (Single Source of Truth) ---
+    # Training uses these values; set to 0 for debugging policy collapse
+    commission: float = 0.0        # Transaction fee (0.0002 = 0.02% realistic)
+    slippage: float = 0.0          # Slippage cost (0.0001 = 0.01% realistic)
+    funding_rate: float = 0.0      # Funding for shorts (0.0001 = 0.01% realistic)
+    w_cost_fixed: float = 0.0      # Fixed w_cost for MORL (None-like = 0, disables cost penalty)
 
     # Reward function (DSR + MORL in env)
     reward_scaling: float = 1.0   # Keep at 1.0

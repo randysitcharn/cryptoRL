@@ -58,8 +58,11 @@ class BatchCryptoEnv(VecEnv):
         window_size: int = 64,
         episode_length: int = 2048,
         initial_balance: float = 10_000.0,
-        commission: float = 0.0006,
-        slippage: float = 0.0001,
+        # Transaction costs (defaults from TQCTrainingConfig)
+        commission: float = 0.0,
+        slippage: float = 0.0,
+        funding_rate: float = 0.0,
+        w_cost_fixed: Optional[float] = 0.0,  # Fixed w_cost (0=no cost penalty, None=sample)
         # Reward params
         reward_scaling: float = 1.0,
         downside_coef: float = 10.0,
@@ -76,8 +79,6 @@ class BatchCryptoEnv(VecEnv):
         observation_noise: float = 0.0,  # 0 = disabled by default
         # Episode start mode
         random_start: bool = True,  # If False, start at beginning (for evaluation)
-        # Short selling
-        funding_rate: float = 0.0001,  # 0.01% per step (~0.24%/day) for short positions
         # Domain Randomization (anti-overfitting)
         enable_domain_randomization: bool = True,
         commission_min: float = 0.0002,  # 0.02%
@@ -142,6 +143,7 @@ class BatchCryptoEnv(VecEnv):
         self.observation_noise = observation_noise
         self.random_start = random_start
         self.funding_rate = funding_rate
+        self.w_cost_fixed = w_cost_fixed  # Fixed w_cost for MORL (None=sample, 0=no penalty)
         self.training = True  # Flag for observation noise (disable during eval)
         self._last_noise_scale = 0.0  # For TensorBoard logging (Dynamic Noise)
 
@@ -554,28 +556,23 @@ class BatchCryptoEnv(VecEnv):
             self._sample_domain_params(torch.arange(self.num_envs, device=self.device))
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL: Sample w_cost (curriculum or biased distribution)
-        # Priority: eval_w_cost > curriculum > biased distribution
+        # MORL: Sample w_cost (priority: w_cost_fixed > eval > curriculum > sample)
         # ═══════════════════════════════════════════════════════════════════
-        if self._eval_w_cost is not None:
-            # Evaluation mode: use fixed w_cost for reproducibility (highest priority)
+        if self.w_cost_fixed is not None:
+            # Fixed w_cost from config (Single Source of Truth)
+            self.w_cost.fill_(self.w_cost_fixed)
+        elif self._eval_w_cost is not None:
+            # Evaluation mode: use fixed w_cost for reproducibility
             self.w_cost.fill_(self._eval_w_cost)
         elif self._use_curriculum_sampling and self._w_cost_target is not None:
             # Curriculum mode: sample around target with truncated normal
-            # std=0.1 provides exploration while following curriculum
             target = self._w_cost_target
             std = 0.1
-            # Sample from normal distribution, then clip to [0, 1]
             samples = torch.normal(mean=target, std=std, size=(self.num_envs, 1), device=self.device)
             self.w_cost = torch.clamp(samples, min=0.0, max=1.0)
         else:
             # Training mode: sample with biased distribution (20%/60%/20%)
-            # 20% extremes (0 or 1) + 60% uniform to ensure agent explores
-            # both pure scalping and pure B&H strategies, not just the middle
             sample_type = torch.rand(self.num_envs, device=self.device)
-            # 20% chance: w_cost = 0 (scalping mode - ignore costs)
-            # 20% chance: w_cost = 1 (B&H mode - maximize cost avoidance)
-            # 60% chance: w_cost ~ Uniform[0, 1] (exploration)
             self.w_cost = torch.where(
                 sample_type.unsqueeze(1) < 0.2,
                 torch.zeros(self.num_envs, 1, device=self.device),
@@ -910,17 +907,19 @@ class BatchCryptoEnv(VecEnv):
                 self._sample_domain_params(done_indices)
 
         # ═══════════════════════════════════════════════════════════════════
-        # MORL: Resample w_cost for done envs (curriculum or biased distribution)
-        # Priority: eval_w_cost > curriculum > biased distribution
+        # MORL: Resample w_cost for done envs
+        # Priority: w_cost_fixed > eval > curriculum > sample
         # ═══════════════════════════════════════════════════════════════════
-        if self._eval_w_cost is not None:
-            # Evaluation mode: use fixed w_cost (highest priority)
+        if self.w_cost_fixed is not None:
+            # Fixed w_cost from config (Single Source of Truth)
+            self.w_cost[dones] = self.w_cost_fixed
+        elif self._eval_w_cost is not None:
+            # Evaluation mode: use fixed w_cost
             self.w_cost[dones] = self._eval_w_cost
         elif self._use_curriculum_sampling and self._w_cost_target is not None:
             # Curriculum mode: sample around target with truncated normal
             target = self._w_cost_target
             std = 0.1
-            # Sample from normal distribution, then clip to [0, 1]
             samples = torch.normal(mean=target, std=std, size=(n_done, 1), device=self.device)
             new_w_cost = torch.clamp(samples, min=0.0, max=1.0)
             self.w_cost[dones] = new_w_cost
