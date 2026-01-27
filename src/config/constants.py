@@ -121,9 +121,9 @@ MAE_DROPOUT: float = 0.1
 # RL Training Constants (Single Source of Truth)
 # =============================================================================
 # Default log_std_init for gSDE exploration
-# 0.0 gives std=1.0 (Shock Therapy: exploration maximale de l'espace [-1, 1])
-# Previous: -1.0 gave std≈0.37 (vs SB3 default -3 giving std≈0.05)
-DEFAULT_LOG_STD_INIT: float = 0.0
+# -2.0 gives std≈7.4 (exp(-(-2)) = exp(2)), increased exploration
+# Previous: 0.0 gave std=1.0, SB3 default -3 gives std≈0.05
+DEFAULT_LOG_STD_INIT: float = -2.0
 
 # Default minimum entropy coefficient for EntropyFloorCallback
 # Prevents entropy collapse in SAC/TQC auto-tuning

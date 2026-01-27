@@ -47,8 +47,8 @@ class TQCTrainingConfig:
     downside_coef: float = 1.0    # Legacy, unused with DSR
     upside_coef: float = 0.0
     action_discretization: float = 0.1
-    dsr_eta: float = 0.005       # DSR EMA decay (Moody & Saffell 1998)
-    dsr_warmup_steps: int = 50   # Steps before DSR activates (warmup = log-return)
+    dsr_eta: float = 0.02        # DSR EMA decay - faster adaptation (~50 steps to converge)
+    dsr_warmup_steps: int = 200  # Steps before DSR activates (let EMA stabilize first)
 
     # Volatility scaling
     target_volatility: float = 0.05  # 5% target vol

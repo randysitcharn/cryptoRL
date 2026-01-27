@@ -462,7 +462,7 @@ class BatchCryptoEnv(VecEnv):
 
         Reference: Moody & Saffell (1998) "Learning to Trade via Direct RL".
         """
-        DSR_SCALE = 10.0
+        DSR_SCALE = 3.0  # Reduced to avoid noise amplification
         MAX_PENALTY_SCALE = 0.05
         COST_PENALTY_CAP = 0.01
 
@@ -471,12 +471,12 @@ class BatchCryptoEnv(VecEnv):
         delta_B = R_t ** 2 - self.dsr_B
 
         variance = torch.clamp(self.dsr_B - self.dsr_A ** 2, min=1e-8)
-        denom = variance ** 1.5
+        denom = variance ** 1.5 + 1e-6  # Epsilon for numerical stability
         numerator = self.dsr_B * delta_A - 0.5 * self.dsr_A * delta_B
         r_dsr_raw = numerator / denom
         self._dsr_raw = r_dsr_raw.clone()
         self._dsr_variance = variance.clone()
-        r_dsr_raw = torch.clamp(r_dsr_raw, min=-5.0, max=5.0)
+        r_dsr_raw = torch.clamp(r_dsr_raw, min=-10.0, max=10.0)  # Allow stronger signals
 
         warmup_mask = self.episode_lengths < self.dsr_warmup_steps
         r_simple = torch.log1p(torch.clamp(R_t, min=-0.99)) * DSR_SCALE
