@@ -10,6 +10,9 @@ from typing import Optional, Union, List, Dict, Callable
 
 from src.config.constants import (
     DEFAULT_LOG_STD_INIT,
+    DEFAULT_TARGET_VOLATILITY,
+    DEFAULT_VOL_WINDOW,
+    DEFAULT_MAX_LEVERAGE,
     MAE_D_MODEL,
     MAE_N_HEADS,
     MAE_N_LAYERS,
@@ -56,10 +59,10 @@ class TQCTrainingConfig:
     dsr_eta: float = 0.02        # DSR EMA decay - faster adaptation (~50 steps to converge)
     dsr_warmup_steps: int = 200  # Steps before DSR activates (let EMA stabilize first)
 
-    # Volatility scaling
-    target_volatility: float = 0.05  # 5% target vol
-    vol_window: int = 24
-    max_leverage: float = 2.0
+    # Volatility scaling (Single Source of Truth: constants.py)
+    target_volatility: float = DEFAULT_TARGET_VOLATILITY  # 1.0 = disabled
+    vol_window: int = DEFAULT_VOL_WINDOW
+    max_leverage: float = DEFAULT_MAX_LEVERAGE
 
     # Regularization (anti-overfitting)
     observation_noise: float = 0.01  # 1% Gaussian noise on market observations

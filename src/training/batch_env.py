@@ -19,6 +19,11 @@ from stable_baselines3.common.vec_env import VecEnv
 from gymnasium import spaces
 
 from src.config import EXCLUDE_COLS
+from src.config.constants import (
+    DEFAULT_TARGET_VOLATILITY,
+    DEFAULT_VOL_WINDOW,
+    DEFAULT_MAX_LEVERAGE,
+)
 
 
 class BatchCryptoEnv(VecEnv):
@@ -58,10 +63,10 @@ class BatchCryptoEnv(VecEnv):
         downside_coef: float = 10.0,
         upside_coef: float = 0.0,
         action_discretization: float = 0.1,
-        # Volatility scaling
-        target_volatility: float = 0.01,
-        vol_window: int = 24,
-        max_leverage: float = 5.0,
+        # Volatility scaling (Single Source of Truth: constants.py)
+        target_volatility: float = DEFAULT_TARGET_VOLATILITY,
+        vol_window: int = DEFAULT_VOL_WINDOW,
+        max_leverage: float = DEFAULT_MAX_LEVERAGE,
         # Data range (for train/val split)
         start_idx: Optional[int] = None,
         end_idx: Optional[int] = None,

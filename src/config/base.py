@@ -8,7 +8,10 @@ Provides common settings used across training, tuning, and evaluation.
 from dataclasses import dataclass
 import torch
 
-from src.config.constants import MAE_D_MODEL, MAE_N_HEADS, MAE_N_LAYERS, MAE_DROPOUT
+from src.config.constants import (
+    MAE_D_MODEL, MAE_N_HEADS, MAE_N_LAYERS, MAE_DROPOUT,
+    DEFAULT_TARGET_VOLATILITY, DEFAULT_VOL_WINDOW, DEFAULT_MAX_LEVERAGE,
+)
 
 
 # =============================================================================
@@ -71,10 +74,10 @@ class EnvConfig:
     upside_coef: float = 0.0
     action_discretization: float = 0.1
 
-    # Volatility scaling
-    target_volatility: float = 0.01
-    vol_window: int = 24
-    max_leverage: float = 5.0
+    # Volatility scaling (Single Source of Truth: constants.py)
+    target_volatility: float = DEFAULT_TARGET_VOLATILITY
+    vol_window: int = DEFAULT_VOL_WINDOW
+    max_leverage: float = DEFAULT_MAX_LEVERAGE
 
 
 # =============================================================================

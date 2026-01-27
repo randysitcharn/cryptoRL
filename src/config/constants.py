@@ -131,6 +131,17 @@ DEFAULT_LOG_STD_INIT: float = 3.0
 DEFAULT_MIN_ENT_COEF: float = 0.01
 
 # =============================================================================
+# Volatility Scaling Constants (Single Source of Truth)
+# =============================================================================
+# These control position sizing based on market volatility (risk parity)
+# Formula: effective_action = raw_action * (target_vol / current_vol)
+# Set target_volatility = 1.0 to effectively disable vol scaling
+
+DEFAULT_TARGET_VOLATILITY: float = 1.0  # 100% = disabled (was 0.05 = 5%)
+DEFAULT_VOL_WINDOW: int = 24            # EMA window for vol estimation (hours)
+DEFAULT_MAX_LEVERAGE: float = 2.0       # Max vol scaling multiplier
+
+# =============================================================================
 # Model Architecture Configurations (Dataclasses)
 # =============================================================================
 # These dataclasses centralize all model dimensions to prevent mismatches.
