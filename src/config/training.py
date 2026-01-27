@@ -52,7 +52,7 @@ class TQCTrainingConfig:
     reward_scaling: float = 1.0   # Keep at 1.0
     downside_coef: float = 1.0    # Legacy, unused with DSR
     upside_coef: float = 0.0
-    action_discretization: float = 0.1
+    action_discretization: float = 0.0  # Disabled - was causing policy collapse (actions < 0.05 → 0)
     dsr_eta: float = 0.02        # DSR EMA decay - faster adaptation (~50 steps to converge)
     dsr_warmup_steps: int = 200  # Steps before DSR activates (let EMA stabilize first)
 
