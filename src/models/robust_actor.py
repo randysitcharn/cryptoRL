@@ -55,6 +55,7 @@ class RobustDropoutActor(BasePolicy):
         dropout_rate: float = 0.0,
         use_layer_norm: bool = False,
         use_spectral_norm: bool = False,
+        use_gated_policy: bool = False,
     ) -> None:
         BasePolicy.__init__(
             self,
@@ -76,6 +77,8 @@ class RobustDropoutActor(BasePolicy):
         self._dropout_rate = dropout_rate
         self._use_layer_norm = use_layer_norm
         self._use_spectral_norm = use_spectral_norm
+        self.use_gated_policy = use_gated_policy
+        self._last_gate_val = 0.0  # Phase 4 monitoring
 
         action_dim = get_action_dim(self.action_space)
         last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
@@ -104,7 +107,7 @@ class RobustDropoutActor(BasePolicy):
                 latent_sde_dim=last_layer_dim,
                 log_std_init=log_std_init,
             )
-            if clip_mean > 0.0:
+            if clip_mean > 0.0 and not use_gated_policy:
                 self.mu = nn.Sequential(
                     self.mu,
                     nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean),
@@ -115,6 +118,20 @@ class RobustDropoutActor(BasePolicy):
             self.mu = nn.Linear(last_layer_dim, action_dim)
             self.log_std = nn.Linear(last_layer_dim, action_dim)
             self.action_dist = action_dist
+
+        # Gated Policy (Phase 2): Gate (Sigmoid) * Size (Tanh) => mean_actions
+        if use_gated_policy:
+            self.mu_gate = nn.Sequential(
+                nn.Linear(last_layer_dim, 1),
+                nn.Sigmoid(),
+            )
+            self.mu_size = nn.Sequential(
+                nn.Linear(last_layer_dim, action_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.mu_gate = None
+            self.mu_size = None
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
@@ -132,6 +149,7 @@ class RobustDropoutActor(BasePolicy):
                 dropout_rate=self._dropout_rate,
                 use_layer_norm=self._use_layer_norm,
                 use_spectral_norm=self._use_spectral_norm,
+                use_gated_policy=self.use_gated_policy,
             )
         )
         return data
@@ -141,7 +159,14 @@ class RobustDropoutActor(BasePolicy):
     ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         features = self.extract_features(obs, self.features_extractor)
         latent_pi = self.latent_pi(features)
-        mean_actions = self.mu(latent_pi)
+        if self.use_gated_policy and self.mu_gate is not None and self.mu_size is not None:
+            gate = self.mu_gate(latent_pi)  # (B, 1)
+            size = self.mu_size(latent_pi)  # (B, action_dim)
+            mean_actions = gate * size
+            with torch.no_grad():
+                self._last_gate_val = gate.mean().item()
+        else:
+            mean_actions = self.mu(latent_pi)
 
         if self.use_sde:
             return mean_actions, self.log_std, dict(latent_sde=latent_pi)

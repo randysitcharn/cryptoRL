@@ -336,6 +336,11 @@ class UnifiedMetricsCallback(BaseCallback):
                     self.logger.record("reward/regret_dsr_raw", val)  # Alias for TensorBoard triptyque
                 if "portfolio/alpha_returns" in metrics:
                     self.logger.record("portfolio/alpha_returns", metrics["portfolio/alpha_returns"])
+                # Phase 4.2: benchmark/return_ema et portfolio/return_ema
+                if "benchmark/return_ema" in metrics:
+                    self.logger.record("benchmark/return_ema", metrics["benchmark/return_ema"])
+                if "portfolio/return_ema" in metrics:
+                    self.logger.record("portfolio/return_ema", metrics["portfolio/return_ema"])
                 if "exploration/cost_annealing_scale" in metrics:
                     self.logger.record("exploration/cost_annealing_scale", metrics["exploration/cost_annealing_scale"])
                 # Gate mean (Phase 2): from actor when Gated Policy is used

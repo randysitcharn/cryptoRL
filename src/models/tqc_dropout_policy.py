@@ -346,6 +346,8 @@ class TQCDropoutPolicy(TQCPolicy):
         use_spectral_norm_actor: bool = False,    # Default False (conservative)
         # ====== Exploration Init (FIX for small positions) ======
         log_std_init: float = DEFAULT_LOG_STD_INIT,  # Single source of truth (constants.py)
+        # ====== Gated Policy (Phase 2 - Cash Trap) ======
+        use_gated_policy: bool = False,
         **kwargs
     ):
         """
@@ -390,6 +392,7 @@ class TQCDropoutPolicy(TQCPolicy):
         self.n_quantiles = n_quantiles
         self.n_critics = n_critics
         self.log_std_init = log_std_init  # FIX: Store for make_actor
+        self.use_gated_policy = use_gated_policy
 
         super().__init__(
             observation_space,
@@ -430,6 +433,7 @@ class TQCDropoutPolicy(TQCPolicy):
             dropout_rate=self.actor_dropout,
             use_layer_norm=self.use_layer_norm,
             use_spectral_norm=self.use_spectral_norm_actor,
+            use_gated_policy=self.use_gated_policy,
         ).to(self.device)
 
     def make_critic(self, features_extractor: Optional[nn.Module] = None) -> DropoutCritic:

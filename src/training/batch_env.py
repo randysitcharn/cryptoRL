@@ -35,6 +35,7 @@ from src.config.constants import (
     DEFAULT_SLIPPAGE_NOISE_STD,
     DEFAULT_FUNDING_RATE,
 )
+from src.training.regret_dsr import RegretDSR
 
 
 class BatchCryptoEnv(VecEnv):
@@ -95,7 +96,12 @@ class BatchCryptoEnv(VecEnv):
         commission_max: float = DEFAULT_COMMISSION_MAX,
         slippage_min: float = DEFAULT_SLIPPAGE_MIN,
         slippage_max: float = DEFAULT_SLIPPAGE_MAX,
-        slippage_noise_std: float = DEFAULT_SLIPPAGE_NOISE_STD
+        slippage_noise_std: float = DEFAULT_SLIPPAGE_NOISE_STD,
+        # RegretDSR & Cash Trap (Phase 1)
+        use_regret_dsr: bool = True,
+        inaction_threshold: float = 0.05,
+        inaction_penalty: float = 0.01,
+        cost_anneal_ratio: float = 0.0,
     ):
         """
         Initialize the batch environment.
@@ -130,6 +136,10 @@ class BatchCryptoEnv(VecEnv):
             slippage_min: Minimum slippage rate for randomization.
             slippage_max: Maximum slippage rate for randomization.
             slippage_noise_std: Standard deviation of execution slippage noise.
+            use_regret_dsr: If True, use RegretDSR (Alpha vs B&H) instead of DSR on raw returns.
+            inaction_threshold: |position| below this is penalized (e.g. 0.05 = 5%).
+            inaction_penalty: Fixed penalty when inactive (e.g. 0.01).
+            cost_anneal_ratio: Progress [0,1] at which costs reach 100%. 0 = disabled.
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.num_envs = n_envs  # Store locally, VecEnv.__init__ will set self.num_envs
@@ -162,6 +172,12 @@ class BatchCryptoEnv(VecEnv):
         self.slippage_min = slippage_min
         self.slippage_max = slippage_max
         self.slippage_noise_std = slippage_noise_std
+
+        # RegretDSR & Cash Trap (Phase 1)
+        self.use_regret_dsr = use_regret_dsr
+        self.inaction_threshold = inaction_threshold
+        self.inaction_penalty = inaction_penalty
+        self.cost_anneal_ratio = cost_anneal_ratio if cost_anneal_ratio > 0 else 0.0
 
         # Curriculum state (stateless architecture - AAAI 2024 Curriculum Learning)
         self.progress = 0.0           # Training progress [0, 1]
@@ -331,6 +347,24 @@ class BatchCryptoEnv(VecEnv):
         self.dsr_B = torch.full((n,), 1e-6, device=device)
         self._dsr_raw = torch.zeros(n, device=device)
         self._dsr_variance = torch.zeros(n, device=device)
+        self._benchmark_returns = torch.zeros(n, device=device)
+        # Phase 4.2: EMA des returns pour benchmark/return_ema et portfolio/return_ema
+        self._portfolio_return_ema = torch.zeros(n, device=device)
+        self._benchmark_return_ema = torch.zeros(n, device=device)
+        self._return_ema_eta = 0.02
+
+        # RegretDSR (Phase 1): DSR on Alpha = agent_return - benchmark_return
+        if self.use_regret_dsr:
+            self.regret_dsr = RegretDSR(
+                n_envs=n,
+                device=device,
+                eta=self.dsr_eta,
+                scale=10.0,
+                warmup_steps=self.dsr_warmup_steps,
+                clip_val=5.0,
+            )
+        else:
+            self.regret_dsr = None
 
         # Domain Randomization: per-env commission/slippage
         self.commission_per_env = torch.zeros(n, device=device)
@@ -388,11 +422,25 @@ class BatchCryptoEnv(VecEnv):
 
         Returns aggregated metrics computed entirely on GPU with minimal CPU transfer.
         Designed for Direct GPU Metric Polling from DetailTensorboardCallback.
+
+        Phase 4: policy/action_saturation, reward/regret_dsr_raw, portfolio/alpha_returns,
+        exploration/cost_annealing_scale.
         """
         navs = self._get_navs()
         drawdowns = (self.peak_navs - navs) / torch.clamp(self.peak_navs, min=1.0)
 
-        return {
+        # Action Saturation Index (Phase 4): % of envs with |position| > 0.1 (active)
+        active_mask = self.position_pcts.abs() > 0.1
+        action_saturation = active_mask.float().mean().item()
+
+        # Cost annealing scale for exploration logging (Phase 3)
+        cost_annealing_scale = (
+            min(1.0, self.progress / self.cost_anneal_ratio)
+            if self.cost_anneal_ratio > 0
+            else 1.0
+        )
+
+        out = {
             # Portfolio metrics
             "portfolio_value": navs.mean().item(),
             "max_drawdown": drawdowns.max().item(),
@@ -406,16 +454,38 @@ class BatchCryptoEnv(VecEnv):
             "reward/smoothness": self._rew_smooth.mean().item(),
             "reward/dsr_raw": self._dsr_raw.mean().item(),
             "reward/dsr_variance": self._dsr_variance.mean().item(),
-            "reward/dsr_A": self.dsr_A.mean().item(),
-            "reward/dsr_B": self.dsr_B.mean().item(),
+            "reward/dsr_A": (
+                self.regret_dsr.A.mean().item()
+                if self.regret_dsr is not None
+                else self.dsr_A.mean().item()
+            ),
+            "reward/dsr_B": (
+                self.regret_dsr.B.mean().item()
+                if self.regret_dsr is not None
+                else self.dsr_B.mean().item()
+            ),
+            # RegretDSR / Alpha (Phase 1 & 4)
+            "reward/regret_dsr_raw": self._dsr_raw.mean().item(),
+            "portfolio/alpha_returns": (
+                (self._rew_pnl - self._benchmark_returns).mean().item()
+            ),
+            # Phase 4.2: EMA des returns (première version avant Sharpe vs Benchmark)
+            "benchmark/return_ema": self._benchmark_return_ema.mean().item(),
+            "portfolio/return_ema": self._portfolio_return_ema.mean().item(),
+            # Policy activity (Phase 4)
+            "policy/action_saturation": action_saturation,
+            "policy/mean_position_abs": self.position_pcts.abs().mean().item(),
             # Curriculum state (AAAI 2024)
             "curriculum/lambda": self.curriculum_lambda,
             "curriculum/progress": self.progress,
             "curriculum/gate_open": self.last_gate_mean,
+            # Exploration (Phase 3)
+            "exploration/cost_annealing_scale": cost_annealing_scale,
             # MORL metrics (Audit 2026-01-22)
             "morl/w_cost_mean": self.w_cost.mean().item(),
             "morl/w_cost_std": self.w_cost.std().item(),
         }
+        return out
 
     def _get_batch_windows(self, steps: torch.Tensor) -> torch.Tensor:
         """
@@ -461,10 +531,10 @@ class BatchCryptoEnv(VecEnv):
         dones: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Reward: DSR (Differential Sharpe Reward) or log-return warmup + MORL churn.
+        Reward: RegretDSR (Alpha vs B&H) or legacy DSR + inaction penalty + MORL churn.
 
-        DSR (Moody & Saffell 1998) rewards incremental improvement of risk/return profile.
-        Order: deltas -> reward -> update EMA (use current moments for this step's reward).
+        RegretDSR (Phase 1): DSR on Alpha = agent_return - benchmark_return; renders
+        inaction costly. Legacy path: DSR on raw returns (Moody & Saffell 1998).
 
         Args:
             step_returns: (new_nav - old_nav) / old_nav. Shape: (n_envs,)
@@ -477,44 +547,83 @@ class BatchCryptoEnv(VecEnv):
         SCALE = 10.0
         MAX_PENALTY_SCALE = 0.05
         COST_PENALTY_CAP = 0.1
-        DSR_SCALE = 10.0
 
-        # MORL churn cost (unchanged)
-        r_cost = -position_deltas * SCALE
+        # Cost annealing (Phase 1 & 3): reduce churn penalty early in training
+        cost_scale = 1.0
+        if self.cost_anneal_ratio > 0:
+            cost_scale = min(1.0, self.progress / self.cost_anneal_ratio)
+
+        # MORL churn cost (scaled by cost_anneal)
+        r_cost = -position_deltas * SCALE * cost_scale
         r_cost = torch.clamp(r_cost, min=-COST_PENALTY_CAP, max=0.0)
 
-        # 1. Deltas (current EMAs, before update)
-        delta_A = step_returns - self.dsr_A
-        delta_B = step_returns ** 2 - self.dsr_B
+        if self.use_regret_dsr and self.regret_dsr is not None:
+            # --- RegretDSR path (Phase 1) ---
+            # 1. Benchmark (Buy & Hold): rendement du prix entre t-1 et t
+            prev_idx = torch.clamp(self.current_steps - 1, min=0)
+            prices_prev = self.prices[prev_idx]
+            prices_curr = self.prices[self.current_steps]
+            benchmark_returns = (prices_curr - prices_prev) / torch.clamp(prices_prev, min=1e-8)
+            valid_mask = self.current_steps > self.episode_starts
+            benchmark_returns = torch.where(
+                valid_mask, benchmark_returns, torch.zeros_like(benchmark_returns)
+            )
+            self._benchmark_returns = benchmark_returns
 
-        # 2. Variance (clamp to avoid div/0 and negative from float error)
-        variance = torch.clamp(self.dsr_B - self.dsr_A ** 2, min=1e-8)
+            # 2. Performance reward via RegretDSR (DSR on Alpha)
+            r_perf, _, _ = self.regret_dsr.update_and_reward(
+                step_returns,
+                benchmark_returns,
+                self.episode_lengths,
+            )
 
-        # 3. DSR (out of warmup)
-        dsr_val = (self.dsr_B * delta_A - 0.5 * self.dsr_A * delta_B) / (variance ** 1.5)
-        r_dsr = torch.clamp(dsr_val * DSR_SCALE, -5.0, 5.0)
+            # 3. Inaction penalty (Phase 1)
+            is_inactive = self.position_pcts.abs() < self.inaction_threshold
+            r_inaction = -self.inaction_penalty * is_inactive.float()
+        else:
+            # --- Legacy DSR path ---
+            self._benchmark_returns = torch.zeros_like(step_returns)
+            delta_A = step_returns - self.dsr_A
+            delta_B = step_returns ** 2 - self.dsr_B
+            variance = torch.clamp(self.dsr_B - self.dsr_A ** 2, min=1e-8)
+            DSR_SCALE = 10.0
+            dsr_val = (self.dsr_B * delta_A - 0.5 * self.dsr_A * delta_B) / (variance ** 1.5)
+            r_dsr = torch.clamp(dsr_val * DSR_SCALE, -5.0, 5.0)
+            warmup_mask = self.episode_lengths < self.dsr_warmup_steps
+            r_simple = torch.log1p(torch.clamp(step_returns, min=-0.99)) * DSR_SCALE
+            r_perf = torch.where(warmup_mask, r_simple, r_dsr)
+            self.dsr_A.add_(delta_A, alpha=self.dsr_eta)
+            self.dsr_B.add_(delta_B, alpha=self.dsr_eta)
+            is_inactive = self.position_pcts.abs() < self.inaction_threshold
+            r_inaction = -self.inaction_penalty * is_inactive.float() if self.inaction_penalty != 0 else torch.zeros_like(step_returns)
 
-        # 4. Warmup: log-return scaled by DSR_SCALE; same scale as r_dsr for VecNormalize
-        warmup_mask = self.episode_lengths < self.dsr_warmup_steps
-        r_simple = torch.log1p(torch.clamp(step_returns, min=-0.99)) * DSR_SCALE
-        r_perf = torch.where(warmup_mask, r_simple, r_dsr)
-
-        # 5. Update EMA (every step, including warmup)
-        self.dsr_A.add_(delta_A, alpha=self.dsr_eta)
-        self.dsr_B.add_(delta_B, alpha=self.dsr_eta)
-
-        # 6. Logging
+        # Logging
         self._dsr_raw = r_perf
-        self._dsr_variance = variance
+        if self.regret_dsr is not None:
+            self._dsr_variance = torch.clamp(
+                self.regret_dsr.B - self.regret_dsr.A ** 2, min=1e-8
+            )
+        else:
+            self._dsr_variance = torch.clamp(
+                self.dsr_B - self.dsr_A ** 2, min=1e-8
+            )
         self._rew_pnl = step_returns
         self._rew_churn = r_cost
         self._rew_downside = torch.zeros_like(step_returns)
         self._rew_smooth = torch.zeros_like(step_returns)
         self.last_gate_mean = 1.0
 
-        # 7. Final reward: DSR/warmup + MORL
+        # Phase 4.2: update return EMAs for benchmark/return_ema and portfolio/return_ema
+        eta = self._return_ema_eta
+        self._portfolio_return_ema = (1.0 - eta) * self._portfolio_return_ema + eta * step_returns
+        self._benchmark_return_ema = (1.0 - eta) * self._benchmark_return_ema + eta * self._benchmark_returns
+
+        # Final reward: (r_perf + r_inaction when RegretDSR) * scaling + MORL
+        r_inaction_val = (
+            r_inaction if self.use_regret_dsr else torch.zeros_like(step_returns)
+        )
         w_cost_squeezed = self.w_cost.squeeze(-1)
-        reward = r_perf * self.reward_scaling + (
+        reward = (r_perf + r_inaction_val) * self.reward_scaling + (
             w_cost_squeezed * r_cost * MAX_PENALTY_SCALE
         )
         return reward
@@ -785,6 +894,14 @@ class BatchCryptoEnv(VecEnv):
             effective_cost_rate = base_cost_rate + slippage_noise
         else:
             effective_cost_rate = base_cost_rate
+
+        # Cost annealing (Phase 3): ramp from 0 to 100% cost as progress increases
+        if self.cost_anneal_ratio > 0:
+            cost_mult = min(1.0, self.progress / self.cost_anneal_ratio)
+            cost_mult_t = torch.full(
+                (self.num_envs,), cost_mult, device=self.device, dtype=effective_cost_rate.dtype
+            )
+            effective_cost_rate = effective_cost_rate * cost_mult_t
         
         trade_costs = trade_values * effective_cost_rate
 
@@ -922,6 +1039,11 @@ class BatchCryptoEnv(VecEnv):
         # Reset DSR EMA for done envs
         self.dsr_A[dones] = 0.0
         self.dsr_B[dones] = 1e-6
+        if self.use_regret_dsr and self.regret_dsr is not None:
+            self.regret_dsr.reset(dones)
+        # Reset return EMAs for done envs (Phase 4.2)
+        self._portfolio_return_ema[dones] = 0.0
+        self._benchmark_return_ema[dones] = 0.0
 
         # Domain Randomization: set or resample fees for done envs (always call so fixed fees are applied when disabled)
         done_indices = torch.nonzero(dones, as_tuple=True)[0]
