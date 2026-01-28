@@ -123,8 +123,9 @@ MAE_DROPOUT: float = 0.1
 # Default log_std_init for gSDE exploration
 # Formula: std = exp(log_std_init)
 # 0.0 gives std=1.0, -3.0 (SB3 default) gives std≈0.05
-# Using 3.0 for maximum exploration (std≈20)
-DEFAULT_LOG_STD_INIT: float = 3.0
+# Using -2.0 for better signal/noise ratio (std≈0.14)
+# Was 3.0 (std≈20) but noise drowned out the mean signal
+DEFAULT_LOG_STD_INIT: float = -2.0
 
 # Default minimum entropy coefficient for EntropyFloorCallback
 # Prevents entropy collapse in SAC/TQC auto-tuning
