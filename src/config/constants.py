@@ -131,6 +131,15 @@ DEFAULT_LOG_STD_INIT: float = -1.0
 DEFAULT_MIN_ENT_COEF: float = 0.01
 
 # =============================================================================
+# Optimizer Constants (Single Source of Truth)
+# =============================================================================
+# Default optimizer hyperparameters for TQC training
+DEFAULT_OPTIMIZER_WEIGHT_DECAY: float = 1e-4  # P0 Robust Finance: régularisation agressive
+DEFAULT_OPTIMIZER_BETAS: tuple = (0.9, 0.999)  # Standard Adam betas
+DEFAULT_OPTIMIZER_EPS: float = 1e-5  # Numerical stability
+DEFAULT_MAX_GRAD_NORM: float = 0.5  # Gradient clipping pour ClippedAdamW (sécurité)
+
+# =============================================================================
 # Volatility Scaling Constants (Single Source of Truth)
 # =============================================================================
 # These control position sizing based on market volatility (risk parity)

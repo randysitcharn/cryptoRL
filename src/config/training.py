@@ -18,6 +18,10 @@ from src.config.constants import (
     MAE_N_HEADS,
     MAE_N_LAYERS,
     MAE_DROPOUT,
+    DEFAULT_OPTIMIZER_WEIGHT_DECAY,
+    DEFAULT_OPTIMIZER_BETAS,
+    DEFAULT_OPTIMIZER_EPS,
+    DEFAULT_MAX_GRAD_NORM,
 )
 
 
@@ -103,6 +107,12 @@ class TQCTrainingConfig:
     top_quantiles_to_drop: int = 2
     n_critics: int = 2
     n_quantiles: int = 25
+
+    # --- Optimizer Configuration ---
+    optimizer_weight_decay: float = DEFAULT_OPTIMIZER_WEIGHT_DECAY  # 1e-4
+    optimizer_betas: tuple = DEFAULT_OPTIMIZER_BETAS  # (0.9, 0.999)
+    optimizer_eps: float = DEFAULT_OPTIMIZER_EPS  # 1e-5
+    optimizer_max_grad_norm: float = DEFAULT_MAX_GRAD_NORM  # 0.5 (pour ClippedAdamW)
 
     # Entropy tuning (Gated Policy / RegretDSR)
     # "auto" = -dim(action) = -1.0 ; -1.5 = exploration plus fine une fois Gate ouverte
@@ -251,7 +261,8 @@ class WFOTrainingConfig(TQCTrainingConfig):
     ent_coef: Union[str, float] = "auto_0.5"  # FIX: Auto-tuning with target 0.5
                                                # Increased from 0.1 to prevent entropy collapse
                                                # EntropyFloorCallback ensures floor at 0.01
-    sde_sample_freq: int = 64             # FIX: More frequent resampling
+    sde_sample_freq: int = 16             # P0 Robust Finance: exploration lente et cohérente (was 64)
+    top_quantiles_to_drop: int = 8        # P0 Robust Finance: troncature agressive (32% des quantiles, was 2)
 
     # --- Regularization (aggressive for OOS generalization) ---
     critic_dropout: float = 0.1           # 10% dropout (DroQ max)

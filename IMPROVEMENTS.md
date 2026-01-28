@@ -299,6 +299,32 @@
 
 ---
 
+## 💡 Insights / Best Practices
+
+### Monitoring des Quantiles (Spread) - "Killer Feature" Anti-Overfitting
+
+**Contexte:** Détection d'overfitting en Reinforcement Learning pour trading
+
+**Problème:** 
+- En apprentissage supervisé, on regarde la Loss Validation
+- En RL, la "Reward OOS" est très bruitée et peu fiable pour détecter l'overfitting
+
+**Solution - Le Spread des Quantiles comme "Canari dans la Mine":**
+
+Le **Spread des Quantiles** (écart entre quantiles min/max du Critic TQC) est un indicateur critique pour détecter l'overfitting :
+
+- **Signal d'overfitting:** Si le spread se réduit (le modèle devient sûr de lui) alors que la performance OOS stagne ou baisse, c'est la définition exacte de l'overfitting (arrogance du modèle)
+- **Signal de bonne généralisation:** Un spread stable ou qui augmente avec une performance OOS croissante indique une bonne généralisation
+
+**Implémentation recommandée:**
+- Logger le spread des quantiles dans TensorBoard pendant l'entraînement
+- Monitorer la divergence entre spread (confiance du modèle) et performance OOS
+- Alerter si spread ↓ + performance OOS → ou ↓ (signe d'overfitting)
+
+**Référence:** Section 4.1 - Monitoring des Quantiles (Spread)
+
+---
+
 ## Propositions REJETÉES
 
 ### [R] Feature-Specific Noise

@@ -369,9 +369,9 @@ def create_policy_kwargs(
         n_quantiles=config.n_quantiles,
         optimizer_class=ClippedAdamW,
         optimizer_kwargs=dict(
-            max_grad_norm=0.5,  # Gradient clipping intégré
-            weight_decay=1e-5,  # Reduced for tiny arch
-            eps=1e-5,
+            max_grad_norm=config.optimizer_max_grad_norm,  # Gradient clipping (via config)
+            weight_decay=config.optimizer_weight_decay,    # P0 Robust Finance: 1e-4 (via config)
+            eps=config.optimizer_eps,                      # Numerical stability (via config)
         ),
     )
 
