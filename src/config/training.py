@@ -97,7 +97,7 @@ class TQCTrainingConfig:
     learning_rate: float = 3e-4      # Standard TQC
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
-    gamma: float = 0.95  # Shorter horizon to avoid reinforcing early collapse patterns
+    gamma: float = 0.99  # Shorter horizon to avoid reinforcing early collapse patterns
     tau: float = 0.005
     ent_coef: Union[str, float] = "auto_0.5"  # FIX: Auto-tuning with target 0.5
                                                # Increased from 0.1 to prevent entropy collapse

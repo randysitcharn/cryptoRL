@@ -1001,9 +1001,19 @@ class WFOPipeline:
             rewards_arr = all_rewards
             navs_arr = all_navs
 
-        # Sharpe
+        # Sharpe on DSR rewards (for reference)
         if len(rewards_arr) > 1 and rewards_arr.std() > 0:
-            sharpe = (rewards_arr.mean() / rewards_arr.std()) * np.sqrt(8760)
+            sharpe_dsr = (rewards_arr.mean() / rewards_arr.std()) * np.sqrt(8760)
+        else:
+            sharpe_dsr = 0.0
+
+        # Sharpe on REAL returns (from NAV changes)
+        if len(navs_arr) > 2:
+            real_returns = np.diff(navs_arr) / navs_arr[:-1]
+            if real_returns.std() > 0:
+                sharpe = (real_returns.mean() / real_returns.std()) * np.sqrt(8760)
+            else:
+                sharpe = 0.0
         else:
             sharpe = 0.0
 
@@ -1048,7 +1058,8 @@ class WFOPipeline:
             'model_type': 'ensemble',
             'aggregation': self.config.ensemble_aggregation,
             'n_members': self.config.ensemble_n_members,
-            'sharpe': sharpe,
+            'sharpe': sharpe,           # Sharpe on REAL returns (NAV-based)
+            'sharpe_dsr': sharpe_dsr,   # Sharpe on DSR rewards (for debug)
             'pnl': pnl,
             'pnl_pct': pnl_pct,
             'max_drawdown': max_drawdown,
@@ -1068,7 +1079,8 @@ class WFOPipeline:
             metrics['train_entropy'] = train_metrics.get('avg_entropy', 0.0)
 
         print(f"  Results (Ensemble - {self.config.ensemble_aggregation}):")
-        print(f"    Sharpe: {sharpe:.2f}")
+        print(f"    Sharpe (real): {sharpe:.2f}")
+        print(f"    Sharpe (DSR):  {sharpe_dsr:.2f}")
         print(f"    PnL: {pnl_pct:+.2f}%")
         print(f"    Max DD: {max_drawdown:.2f}%")
         print(f"    Alpha vs B&H: {alpha:+.2f}%")
@@ -1236,9 +1248,19 @@ class WFOPipeline:
 
         print(f"  Total steps: {len(all_rewards)}, Metrics computed on: {len(rewards)} steps")
 
-        # Sharpe ratio (annualized)
+        # Sharpe ratio on DSR rewards (for reference/debug)
         if len(rewards) > 1 and rewards.std() > 0:
-            sharpe = (rewards.mean() / rewards.std()) * np.sqrt(8760)  # Hourly to annual
+            sharpe_dsr = (rewards.mean() / rewards.std()) * np.sqrt(8760)  # Hourly to annual
+        else:
+            sharpe_dsr = 0.0
+
+        # Sharpe ratio on REAL returns (from NAV changes)
+        if len(navs) > 2:
+            real_returns = np.diff(navs) / navs[:-1]  # (NAV[t] - NAV[t-1]) / NAV[t-1]
+            if real_returns.std() > 0:
+                sharpe = (real_returns.mean() / real_returns.std()) * np.sqrt(8760)
+            else:
+                sharpe = 0.0
         else:
             sharpe = 0.0
 
@@ -1315,7 +1337,8 @@ class WFOPipeline:
         metrics = {
             'segment_id': segment_id,
             'total_reward': float(rewards.sum()),  # Sum of actual test period
-            'sharpe': sharpe,
+            'sharpe': sharpe,           # Sharpe on REAL returns (NAV-based)
+            'sharpe_dsr': sharpe_dsr,   # Sharpe on DSR rewards (for debug)
             'pnl': pnl,
             'pnl_pct': pnl_pct,
             'max_drawdown': max_drawdown,
@@ -1341,7 +1364,8 @@ class WFOPipeline:
             metrics['churn_ratio'] = train_metrics.get('avg_churn_ratio', 0.0)
 
         print(f"  Results:")
-        print(f"    Sharpe: {sharpe:.2f}")
+        print(f"    Sharpe (real): {sharpe:.2f}")
+        print(f"    Sharpe (DSR):  {sharpe_dsr:.2f}")
         print(f"    PnL: {pnl_pct:+.2f}%")
         print(f"    Max DD: {max_drawdown:.2f}%")
         print(f"    Trades: {total_trades}")
@@ -1355,6 +1379,7 @@ class WFOPipeline:
 
         # Log scalar metrics
         writer.add_scalar("eval/sharpe", sharpe, segment_id)
+        writer.add_scalar("eval/sharpe_dsr", sharpe_dsr, segment_id)
         writer.add_scalar("eval/pnl_pct", pnl_pct, segment_id)
         writer.add_scalar("eval/max_drawdown", max_drawdown, segment_id)
         writer.add_scalar("eval/total_trades", total_trades, segment_id)
@@ -1998,7 +2023,8 @@ class WFOPipeline:
     =================
     PnL: {metrics['pnl_pct']:+.2f}%
     Alpha: {alpha:+.2f}%
-    Sharpe: {metrics['sharpe']:.2f}
+    Sharpe (real): {metrics['sharpe']:.2f}
+    Sharpe (DSR):  {metrics.get('sharpe_dsr', 0):.2f}
     Max DD: {metrics['max_drawdown']:.2f}%
     Trades: {metrics['total_trades']}
 
