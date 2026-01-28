@@ -423,6 +423,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
         downside_coef=config.downside_coef,
         upside_coef=config.upside_coef,
         action_discretization=config.action_discretization,
+        dsr_eta=config.dsr_eta,
+        dsr_warmup_steps=config.dsr_warmup_steps,
         target_volatility=config.target_volatility,
         vol_window=config.vol_window,
         max_leverage=config.max_leverage,
@@ -433,6 +435,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
     # FIX 2026-01-26: VecNormalize pour reward scaling
     # Normalise les rewards avec running mean/std pour un signal stable.
     # Critique pour que le Critic puisse apprendre sur des rewards faibles (~0.0005).
+    # DSR: en backtest/éval, charger les stats VecNormalize (.pkl) sur l'env d'éval,
+    # sinon le DSR est mal interprété par le Critic (distribution différente du train).
     clip_reward = 10.0
     train_vec_env = VecNormalize(
         train_vec_env,
@@ -464,6 +468,8 @@ def create_environments(config: TrainingConfig, n_envs: int = 1, use_batch_env: 
             downside_coef=config.downside_coef,
             upside_coef=config.upside_coef,
             action_discretization=config.action_discretization,
+            dsr_eta=config.dsr_eta,
+            dsr_warmup_steps=config.dsr_warmup_steps,
             target_volatility=config.target_volatility,
             vol_window=config.vol_window,
             max_leverage=config.max_leverage,

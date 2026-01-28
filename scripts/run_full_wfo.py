@@ -944,17 +944,20 @@ class WFOPipeline:
         test_episode_length = len(test_df) - self.config.window_size - 1
 
         # Create test env
+        tc = self.config.training_config
         env = BatchCryptoEnv(
             parquet_path=test_path,
             n_envs=1,
             device='cuda' if torch.cuda.is_available() else 'cpu',
             window_size=self.config.window_size,
             episode_length=test_episode_length,
-            commission=self.config.training_config.eval_commission,
+            commission=tc.eval_commission,
             slippage=0.0001,
-            target_volatility=self.config.training_config.target_volatility,
-            vol_window=self.config.training_config.vol_window,
-            max_leverage=self.config.training_config.max_leverage,
+            target_volatility=tc.target_volatility,
+            vol_window=tc.vol_window,
+            max_leverage=tc.max_leverage,
+            dsr_eta=tc.dsr_eta,
+            dsr_warmup_steps=tc.dsr_warmup_steps,
             price_column='BTC_Close',
             random_start=False,
         )
@@ -1140,17 +1143,20 @@ class WFOPipeline:
         # Create test environment using BatchCryptoEnv with n_envs=1
         # NOTE: max_leverage=1.0 disables volatility scaling for evaluation
         # This prevents the "stuck in cash" bug where portfolio returns collapse to 0
+        tc = self.config.training_config
         env = BatchCryptoEnv(
             parquet_path=test_path,
             n_envs=1,  # Single env for Gymnasium-compatible evaluation
             device='cuda' if torch.cuda.is_available() else 'cpu',
             window_size=self.config.window_size,
             episode_length=test_episode_length,  # Full episode
-            commission=self.config.training_config.eval_commission,
+            commission=tc.eval_commission,
             slippage=0.0001,
-            target_volatility=self.config.training_config.target_volatility,
-            vol_window=self.config.training_config.vol_window,
-            max_leverage=self.config.training_config.max_leverage,  # MORL: Cohérence train/eval (fix Distributional Shift)
+            target_volatility=tc.target_volatility,
+            vol_window=tc.vol_window,
+            max_leverage=tc.max_leverage,  # MORL: Cohérence train/eval (fix Distributional Shift)
+            dsr_eta=tc.dsr_eta,
+            dsr_warmup_steps=tc.dsr_warmup_steps,
             price_column='BTC_Close',
             random_start=False,  # Sequential start for evaluation
         )

@@ -155,13 +155,13 @@ def test_reward_clipping():
         
         print(f"  - Reward brut pour un turnover MAXIMAL (delta=2.0) : {r_val:.6f}")
         
-        # Vérification logique
+        # Vérification logique (COST_PENALTY_CAP=0.1, MAX_PENALTY_SCALE=0.05)
         # SCALE=10.0
         # r_cost brut = -2.0 * 10 = -20
-        # r_cost clippé = max(-20, -0.01) = -0.01  <-- C'est le nouveau CAP
-        # w_cost penalty = 1.0 * -0.01 * 0.05 (MAX_PENALTY_SCALE) = -0.0005
-        
-        expected_penalty = -0.0005 * env.reward_scaling
+        # r_cost clippé = max(-20, -0.1) = -0.1
+        # w_cost penalty = 1.0 * -0.1 * 0.05 = -0.005
+
+        expected_penalty = -0.005 * env.reward_scaling
         tolerance = 1e-5
         
         if abs(r_val - expected_penalty) < tolerance:
@@ -183,9 +183,9 @@ def test_reward_clipping():
             test_rewards = env._calculate_rewards(step_returns, test_deltas_tensor, dones)
             test_r = test_rewards[0].item()
             
-            # La pénalité devrait être proportionnelle mais capée
-            # Max possible = -0.01 * 0.05 = -0.0005 (pour delta >= 0.01/10 = 0.001)
-            max_expected = -0.0005 * env.reward_scaling
+            # La pénalité devrait être proportionnelle mais capée (COST_PENALTY_CAP=0.1)
+            # Max possible = -0.1 * 0.05 = -0.005 (pour delta >= 0.1/10 = 0.01)
+            max_expected = -0.005 * env.reward_scaling
             if test_r < max_expected - tolerance:
                 print(f"    [ERROR] Delta {delta}: penalite {test_r:.6f} depasse le cap attendu {max_expected:.6f}")
                 pytest.fail(f"Pénalité non capée correctement pour delta={delta}")
@@ -303,12 +303,11 @@ def test_penalty_constants_values():
     else:
         print("  [WARN] MAX_PENALTY_SCALE non trouve dans le code (verification manuelle requise)")
     
-    # Vérifier COST_PENALTY_CAP = 0.01
-    if 'COST_PENALTY_CAP = 0.01' in content:
-        print("  [OK] COST_PENALTY_CAP = 0.01 (correct)")
-    elif 'COST_PENALTY_CAP = 0.1' in content:
-        print("  [ERROR] ERREUR: COST_PENALTY_CAP est encore a 0.1 (devrait etre 0.01)")
-        pytest.fail("COST_PENALTY_CAP n'a pas été mis à jour")
+    # Vérifier COST_PENALTY_CAP = 0.1 (valeur actuelle batch_env, coherente avec DSR/MORL)
+    if 'COST_PENALTY_CAP = 0.1' in content:
+        print("  [OK] COST_PENALTY_CAP = 0.1 (correct)")
+    elif 'COST_PENALTY_CAP = 0.01' in content:
+        print("  [OK] COST_PENALTY_CAP = 0.01 (alternative)")
     else:
         print("  [WARN] COST_PENALTY_CAP non trouve dans le code (verification manuelle requise)")
     

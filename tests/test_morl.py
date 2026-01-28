@@ -271,19 +271,20 @@ class TestMORLReward:
     """Tests for MORL reward calculation."""
 
     def test_reward_zero_cost_when_w_zero(self):
-        """With w_cost=0, churn cost component should be 0."""
+        """With w_cost=0, cost does not affect reward (reward = r_perf only)."""
         env, tmp_path = create_test_env(n_envs=4)
         try:
             env.set_eval_w_cost(0.0)
             env.reset()
-            
-            # Take action that changes position
             env.step_async(np.array([[0.5], [0.5], [0.5], [0.5]], dtype=np.float32))
-            env.step_wait()
-            
-            # With w=0, churn component should be 0
-            assert env._rew_churn.abs().max().item() < 1e-6, \
-                f"With w_cost=0, _rew_churn should be ~0, got {env._rew_churn}"
+            obs, rewards, dones, infos = env.step_wait()
+            m = env.get_global_metrics()
+            # reward = r_perf * scaling + 0 * r_cost * scale, so mean reward ~ dsr_raw * scaling
+            expected = m["reward/dsr_raw"] * env.reward_scaling
+            actual = float(np.mean(rewards))
+            assert abs(actual - expected) < 1e-4, (
+                f"With w_cost=0, reward should equal DSR component: got {actual}, expected ~{expected}"
+            )
         finally:
             cleanup_env(tmp_path)
 

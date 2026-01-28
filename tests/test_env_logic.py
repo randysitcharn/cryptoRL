@@ -111,6 +111,7 @@ def create_test_env(commission: float = 0.001, slippage: float = 0.0001,
         price_column='close',
         random_start=False,
         funding_rate=funding_rate,
+        enable_domain_randomization=False,  # Fixed fees for reproducible tests
     )
     
     return env, tmp_file.name

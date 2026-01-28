@@ -302,8 +302,15 @@ class UnifiedMetricsCallback(BaseCallback):
                 if "reward/pnl_component" in metrics:
                     self.logger.record("rewards/pnl_component", metrics["reward/pnl_component"])
                     self.episode_log_returns.append(metrics["reward/pnl_component"])
-                if "reward/alpha_component" in metrics:
-                    self.logger.record("rewards/alpha_component", metrics["reward/alpha_component"])
+                # DSR metrics (optional debug)
+                if "reward/dsr_raw" in metrics:
+                    self.logger.record("rewards/dsr_raw", metrics["reward/dsr_raw"])
+                if "reward/dsr_variance" in metrics:
+                    self.logger.record("rewards/dsr_variance", metrics["reward/dsr_variance"])
+                if "reward/dsr_A" in metrics:
+                    self.logger.record("rewards/dsr_A", metrics["reward/dsr_A"])
+                if "reward/dsr_B" in metrics:
+                    self.logger.record("rewards/dsr_B", metrics["reward/dsr_B"])
                 
                 # Agréger les pénalités en total_penalties (suppression des composantes individuelles)
                 total_penalties = 0.0
