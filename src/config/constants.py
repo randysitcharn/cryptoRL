@@ -120,12 +120,11 @@ MAE_DROPOUT: float = 0.1
 # =============================================================================
 # RL Training Constants (Single Source of Truth)
 # =============================================================================
-# Default log_std_init for gSDE exploration
+# Default log_std_init for gSDE exploration (Gated Policy / RegretDSR)
 # Formula: std = exp(log_std_init)
-# 0.0 gives std=1.0, -3.0 (SB3 default) gives std≈0.05
-# Using -7.0 for minimal noise (std≈0.0009)
-# Testing if near-deterministic policy learns better
-DEFAULT_LOG_STD_INIT: float = -7.0
+# 0.0 gives std=1.0, -3.0 (SB3 default) gives std≈0.05, -1.0 gives std≈0.37
+# -1.0 for Gated Policy: increases initial noise to exit cash trap faster
+DEFAULT_LOG_STD_INIT: float = -1.0
 
 # Default minimum entropy coefficient for EntropyFloorCallback
 # Prevents entropy collapse in SAC/TQC auto-tuning

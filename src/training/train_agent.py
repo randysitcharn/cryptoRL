@@ -42,6 +42,8 @@ from src.training.callbacks import (
     OverfittingGuardCallbackV2,
     ModelEMACallback,
     EntropyFloorCallback,
+    DynamicEntropyFloorCallback,
+    BimodalPriorCallback,
 )
 
 
@@ -603,6 +605,23 @@ def create_callbacks(
     callbacks.append(entropy_floor)
     print(f"  [Entropy] EntropyFloorCallback enabled (min={DEFAULT_MIN_ENT_COEF}, check_freq=5000)")
 
+    # Dynamic Entropy Floor (RegretDSR / Cash Trap): boost α when action_saturation low
+    dynamic_entropy_floor = DynamicEntropyFloorCallback(
+        check_freq=5000,
+        saturation_threshold=0.2,
+        boost_ent_coef=0.1,
+        verbose=config.verbose,
+    )
+    callbacks.append(dynamic_entropy_floor)
+
+    # Bimodal Prior (RegretDSR / Gated): repulsion from center for monitoring
+    bimodal_prior = BimodalPriorCallback(
+        target_steps=100_000,
+        repulsion_weight=getattr(config, 'repulsion_weight', 0.05),
+        verbose=config.verbose,
+    )
+    callbacks.append(bimodal_prior)
+
     # ═══════════════════════════════════════════════════════════════════════
     # Model EMA Callback (Polyak Averaging for Policy Weights)
     # Maintains EMA of policy weights for robust evaluation
@@ -1019,6 +1038,7 @@ def train(
             batch_size=config.batch_size,
             gamma=config.gamma,
             tau=config.tau,
+            learning_starts=getattr(config, 'learning_starts', 10_000),
             ent_coef=config.ent_coef,
             target_entropy=config.target_entropy,
             train_freq=config.train_freq,

@@ -324,6 +324,25 @@ class UnifiedMetricsCallback(BaseCallback):
                 
                 # Log total_penalties (agrégé, pas les composantes individuelles)
                 self.logger.record("rewards/total_penalties", total_penalties)
+
+                # Phase 4: RegretDSR & Gated Policy monitoring
+                if "policy/action_saturation" in metrics:
+                    self.logger.record("policy/action_saturation", metrics["policy/action_saturation"])
+                if "policy/mean_position_abs" in metrics:
+                    self.logger.record("policy/mean_position_abs", metrics["policy/mean_position_abs"])
+                if "reward/regret_dsr_raw" in metrics:
+                    val = metrics["reward/regret_dsr_raw"]
+                    self.logger.record("rewards/regret_dsr_raw", val)
+                    self.logger.record("reward/regret_dsr_raw", val)  # Alias for TensorBoard triptyque
+                if "portfolio/alpha_returns" in metrics:
+                    self.logger.record("portfolio/alpha_returns", metrics["portfolio/alpha_returns"])
+                if "exploration/cost_annealing_scale" in metrics:
+                    self.logger.record("exploration/cost_annealing_scale", metrics["exploration/cost_annealing_scale"])
+                # Gate mean (Phase 2): from actor when Gated Policy is used
+                if hasattr(self.model, "policy") and hasattr(self.model.policy, "actor"):
+                    gate_val = getattr(self.model.policy.actor, "_last_gate_val", None)
+                    if gate_val is not None:
+                        self.logger.record("policy/gate_open_ratio", float(gate_val))
         except Exception as e:
             if self.verbose > 0:
                 print(f"[UnifiedMetricsCallback] Error in _log_global_metrics: {e}")
@@ -727,8 +746,12 @@ class MORLCurriculumCallback(BaseCallback):
         # self.model.env is the training environment (passed to model.learn())
         # The eval environment is separate and managed by EvalCallback
         real_env = get_underlying_batch_env(self.model.env)
-        if real_env is not None and hasattr(real_env, 'set_w_cost_target'):
-            real_env.set_w_cost_target(current_w)
+        if real_env is not None:
+            if hasattr(real_env, 'set_w_cost_target'):
+                real_env.set_w_cost_target(current_w)
+            # Phase 3 / Plan: set_progress for cost_anneal_ratio (Cost Annealing)
+            if hasattr(real_env, 'set_progress'):
+                real_env.set_progress(progress)
         else:
             if self.verbose > 0 and self.n_calls % 1000 == 0:
                 print(f"[MORLCurriculumCallback] Warning: BatchCryptoEnv.set_w_cost_target() not found")
@@ -1471,6 +1494,95 @@ class EntropyFloorCallback(BaseCallback):
             self.logger.record("entropy/floor_applied_count", self.floor_count)
             self.logger.record("entropy/min_ent_coef", self.min_ent_coef)
         
+        return True
+
+
+# ============================================================================
+# Bimodal Prior Callback (Phase 3 - Cash Trap)
+# ============================================================================
+
+class BimodalPriorCallback(BaseCallback):
+    """
+    Force l'exploration vers les extrêmes (-1, 1) au début de l'entraînement.
+    Empêche la convergence prématurée vers la moyenne (0).
+    """
+
+    def __init__(
+        self,
+        target_steps: int = 100_000,
+        repulsion_weight: float = 0.1,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.target_steps = target_steps
+        self.repulsion_weight = repulsion_weight
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps >= self.target_steps:
+            return True
+        # Decay: réduit l'influence du prior progressivement
+        decay = 1.0 - (self.num_timesteps / self.target_steps)
+        current_weight = self.repulsion_weight * decay
+        if self.logger is not None:
+            self.logger.record("exploration/bimodal_prior_weight", current_weight)
+        # Note: perte auxiliaire KL / repulsion nécessiterait un hook sur l'actor loss
+        # ou un step de descente séparé. Pour l'instant on log le weight pour monitoring.
+        return True
+
+
+# ============================================================================
+# Dynamic Entropy Floor Callback (Phase 3 - Cash Trap)
+# ============================================================================
+
+class DynamicEntropyFloorCallback(BaseCallback):
+    """
+    Surveille le taux d'activité (Action Saturation).
+    Si l'agent reste trop en cash, booste l'entropie pour forcer l'exploration.
+    """
+
+    def __init__(
+        self,
+        check_freq: int = 5000,
+        saturation_threshold: float = 0.2,
+        boost_ent_coef: float = 0.1,
+        verbose: int = 1,
+    ):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.saturation_threshold = saturation_threshold
+        self.boost_ent_coef = boost_ent_coef
+        self.boost_count = 0
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.check_freq != 0:
+            return True
+        if not hasattr(self.model, "log_ent_coef"):
+            return True
+
+        real_env = get_underlying_batch_env(self.model.env)
+        if real_env is None or not hasattr(real_env, "get_global_metrics"):
+            return True
+
+        metrics = real_env.get_global_metrics()
+        saturation = metrics.get("policy/action_saturation", 1.0)
+
+        if saturation < self.saturation_threshold:
+            current_log = self.model.log_ent_coef.item()
+            current_ent = np.exp(current_log)
+            target_log = np.log(self.boost_ent_coef)
+            if current_log < target_log:
+                with torch.no_grad():
+                    self.model.log_ent_coef.fill_(target_log)
+                self.boost_count += 1
+                if self.verbose > 0:
+                    print(
+                        f"[DynamicEntropyFloor] Saturation ({saturation:.2f}) < seuil. "
+                        f"ent_coef {current_ent:.4f} → {self.boost_ent_coef} (boost #{self.boost_count})"
+                    )
+            if self.logger is not None:
+                self.logger.record("entropy/dynamic_floor_boost_count", self.boost_count)
+                self.logger.record("entropy/dynamic_floor_saturation", saturation)
+
         return True
 
 

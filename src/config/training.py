@@ -89,6 +89,7 @@ class TQCTrainingConfig:
 
     # --- TQC Hyperparameters ---
     total_timesteps: int = 90_000_000  # 90M steps
+    learning_starts: int = 10_000     # Warmup: fill replay with Regret before learning
     learning_rate: float = 3e-4      # Standard TQC
     buffer_size: Optional[int] = None  # Auto-detect from RAM (HardwareManager)
     batch_size: Optional[int] = None   # Auto-detect from VRAM (HardwareManager)
@@ -103,10 +104,9 @@ class TQCTrainingConfig:
     n_critics: int = 2
     n_quantiles: int = 25
 
-    # Entropy tuning (FIX 2026-01-26)
-    # "auto" = -dim(action) = -1.0 (trop agressif pour trading)
-    # 0.0 = neutre, pas de pression vers entropy faible
-    target_entropy: Union[str, float] = 0.0
+    # Entropy tuning (Gated Policy / RegretDSR)
+    # "auto" = -dim(action) = -1.0 ; -1.5 = exploration plus fine une fois Gate ouverte
+    target_entropy: Union[str, float] = -1.5
 
     # Policy network
     net_arch: Optional[Dict[str, List[int]]] = None  # Default: dict(pi=[64,64], qf=[64,64])
@@ -118,6 +118,9 @@ class TQCTrainingConfig:
                                # 64 gives fresh exploration noise ~32x per episode
     use_sde_at_warmup: bool = True
     log_std_init: float = DEFAULT_LOG_STD_INIT  # Single source of truth (constants.py)
+
+    # RegretDSR / Gated Policy (Bimodal Prior)
+    repulsion_weight: float = 0.05  # Weight for BimodalPriorCallback (repel from center)
 
     # Actor Noise (fallback when use_sde=False, ignored otherwise)
     # OrnsteinUhlenbeck noise for temporally correlated exploration
