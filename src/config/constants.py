@@ -142,6 +142,20 @@ DEFAULT_VOL_WINDOW: int = 24            # EMA window for vol estimation (hours)
 DEFAULT_MAX_LEVERAGE: float = 2.0       # Max vol scaling multiplier
 
 # =============================================================================
+# Domain Randomization Constants (Single Source of Truth)
+# =============================================================================
+# Controls fee randomization for anti-overfitting during training
+# Set ENABLE_DOMAIN_RANDOMIZATION = False to disable all fee randomization
+
+DEFAULT_ENABLE_DOMAIN_RANDOMIZATION: bool = False  # DISABLED for debugging policy collapse
+DEFAULT_COMMISSION_MIN: float = 0.0     # 0% (was 0.0002 = 0.02%)
+DEFAULT_COMMISSION_MAX: float = 0.0     # 0% (was 0.0008 = 0.08%)
+DEFAULT_SLIPPAGE_MIN: float = 0.0       # 0% (was 0.00005 = 0.005%)
+DEFAULT_SLIPPAGE_MAX: float = 0.0       # 0% (was 0.00015 = 0.015%)
+DEFAULT_SLIPPAGE_NOISE_STD: float = 0.0 # 0% (was 0.00002)
+DEFAULT_FUNDING_RATE: float = 0.0       # 0% (was 0.0001 = 0.01% per step)
+
+# =============================================================================
 # Model Architecture Configurations (Dataclasses)
 # =============================================================================
 # These dataclasses centralize all model dimensions to prevent mismatches.

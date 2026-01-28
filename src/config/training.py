@@ -13,6 +13,7 @@ from src.config.constants import (
     DEFAULT_TARGET_VOLATILITY,
     DEFAULT_VOL_WINDOW,
     DEFAULT_MAX_LEVERAGE,
+    DEFAULT_FUNDING_RATE,
     MAE_D_MODEL,
     MAE_N_HEADS,
     MAE_N_LAYERS,
@@ -48,7 +49,7 @@ class TQCTrainingConfig:
     # Training uses these values; set to 0 for debugging policy collapse
     commission: float = 0.0        # Transaction fee (0.0002 = 0.02% realistic)
     slippage: float = 0.0          # Slippage cost (0.0001 = 0.01% realistic)
-    funding_rate: float = 0.0      # Funding for shorts (0.0001 = 0.01% realistic)
+    funding_rate: float = DEFAULT_FUNDING_RATE  # Single Source of Truth: constants.py
     w_cost_fixed: float = 0.0      # Fixed w_cost for MORL (None-like = 0, disables cost penalty)
 
     # Reward function (DSR + MORL in env)

@@ -23,6 +23,13 @@ from src.config.constants import (
     DEFAULT_TARGET_VOLATILITY,
     DEFAULT_VOL_WINDOW,
     DEFAULT_MAX_LEVERAGE,
+    DEFAULT_ENABLE_DOMAIN_RANDOMIZATION,
+    DEFAULT_COMMISSION_MIN,
+    DEFAULT_COMMISSION_MAX,
+    DEFAULT_SLIPPAGE_MIN,
+    DEFAULT_SLIPPAGE_MAX,
+    DEFAULT_SLIPPAGE_NOISE_STD,
+    DEFAULT_FUNDING_RATE,
 )
 
 
@@ -74,15 +81,15 @@ class BatchCryptoEnv(VecEnv):
         observation_noise: float = 0.0,  # 0 = disabled by default
         # Episode start mode
         random_start: bool = True,  # If False, start at beginning (for evaluation)
-        # Short selling
-        funding_rate: float = 0.0001,  # 0.01% per step (~0.24%/day) for short positions
-        # Domain Randomization (anti-overfitting)
-        enable_domain_randomization: bool = True,
-        commission_min: float = 0.0002,  # 0.02%
-        commission_max: float = 0.0008,  # 0.08%
-        slippage_min: float = 0.00005,   # 0.005%
-        slippage_max: float = 0.00015,   # 0.015%
-        slippage_noise_std: float = 0.00002,  # Bruit additif pour market impact
+        # Short selling (Single Source of Truth: constants.py)
+        funding_rate: float = DEFAULT_FUNDING_RATE,
+        # Domain Randomization (Single Source of Truth: constants.py)
+        enable_domain_randomization: bool = DEFAULT_ENABLE_DOMAIN_RANDOMIZATION,
+        commission_min: float = DEFAULT_COMMISSION_MIN,
+        commission_max: float = DEFAULT_COMMISSION_MAX,
+        slippage_min: float = DEFAULT_SLIPPAGE_MIN,
+        slippage_max: float = DEFAULT_SLIPPAGE_MAX,
+        slippage_noise_std: float = DEFAULT_SLIPPAGE_NOISE_STD
     ):
         """
         Initialize the batch environment.
