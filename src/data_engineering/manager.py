@@ -253,7 +253,7 @@ class RegimeDetector:
             n_iter=self.n_iter,
             random_state=self.random_state,
             init_params='stc',  # startprob, transmat, covars (pas means)
-            min_covar=1e-3,  # Régularisation supplémentaire
+            min_covar=1e-2,  # Augmenté pour éviter covariance dégénérée
         )
 
         # Initialiser le HMM pour créer les attributs
@@ -289,39 +289,42 @@ class RegimeDetector:
     def _apply_transition_penalty(self) -> None:
         """
         Applique une pénalité de transition pour améliorer la persistence des régimes.
-
-        Inspiré des Statistical Jump Models (Shu et al., 2024) qui montrent que
-        la persistence explicite améliore le Sharpe ratio et réduit le drawdown.
-
-        Formule: A_sticky = A * (1 - penalty) + I * penalty
-
-        Effet: Augmente la probabilité de rester dans le même état (diagonale).
-        Avec penalty=0.1: diagonale +10%, off-diagonale -10% proportionnellement.
+        Avec validation robuste pour éviter corruption par NaN.
         """
         if self.transition_penalty <= 0:
             return
 
         n = self.n_components
-        penalty = min(self.transition_penalty, 0.5)  # Cap à 50% pour éviter HMM dégénéré
+        penalty = min(self.transition_penalty, 0.5)
 
         # Récupérer la matrice de transition originale
         A = self.hmm.transmat_.copy()
+        diag_before = np.diag(A).mean() if np.isfinite(A).all() else np.nan
 
-        # Appliquer la pénalité: plus de poids sur la diagonale
+        # FIX: Si transmat_ déjà corrompue, reset à uniform sticky
+        if not np.isfinite(A).all():
+            print(f"  [WARNING] transmat_ contains NaN/Inf, resetting to uniform sticky prior")
+            A = np.ones((n, n)) * (1.0 - 0.7) / (n - 1)
+            np.fill_diagonal(A, 0.7)
+
+        # Appliquer la pénalité
         I = np.eye(n)
         A_sticky = A * (1.0 - penalty) + I * penalty
 
-        # Renormaliser les lignes pour que chaque ligne somme à 1
-        A_sticky = A_sticky / A_sticky.sum(axis=1, keepdims=True)
+        # Renormaliser
+        row_sums = A_sticky.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums > 1e-10, row_sums, 1.0)
+        A_sticky = A_sticky / row_sums
 
-        # Remplacer dans le HMM
+        # FIX: Validation finale
+        if not np.isfinite(A_sticky).all() or not np.allclose(A_sticky.sum(axis=1), 1.0, atol=1e-6):
+            print(f"  [WARNING] transmat_ still corrupted after penalty, forcing uniform sticky")
+            A_sticky = np.ones((n, n)) * 0.1 / (n - 1)
+            np.fill_diagonal(A_sticky, 0.9)
+
         self.hmm.transmat_ = A_sticky
-
-        # Log le changement
-        diag_before = np.diag(A).mean()
         diag_after = np.diag(A_sticky).mean()
-        print(f"  Transition Penalty applied (penalty={penalty:.2f}): "
-              f"diag_avg {diag_before:.3f} -> {diag_after:.3f}")
+        print(f"  Transition Penalty applied (penalty={penalty:.2f}): diag_avg {diag_before:.3f} -> {diag_after:.3f}")
 
     def _sort_states_by_trend(self) -> np.ndarray:
         """
@@ -355,6 +358,17 @@ class RegimeDetector:
         trend_means = np.zeros(self.n_components)
         for state in range(self.n_components):
             trend_means[state] = self.hmm.means_[state, :, trend_idx].mean()
+
+        # FIX: Si tous les trend_means sont NaN, skip le tri
+        if not np.isfinite(trend_means).any():
+            print(f"  [WARNING] ALL trend_means are NaN/Inf - skipping state sorting")
+            return np.arange(self.n_components)
+
+        # Remplacer NaN par médiane pour permettre le tri
+        if not np.isfinite(trend_means).all():
+            median_val = np.nanmedian(trend_means)
+            trend_means = np.nan_to_num(trend_means, nan=median_val)
+            print(f"  [WARNING] Some trend_means were NaN, replaced with median={median_val:.4f}")
 
         # Trouver l'ordre de tri (du plus baissier au plus haussier)
         sorted_indices = np.argsort(trend_means)
@@ -622,7 +636,7 @@ class RegimeDetector:
                 n_iter=self.n_iter,
                 random_state=current_random_state,
                 init_params='stc',
-                min_covar=1e-3,
+                min_covar=1e-2,  # Augmenté pour éviter covariance dégénérée
             )
             self.hmm._init(features_scaled, None)
 
@@ -885,15 +899,20 @@ class RegimeDetector:
         """
         if not self._is_fitted or self.hmm is None:
             raise RuntimeError("HMM must be fitted before extracting belief states")
-        
-        if use_forward_only:
-            # Algorithme Forward-Only (pas de look-ahead bias)
-            probs = self._forward_filter(features_scaled)
-        else:
-            # Utilise Forward-Backward (plus rapide mais avec look-ahead)
-            # Acceptable pour l'entraînement si on accepte le lissage intra-segment
-            probs = self.hmm.predict_proba(features_scaled)
-        
+
+        try:
+            if use_forward_only:
+                # Algorithme Forward-Only (pas de look-ahead bias)
+                probs = self._forward_filter(features_scaled)
+            else:
+                # Utilise Forward-Backward (plus rapide mais avec look-ahead)
+                # Acceptable pour l'entraînement si on accepte le lissage intra-segment
+                probs = self.hmm.predict_proba(features_scaled)
+        except (ValueError, FloatingPointError) as e:
+            print(f"  [WARNING] HMM inference failed: {e}")
+            print(f"  [FALLBACK] Using uniform priors")
+            probs = np.ones((len(features_scaled), self.n_components)) / self.n_components
+
         # Calcul de l'entropie de Shannon (incertitude du régime)
         # H = -sum_i P(s_t=i) * log(P(s_t=i))
         # Plus l'entropie est élevée, plus l'incertitude est grande
